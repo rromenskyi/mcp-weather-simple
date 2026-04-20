@@ -166,14 +166,39 @@ The manifests are compatible with the PodSecurity `restricted` profile:
 `runAsNonRoot`, `readOnlyRootFilesystem`, `capabilities.drop: [ALL]`,
 `seccompProfile: RuntimeDefault`, and bounded CPU/memory.
 
-#### 3. Wire it to Ollama through a chat UI
+#### 3. Create the auth Secret
+
+The server enforces Bearer-token auth on the HTTP transport when
+`MCP_AUTH_TOKEN` is set (the Deployment wires it to a Secret named
+`mcp-weather-auth`). Generate a token and create the Secret:
+
+```
+TOKEN=$(openssl rand -hex 32)
+kubectl -n ai create secret generic mcp-weather-auth \
+  --from-literal=token="$TOKEN"
+echo "$TOKEN"   # share with the MCP client
+```
+
+Requests without `Authorization: Bearer $TOKEN` get a `401`.
+
+The `k8s/networkpolicy.yaml` manifest restricts inbound traffic to pods
+in the same namespace (`ai`). Combined with the Bearer token this
+gives two independent layers: the CNI blocks the packet and the server
+rejects the request. Egress is locked down to DNS + HTTPS to public
+IPs (Open-Meteo).
+
+If you don't want auth (e.g. purely local testing), leave
+`MCP_AUTH_TOKEN` unset — the middleware will not be attached.
+
+#### 4. Wire it to Ollama through a chat UI
 
 Deploy a chat frontend with MCP support next to Ollama. **Open WebUI**
 is the common choice (Helm chart `open-webui/open-webui`). In its
 settings, point it at:
 
 - Ollama endpoint → `http://ollama.<ns>.svc:11434`
-- MCP server → `http://mcp-weather.ai.svc:8000/mcp`
+- MCP server → `http://mcp-weather.ai.svc:8000/mcp` with header
+  `Authorization: Bearer <TOKEN>`
 
 Result: three pods in the cluster (Ollama + Open WebUI + mcp-weather),
 the model calls weather tools on its own, the user talks to it in a
@@ -187,8 +212,8 @@ browser.
 - `mcphost.config.json` — `mcphost` config for Option A.
 - `Dockerfile` / `.dockerignore` — multi-stage image built with `uv`,
   runs as non-root with a read-only root filesystem.
-- `k8s/` — Kustomize manifests (Deployment, Service, optional Traefik
-  IngressRoute).
+- `k8s/` — Kustomize manifests: Deployment, Service, NetworkPolicy,
+  Secret template, and an optional Traefik IngressRoute.
 
 ## License
 

@@ -9,3 +9,7 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Real Secret manifests — copy secret.example.yaml and fill in values.
+k8s/secret.yaml
+

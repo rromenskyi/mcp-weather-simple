@@ -6,7 +6,9 @@ namespace: ai
 resources:
   - deployment.yaml
   - service.yaml
+  - networkpolicy.yaml
   # - ingressroute.yaml   # uncomment to expose externally via Traefik
+  # - secret.yaml         # copy from secret.example.yaml, fill in token, uncomment
 
 commonLabels:
   app.kubernetes.io/part-of: ai-stack

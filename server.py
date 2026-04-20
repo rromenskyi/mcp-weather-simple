@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -8,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 HOST = os.getenv("MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("MCP_PORT", "8000"))
+AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
 mcp = FastMCP("weather", host=HOST, port=PORT, stateless_http=True)
 
@@ -123,5 +125,35 @@ async def get_forecast(city: str, days: int = 7) -> dict:
     }
 
 
+def _run_http_with_auth() -> None:
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    app = mcp.streamable_http_app()
+
+    if AUTH_TOKEN:
+        expected = f"Bearer {AUTH_TOKEN}"
+
+        class BearerAuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                if not secrets.compare_digest(
+                    request.headers.get("authorization", ""), expected
+                ):
+                    return JSONResponse(
+                        {"error": "unauthorized"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                return await call_next(request)
+
+        app.add_middleware(BearerAuthMiddleware)
+
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+
+
 if __name__ == "__main__":
-    mcp.run(transport=TRANSPORT)
+    if TRANSPORT == "streamable-http":
+        _run_http_with_auth()
+    else:
+        mcp.run(transport=TRANSPORT)
