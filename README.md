@@ -76,52 +76,15 @@ can live anywhere.
 
 ## Deployment options
 
-### Option A — host on your laptop (fast path)
+The server supports two transports, switchable via the `MCP_TRANSPORT`
+env var:
 
-No cluster changes required.
+- `streamable-http` — used by the Docker image and Kubernetes manifests
+  (Option A).
+- `stdio` — default, used when an MCP client spawns the server as a
+  subprocess on the same host (Option B).
 
-1. Forward Ollama out of the cluster:
-
-   ```
-   kubectl -n <namespace> port-forward svc/ollama 11434:11434
-   ```
-
-2. Install [`mcphost`](https://github.com/mark3labs/mcphost) (the
-   Ollama ↔ MCP bridge):
-
-   ```
-   go install github.com/mark3labs/mcphost@latest
-   # or grab a release binary from the GitHub releases page
-   ```
-
-3. Run it:
-
-   ```
-   mcphost --config /path/to/mcp-weather-simple/mcphost.config.json \
-           -m ollama:llama3.1
-   ```
-
-   Use a model that supports tool calling: `llama3.1`, `qwen2.5`,
-   `mistral-nemo`, `llama3.2`, etc. Models like `phi` or `gemma2` won't
-   work.
-
-The included `mcphost.config.json` spawns the server via `uv` with
-stdio transport — nothing else to configure.
-
-#### Debug the server without Ollama
-
-```
-uv run mcp dev server.py
-```
-
-This launches the MCP Inspector in a browser so you can call tools by
-hand and inspect the traffic.
-
-### Option B — everything in k3s (production path)
-
-The transport is switchable via the `MCP_TRANSPORT` env var: `stdio`
-(default, Option A) or `streamable-http` (Option B). The Dockerfile
-sets the latter.
+### Option A — everything in k3s (production path)
 
 #### 1. Build and push the image
 
@@ -204,12 +167,53 @@ Result: three pods in the cluster (Ollama + Open WebUI + mcp-weather),
 the model calls weather tools on its own, the user talks to it in a
 browser.
 
+### Option B — host on your laptop (dev / fast start)
+
+Useful when you want to experiment without touching the cluster.
+
+1. Forward Ollama out of the cluster:
+
+   ```
+   kubectl -n <namespace> port-forward svc/ollama 11434:11434
+   ```
+
+2. Install [`mcphost`](https://github.com/mark3labs/mcphost) — the
+   Ollama ↔ MCP bridge:
+
+   ```
+   go install github.com/mark3labs/mcphost@latest
+   # or grab a release binary from the GitHub releases page
+   ```
+
+3. Run it:
+
+   ```
+   mcphost --config /path/to/mcp-weather-simple/mcphost.config.json \
+           -m ollama:llama3.1
+   ```
+
+   Use a model that supports tool calling: `llama3.1`, `qwen2.5`,
+   `mistral-nemo`, `llama3.2`, etc. Models like `phi` or `gemma2` won't
+   work.
+
+The included `mcphost.config.json` spawns the server via `uv` with
+stdio transport (no auth, no container) — nothing else to configure.
+
+#### Debug the server without Ollama
+
+```
+uv run mcp dev server.py
+```
+
+This launches the MCP Inspector in a browser so you can call tools by
+hand and inspect the traffic.
+
 ## Project files
 
 - `server.py` — the MCP server (FastMCP). Transport is controlled by
   `MCP_TRANSPORT` (`stdio` | `streamable-http`), port by `MCP_PORT`.
 - `pyproject.toml` / `uv.lock` — dependencies (`mcp[cli]`, `httpx`).
-- `mcphost.config.json` — `mcphost` config for Option A.
+- `mcphost.config.json` — `mcphost` config for Option B.
 - `Dockerfile` / `.dockerignore` — multi-stage image built with `uv`,
   runs as non-root with a read-only root filesystem.
 - `k8s/` — Kustomize manifests: Deployment, Service, NetworkPolicy,
