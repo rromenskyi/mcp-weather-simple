@@ -3,12 +3,17 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+# Default permissions for every job. Individual jobs can widen if needed.
 permissions:
   contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   python:
@@ -29,26 +34,61 @@ jobs:
         run: uv run python -c "import server; print(server.mcp.name)"
 
   docker:
-    name: docker / build image
+    name: docker / build & push
     runs-on: ubuntu-latest
+    # Need packages:write to push to ghcr.io. On PRs this job still runs but
+    # the Login and Push steps skip — PR code never gets write access.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build image (no push)
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags & labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # Tags are auto-derived from the git ref:
+          #   push to main            → main, sha-<short>, latest
+          #   push to tag v1.2.3      → 1.2.3, 1.2, sha-<short>, latest
+          #   pull_request            → pr-<number>, sha-<short>
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image (push on main/tag, load for smoke test)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
           load: true
-          tags: mcp-weather-simple:ci
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Smoke test container
         run: |
-          docker run -d --name mcp -p 8000:8000 mcp-weather-simple:ci
+          IMG=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n1)
+          echo "Testing $IMG"
+          docker run -d --name mcp -p 8000:8000 "$IMG"
           for i in {1..20}; do
             if curl -sf -o /dev/null -X POST http://127.0.0.1:8000/mcp \
                  -H 'Content-Type: application/json' \
