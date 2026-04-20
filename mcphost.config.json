@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "weather": {
+      "command": "/home/roman220/.local/bin/uv",
+      "args": [
+        "--directory",
+        "/home/roman220/gh/mcp-weather-simple",
+        "run",
+        "server.py"
+      ]
+    }
+  }
+}

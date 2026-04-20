@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.idea
+.vscode
+k8s
+README.md
+mcphost.config.json

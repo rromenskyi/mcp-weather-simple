@@ -1,0 +1,19 @@
+# Optional: expose mcp-weather outside the cluster via Traefik.
+# Skip if the MCP client (Open WebUI / mcphost) runs inside the cluster —
+# use the ClusterIP Service (http://mcp-weather.ai.svc:8000/mcp) instead.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: mcp-weather
+  namespace: ai
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`mcp-weather.example.com`) && PathPrefix(`/mcp`)
+      kind: Rule
+      services:
+        - name: mcp-weather
+          port: 8000
+  tls:
+    secretName: mcp-weather-tls
