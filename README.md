@@ -368,12 +368,31 @@ measure this as a **top-1 tool-selection hit rate**:
   ReadTimeout on the first 4 scored cases).
 
 Run (GitHub Actions): `.github/workflows/eval.yml` kicks this off
-via `workflow_dispatch` (manual button in the Actions tab — leave
-`model` empty to fan out across **qwen2.5:7b + qwen2.5:14b** in
-parallel, or pick a single model for quick iteration) and a nightly
-`cron` at 03:00 UTC. Each model gets its own runner (16 GB RAM /
-4 vCPU), its own Ollama model cache (`ollama-<model>-v1`), its own
-job summary with the scored table.
+via `workflow_dispatch` and a nightly `cron` at 03:00 UTC. Each
+runner gets 16 GB RAM / 4 vCPU, its own Ollama model cache
+(`ollama-<model>-v1`), and its own job summary with the scored table.
+
+Three matrix axes, fan-out independently:
+
+- **model** — `qwen2.5:7b` + `qwen2.5:14b` by default (leave input
+  empty), or pick a single model via the `model` dropdown.
+- **output_schema** — `off` (default), `on`, or `both`. The `both`
+  setting runs the outputSchema A/B experiment; see ROADMAP's
+  "Experiments → outputSchema A/B" section.
+- **chunk_count** — `1`, `2` (default), or `4`. Shards the 40-prompt
+  suite across parallel rows so the 14b-on-CPU path fits inside the
+  45-minute per-row ceiling. Widest fanout (2 × 2 × 4 = 16 rows) is
+  still under the 20-concurrent-job free-tier cap.
+
+**Named recipes**: `scripts/eval.sh <recipe>` wraps `gh workflow run`
+so you don't have to remember axis combinations. Recipes: `quick`
+(single 7b, 1 chunk — ~15 min), `matrix` (default nightly shape),
+`schema-ab` (A/B experiment, 8 parallel rows), `full` (widest fanout,
+16 rows), `14b-only`. Run `scripts/eval.sh help` for the full list.
+
+Step logs stream live — each per-case line appears as it happens via
+`PYTHONUNBUFFERED=1` + `python -u` + `flush=True`, so you can watch
+progress instead of waiting for a final wall of text.
 
 Run (locally, against your own Ollama): point the script at a
 running Ollama and MCP server:

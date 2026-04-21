@@ -250,8 +250,14 @@ def summarise(results: list[dict], threshold: float) -> int:
 async def main_async(args: argparse.Namespace) -> int:
     cases_path = Path(args.cases)
     cfg = yaml.safe_load(cases_path.read_text())
-    cases = cfg["cases"]
+    all_cases = cfg["cases"]
+    cases = _slice_cases(all_cases, args.chunk_index, args.chunk_count)
     threshold = cfg.get("pass_threshold", 0.70)
+    if args.chunk_count > 1:
+        print(
+            f"Sharded: {len(cases)}/{len(all_cases)} cases "
+            f"(chunk {args.chunk_index + 1}/{args.chunk_count})"
+        )
 
     # Fetch the tool catalog once — it doesn't change between cases.
     try:
@@ -311,7 +317,14 @@ async def main_async(args: argparse.Namespace) -> int:
             mark = "✓" if picked == expected else "×"
             args_str = _format_arguments(arguments)
             tail = (picked or "<no tool_call>") + args_str
-            print(f"  [{i:>3}/{len(cases)}] {mark} {latency:>5.1f}s  {prompt[:55]:<57} → {tail}")
+            # flush=True so GitHub Actions streams the line immediately.
+            # Without it, Python's block-buffered stdout (pipe → tee)
+            # holds every case's line until the whole suite finishes,
+            # and the step looks like a black screen for 20+ minutes.
+            print(
+                f"  [{i:>3}/{len(cases)}] {mark} {latency:>5.1f}s  {prompt[:55]:<57} → {tail}",
+                flush=True,
+            )
             results.append({
                 "prompt": prompt,
                 "expected": expected,
@@ -352,6 +365,21 @@ def _default_timeout_for_model(model: str) -> float:
     return _DEFAULT_TIMEOUTS_BY_MODEL_SIZE["7b"]
 
 
+def _slice_cases(cases: list[dict], index: int, count: int) -> list[dict]:
+    """Stride-based sharding: case[0,count,2*count,...] → chunk 0.
+
+    Stride (not contiguous) is deliberate — it spreads every intent
+    family across every chunk, so the warm-up cost amortises evenly
+    and per-chunk `pass_threshold` checks don't collapse when a
+    chunk happens to inherit only radio-station cases.
+    """
+    if count <= 1:
+        return cases
+    if not (0 <= index < count):
+        raise ValueError(f"chunk index {index} out of range [0, {count})")
+    return cases[index::count]
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--cases", default=str(Path(__file__).parent / "cases.yaml"))
@@ -369,10 +397,28 @@ def main() -> int:
         default=float(timeout_env) if timeout_env else None,
         help="Per-request timeout in seconds (default: 300 for 14b, 120 for 7b)",
     )
+    # Sharding lets the matrix fan each model × schema combo into N
+    # parallel chunks so the 14b-on-CPU row no longer bumps the
+    # workflow's 45-min ceiling. Warm-up and model-pull still happen
+    # per chunk — trade-off accepted, wall-clock wins.
+    p.add_argument(
+        "--chunk-index",
+        type=int,
+        default=int(os.environ.get("EVAL_CHUNK_INDEX", "0")),
+        help="Zero-based chunk index (stride = chunk_count).",
+    )
+    p.add_argument(
+        "--chunk-count",
+        type=int,
+        default=int(os.environ.get("EVAL_CHUNK_COUNT", "1")),
+        help="Total number of chunks the case list is sharded into.",
+    )
     args = p.parse_args()
     if args.timeout is None:
         args.timeout = _default_timeout_for_model(args.model)
     print(f"Per-request timeout: {args.timeout:.0f}s (model={args.model})")
+    if args.chunk_count > 1:
+        print(f"Running chunk {args.chunk_index + 1}/{args.chunk_count}")
     return asyncio.run(main_async(args))
 
 

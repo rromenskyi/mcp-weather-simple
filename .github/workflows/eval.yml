@@ -54,6 +54,21 @@ on:
           - 'off'
           - 'on'
           - 'both'
+      chunk_count:
+        description: >-
+          Shard the 40-prompt suite across N parallel runners. 1 = one
+          row runs every case (the 2-vCPU 14b path bumps the 45-min
+          ceiling). 2 = default; 14b finishes ~25 min per row. 4 =
+          aggressive split for when other axes (output_schema=both)
+          also fan out — e.g. 2 models × 2 schemas × 4 chunks = 16
+          rows, still under the 20-concurrent-job free-tier cap.
+        required: false
+        default: '2'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '4'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
     # 14b) so nightly trend data covers both sizes. Schedule uses the
@@ -62,8 +77,9 @@ on:
     # when you want to measure the experiment.
     - cron: "0 3 * * *"
 
-# Concurrency lock includes BOTH axes (model + output_schema) so
-# runs with different experiment settings don't cancel each other.
+# Concurrency lock is per (model × schema) — chunk index is NOT in
+# the key so two re-runs of the same (model, schema) combo can't
+# stack up, but (7b,off) runs independently from (14b,on) etc.
 concurrency:
   group: >-
     eval-tool-calling-${{ github.event.inputs.model || 'matrix' }}-${{ github.event.inputs.output_schema || 'off' }}
@@ -87,6 +103,8 @@ jobs:
     outputs:
       models: ${{ steps.pick.outputs.models }}
       schemas: ${{ steps.pick.outputs.schemas }}
+      chunks: ${{ steps.pick.outputs.chunks }}
+      chunk_count: ${{ steps.pick.outputs.chunk_count }}
     steps:
       - id: pick
         run: |
@@ -102,15 +120,28 @@ jobs:
           else
             echo "schemas=[\"$schema\"]" >> "$GITHUB_OUTPUT"
           fi
+          # Chunk count defaults to 2 (schedule default + explicit).
+          # Build the indices array inline so the eval job can use it
+          # straight via fromJSON with matrix expansion.
+          count='${{ github.event.inputs.chunk_count || '2' }}'
+          case "$count" in
+            1) echo 'chunks=["0"]' >> "$GITHUB_OUTPUT" ;;
+            2) echo 'chunks=["0","1"]' >> "$GITHUB_OUTPUT" ;;
+            4) echo 'chunks=["0","1","2","3"]' >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unsupported chunk_count=$count" >&2 ; exit 1 ;;
+          esac
+          echo "chunk_count=$count" >> "$GITHUB_OUTPUT"
 
   eval:
     needs: plan
-    name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }}
+    name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }} / chunk ${{ matrix.chunk }}
     runs-on: ubuntu-latest
-    # Generous but bounded — a cold 14b run pulls ~9 GB and inferences
-    # at ~1.5-2 tok/s (vs ~3-4 tok/s for 7b). 40 prompts × ~30 s each
-    # + pull = ~25-30 min for 14b. 45 min gives headroom without
-    # hanging forever.
+    # Generous but bounded. With the default chunk_count=2, 14b on
+    # CPU now runs ~20 cases + warm-up + model pull ≈ 20-25 min per
+    # row, comfortably under the ceiling. chunk_count=1 puts full
+    # 40 cases back on one row and needs the headroom the 45-min cap
+    # provides; anything above 4 chunks won't fit the 20-job
+    # free-tier concurrent cap when combined with `output_schema=both`.
     timeout-minutes: 45
     strategy:
       # A single row failure shouldn't cancel its siblings — we want
@@ -119,6 +150,7 @@ jobs:
       matrix:
         model: ${{ fromJSON(needs.plan.outputs.models) }}
         schema: ${{ fromJSON(needs.plan.outputs.schemas) }}
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -192,17 +224,27 @@ jobs:
           OLLAMA_URL: http://127.0.0.1:11434
           MCP_URL: http://127.0.0.1:8000/mcp
           OLLAMA_MODEL: ${{ matrix.model }}
+          # Sharding env — the harness reads these to pick a
+          # stride-N subset of cases.yaml so this row runs ~1/N of
+          # the suite in parallel with its siblings.
+          EVAL_CHUNK_INDEX: ${{ matrix.chunk }}
+          EVAL_CHUNK_COUNT: ${{ needs.plan.outputs.chunk_count }}
+          # Force line-buffered stdout so GitHub Actions streams each
+          # per-case line to the step log as it happens. Without this
+          # Python block-buffers through the `| tee` pipe and the step
+          # looks like a black screen until the whole suite finishes.
+          PYTHONUNBUFFERED: "1"
         # Tee'ing so the raw table lives in the log AND gets captured
         # for the step summary below.
         run: |
           set -o pipefail
-          uv run python tests/integration/eval_tool_calling.py 2>&1 | tee /tmp/eval.out
+          uv run python -u tests/integration/eval_tool_calling.py 2>&1 | tee /tmp/eval.out
 
       - name: Publish results to the job summary
         if: always()
         run: |
           {
-            echo "### Tool-calling eval — ${{ matrix.model }} · outputSchema=${{ matrix.schema }}"
+            echo "### Tool-calling eval — ${{ matrix.model }} · outputSchema=${{ matrix.schema }} · chunk ${{ matrix.chunk }}/${{ needs.plan.outputs.chunk_count }}"
             echo ""
             echo '```'
             tail -60 /tmp/eval.out 2>/dev/null || echo "(no output captured)"
@@ -213,11 +255,12 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          # Artifact name must be unique across matrix rows, otherwise
-          # GHA refuses the upload with "artifact already exists".
-          # Both matrix axes (model + schema) in the name so "both"
-          # fanouts don't collide.
-          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}
+          # Artifact name must be unique across all matrix rows,
+          # otherwise GHA refuses the upload with "artifact already
+          # exists". All three axes (model + schema + chunk) in the
+          # name so the widest fanout (2×2×4 = 16 rows) doesn't
+          # collide.
+          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}-chunk-${{ matrix.chunk }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log
