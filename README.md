@@ -14,11 +14,38 @@ Two transports in a single codebase:
 
 ## Tools
 
-| Tool                         | Description                                      |
-|------------------------------|--------------------------------------------------|
-| `geocode_city(city)`         | Resolve a city name to lat/lon and timezone.     |
-| `get_current_weather(city)`  | Current temperature, humidity, wind, conditions. |
-| `get_forecast(city, days=7)` | Daily forecast, 1–16 days ahead.                 |
+| Tool                                               | Description                                                                                                                                           |
+|----------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `get_current_date(timezone="UTC")`                       | Today's date, weekday and the timezone used as anchor. Call this first when the user asks about "today" / "tomorrow" / a weekday. |
+| `get_current_time_in_city(city, country_code=None)`      | Current local date, time, weekday, UTC offset and timezone for a city or postal code — answers "what time is it in Kyiv?" without arithmetic. |
+| `detect_my_location_by_ip(ip=None)`                      | GeoIP lookup (ipwho.is, no key, HTTPS). Answers "where am I?" / "weather here?" by returning city, country, timezone, lat/lon and local clock. Feed `city` straight into the weather tools. Inside k8s this reports the cluster's egress IP city, not the browser's — pass `ip` explicitly when that matters. |
+| `find_place_coordinates(city, country_code=None)`        | Resolve a city name or postal code to lat/lon and timezone. `country_code` (ISO-3166-1 alpha-2) disambiguates homonyms and zip-code collisions. |
+| `search_places(query, country_code=None, feature_types=None, limit=5)` | Return every geocoding candidate for an ambiguous query — towns, mountains, lakes, islands, neighborhoods, airports, etc. Each candidate carries a `feature_type` human label; filter with `feature_types=["city"]` for only towns, or leave unset to see every kind. |
+| `get_current_weather_in_city(city, country_code=None)`   | Current temperature, humidity, wind, conditions. |
+| `get_weather_forecast(city, days=7, country_code=None)`  | Daily forecast, 1–16 days ahead. Each entry carries `day_label` ("today", "tomorrow", "in N days") anchored to the city's local timezone. |
+| `get_hourly_forecast(city, hours=24, country_code=None)` | Hour-by-hour forecast (up to 168 h = 7 days). Timestamps in the city's local timezone. |
+| `get_sunrise_sunset(city, date_iso=None, days=1, country_code=None)` | Sunrise, sunset, daylight duration and sunshine duration for one or more consecutive days. |
+| `get_air_quality(city, country_code=None)`               | Current PM2.5 / PM10 / ozone / NO2 / SO2 / CO plus European and US AQI indices. |
+| `get_weather_by_coordinates(latitude, longitude)`        | Current weather at raw lat/lon — skips the geocoder entirely. Useful with coordinates from `detect_my_location_by_ip` or pasted from a map app. |
+| `get_historical_weather(city, start_date_iso, end_date_iso=None, country_code=None)` | Daily archive (1940–present). Up to 31 days per request. |
+| `get_wikipedia_summary(title, lang="en")`                | ~300-char Wikipedia summary + page URL. Answers "tell me about X". |
+| `get_country_info(country)`                              | Country facts: capital, population, currencies, languages, calling code, borders, timezones. Accepts ISO code or plain name. |
+| `get_public_holidays(country_code, year=None)`           | Public / bank holidays for a country in a given year. Backed by `date.nager.at`. |
+| `convert_currency(amount, from_currency, to_currency)`   | Fiat currency conversion at today's rate. ISO-4217 codes. |
+| `list_radio_stations(country=None, tag=None, language=None, limit=10)` | Browse internet-radio stations by country, tag or language. Volunteer catalogue (radio-browser.info) with mirror fallback. |
+
+### No-arg shortcuts for common questions
+
+Pre-composed tools whose **name alone** tells the model which user question they answer. Each one auto-detects the caller's city via GeoIP (so the user doesn't have to name their city) and calls the appropriate lower-level tool.
+
+| Tool | Answers the question |
+|---|---|
+| `get_weather_outside_right_now()` | "What's the weather outside?" / «какая погода на улице?» |
+| `get_weather_forecast_for_today()` | "What's the weather today?" / «какая погода сегодня?» |
+| `get_weather_forecast_for_tomorrow()` | "What's the forecast for tomorrow?" / «прогноз на завтра?» |
+| `get_current_time_where_i_am()` | "What time is it?" / «который сейчас час?» |
+
+The lower-level tools stay available for precise follow-ups (another city, a specific date, longer horizon).
 
 ## What is `uv`?
 
