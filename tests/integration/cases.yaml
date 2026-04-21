@@ -141,8 +141,21 @@ cases:
   # the follow-up signal "right tool + wrong args".
   - prompt: "Is it raining in Bountiful, Utah, 84010?"
     expected_tool: get_current_weather_in_city
-  - prompt: "Looking up the place: Bountiful, Utah, 84010"
-    expected_tool: search_places
+
+  # ── Address normalisation (resolve_address, issue #16) ─────────────────
+  # Explicit-intent address parsing: the user's phrasing says "parse
+  # / resolve / normalise / lookup this address", and the input
+  # contains multiple comma-separated parts or a street number. All
+  # three should pick resolve_address over search_places or the
+  # weather tools — search_places handles ambiguous single tokens,
+  # weather tools expect clean names, resolve_address is the escape
+  # hatch specifically for full postal strings.
+  - prompt: "Resolve this address to coordinates: 221B Baker Street, London"
+    expected_tool: resolve_address
+  - prompt: "Parse Bountiful, Utah, 84010 into city, state, postcode"
+    expected_tool: resolve_address
+  - prompt: "Нормализуй адрес: Бульвар Лобановского, 23, Киев"
+    expected_tool: resolve_address
 
 # Minimum hit-rate to consider the model "dialed in" for this surface.
 # Set below 1.0 because LLMs are not deterministic even at T=0 — a

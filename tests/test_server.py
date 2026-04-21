@@ -703,6 +703,167 @@ async def test_search_places_returns_hint_when_comma_query_is_empty():
     assert "SINGLE token" in resp["hint"]
 
 
+# ── resolve_address (#16) ────────────────────────────────────────────────
+
+
+_NOMINATIM_HIT_BOUNTIFUL = [
+    {
+        "lat": "40.88939",
+        "lon": "-111.88077",
+        "display_name": "Bountiful, Davis County, Utah, 84010, United States",
+        "address": {
+            "city": "Bountiful",
+            "county": "Davis County",
+            "state": "Utah",
+            "postcode": "84010",
+            "country": "United States",
+            "country_code": "us",
+        },
+    }
+]
+
+_PHOTON_FEATURE_BOUNTIFUL = {
+    "features": [
+        {
+            "geometry": {"coordinates": [-111.88077, 40.88939], "type": "Point"},
+            "properties": {
+                "name": "Bountiful",
+                "city": "Bountiful",
+                "state": "Utah",
+                "country": "United States",
+                "countrycode": "US",
+                "postcode": "84010",
+            },
+        }
+    ]
+}
+
+
+@respx.mock
+async def test_resolve_address_nominatim_hit_normalises_to_shared_shape():
+    # Happy path: Nominatim returns a populated match on the first try.
+    # Every field in our normalised shape comes from the nested
+    # `address` dict; country_code gets upper-cased to match our
+    # ISO-3166 convention downstream.
+    respx.get(server.NOMINATIM_URL).mock(
+        return_value=httpx.Response(200, json=_NOMINATIM_HIT_BOUNTIFUL)
+    )
+    r = await server.resolve_address("Bountiful, Utah, 84010")
+    assert r["relay_to_user"] is True
+    assert r["city"] == "Bountiful"
+    assert r["state"] == "Utah"
+    assert r["country_code"] == "US"  # upper-cased from "us"
+    assert r["postcode"] == "84010"
+    assert abs(r["latitude"] - 40.88939) < 1e-6
+    assert r["source"] == "nominatim"
+
+
+@respx.mock
+async def test_resolve_address_falls_back_to_photon_when_nominatim_is_empty():
+    # Nominatim sometimes returns [] for addresses OSM does tag but
+    # Photon indexes differently. Fall-through must populate the
+    # same shape but flag `source: "photon"` so operators can tell
+    # from logs which path served the hit.
+    respx.get(server.NOMINATIM_URL).mock(return_value=httpx.Response(200, json=[]))
+    respx.get(server.PHOTON_URL).mock(
+        return_value=httpx.Response(200, json=_PHOTON_FEATURE_BOUNTIFUL)
+    )
+    r = await server.resolve_address("Bountiful, Utah, 84010")
+    assert r["relay_to_user"] is True
+    assert r["source"] == "photon"
+    assert r["city"] == "Bountiful"
+    assert r["country_code"] == "US"
+
+
+@respx.mock
+async def test_resolve_address_falls_back_to_photon_when_nominatim_errors():
+    # 500 on Nominatim should NOT crash — drop through to Photon.
+    respx.get(server.NOMINATIM_URL).mock(return_value=httpx.Response(503))
+    respx.get(server.PHOTON_URL).mock(
+        return_value=httpx.Response(200, json=_PHOTON_FEATURE_BOUNTIFUL)
+    )
+    r = await server.resolve_address("Bountiful, Utah, 84010")
+    assert r["source"] == "photon"
+
+
+@respx.mock
+async def test_resolve_address_retries_nominatim_with_script_language_as_last_hop():
+    # Hop 3: OSM has a Japanese-only name tag for the place, so
+    # Nominatim-English returns empty AND Photon returns empty too.
+    # The retry with `accept-language=ja` finally finds it. Covers
+    # the "native-script-only place" failure mode.
+    ja_hit = [{
+        "lat": "35.44",
+        "lon": "139.65",
+        "display_name": "横浜市, 神奈川県, 日本",
+        "address": {
+            "city": "横浜市",
+            "state": "神奈川県",
+            "country": "日本",
+            "country_code": "jp",
+        },
+    }]
+    call_count = {"n": 0}
+
+    def nominatim_handler(request):
+        call_count["n"] += 1
+        accept_lang = request.headers.get("Accept-Language", "")
+        # First hop: accept-language=en → empty. Later hop with "ja"
+        # → populated.
+        if accept_lang == "en":
+            return httpx.Response(200, json=[])
+        if "ja" in accept_lang.lower():
+            return httpx.Response(200, json=ja_hit)
+        return httpx.Response(200, json=[])
+
+    respx.get(server.NOMINATIM_URL).mock(side_effect=nominatim_handler)
+    respx.get(server.PHOTON_URL).mock(return_value=httpx.Response(200, json={"features": []}))
+
+    r = await server.resolve_address("横浜市中区")
+    assert r["relay_to_user"] is True
+    assert r["city"] == "横浜市"
+    assert r["country_code"] == "JP"
+    assert call_count["n"] >= 2  # at least en + ja
+
+
+@respx.mock
+async def test_resolve_address_returns_relay_to_user_false_when_all_sources_empty():
+    # No source has a match. The tool MUST NOT silently lie with a
+    # plausible-looking but wrong hit; instead it returns
+    # relay_to_user=false + guidance telling the LLM to ask the
+    # user to rephrase.
+    respx.get(server.NOMINATIM_URL).mock(return_value=httpx.Response(200, json=[]))
+    respx.get(server.PHOTON_URL).mock(return_value=httpx.Response(200, json={"features": []}))
+    r = await server.resolve_address("zzz nowhere zzz")
+    assert r["relay_to_user"] is False
+    assert "rephrase" in r["guidance"].lower() or "ask the user" in r["guidance"].lower()
+    assert r["candidates"] == []
+
+
+@respx.mock
+async def test_resolve_address_sends_nominatim_user_agent_per_osm_tos():
+    # Nominatim ToS requires a descriptive User-Agent. We share the
+    # same UA with radio-browser since it's one repo. This test
+    # pins that contract — removing the UA would be a silent ToS
+    # violation.
+    captured = {}
+
+    def handler(request):
+        captured["ua"] = request.headers.get("User-Agent", "")
+        captured["lang"] = request.headers.get("Accept-Language", "")
+        return httpx.Response(200, json=_NOMINATIM_HIT_BOUNTIFUL)
+
+    respx.get(server.NOMINATIM_URL).mock(side_effect=handler)
+    await server.resolve_address("Bountiful, Utah, 84010")
+    assert "mcp-weather-simple" in captured["ua"]
+    assert captured["lang"] == "en"
+
+
+async def test_resolve_address_rejects_empty_input():
+    with pytest.raises(ValueError, match="non-empty"):
+        await server.resolve_address("   ")
+
+
 @respx.mock
 async def test_geocode_error_stays_generic_without_comma():
     respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={"results": []}))

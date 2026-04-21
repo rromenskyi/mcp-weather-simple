@@ -161,6 +161,14 @@ RADIO_BROWSER_MIRRORS = (
 # The radio-browser ToS asks clients to identify themselves so abusive
 # integrations can be banned without collateral damage.
 RADIO_BROWSER_UA = "mcp-weather-simple/0.2 (https://github.com/rromenskyi/mcp-weather-simple)"
+# Nominatim (OSM, no key) is our primary address-normalisation source.
+# ToS requires a descriptive User-Agent with contact info and ≤ 1 rps
+# global. Photon (Komoot/OSM, no limit at our volume, returns GeoJSON
+# in a different shape) is the fallback when Nominatim is empty or
+# down. See `resolve_address` for the actual fallback chain.
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+PHOTON_URL = "https://photon.komoot.io/api"
+OSM_UA = RADIO_BROWSER_UA  # same self-identification string — one repo, one UA
 
 
 async def _fetch_json(
@@ -830,6 +838,231 @@ async def search_places(
     return _respond(response, guidance=guidance)
 
 
+# ── Address normalisation (resolve_address, #16) ──────────────────────────
+#
+# Separate path from `_geocode` / `search_places`: those take a SINGLE
+# canonical token (place name or postal code) — exactly what #14's
+# docstring-first contract enforces. `resolve_address` is the ESCAPE
+# HATCH for the opposite situation: the user really did type a full
+# postal address (`"Bountiful, Utah, 84010"`, `"221B Baker Street,
+# London"`), and the LLM can feed the free-form string here instead of
+# trying to parse it.
+#
+# Sources (no-key, fits our usual pattern):
+#   1. Nominatim (OSM, 1 rps global). Accept-language=en requests an
+#      English display_name so downstream weather tools get Latin
+#      input — OSM has multilingual name tags, so the SEARCH works
+#      for any script regardless of header.
+#   2. Photon (Komoot/OSM, no rate-limit at our volume). Returns
+#      GeoJSON in a different shape; normalised in `_normalise_photon`.
+#   3. Last-ditch: Nominatim again, this time with an accept-language
+#      matching the input script (via `_detect_query_languages`). Helps
+#      when OSM simply lacks a Latin tag for a native-script place.
+# Each hop short-circuits on the first populated result.
+
+
+def _normalise_nominatim_hit(hit: dict, *, address_input: str) -> dict:
+    """Flatten a Nominatim `jsonv2` result into our shared output shape.
+
+    Nominatim's `addressdetails=1` mode surfaces a nested `address`
+    dict whose keys vary by hit type (`city` vs `town` vs `village`
+    vs `hamlet` vs `suburb`). We pick the most-populated bucket in
+    that order — matches how a human would read the address.
+    """
+    addr = hit.get("address") or {}
+    # Pick the finest-resolution populated-place label that's present;
+    # `neighbourhood` / `suburb` are intentionally NOT here — a weather
+    # query for "Brooklyn" wants NYC, not the neighbourhood label.
+    city = (
+        addr.get("city")
+        or addr.get("town")
+        or addr.get("village")
+        or addr.get("hamlet")
+        or addr.get("municipality")
+    )
+    return {
+        "address": address_input,
+        "city": city,
+        "state": addr.get("state") or addr.get("region"),
+        "country": addr.get("country"),
+        "country_code": (addr.get("country_code") or "").upper() or None,
+        "postcode": addr.get("postcode"),
+        "latitude": float(hit["lat"]) if hit.get("lat") is not None else None,
+        "longitude": float(hit["lon"]) if hit.get("lon") is not None else None,
+        "display_name": hit.get("display_name"),
+        "source": "nominatim",
+    }
+
+
+def _normalise_photon_feature(feat: dict, *, address_input: str) -> dict:
+    """Flatten a Photon GeoJSON feature into our shared output shape.
+
+    Photon returns `properties` with a flat set of optional keys and
+    `geometry.coordinates` in [lon, lat] order (GeoJSON standard).
+    Falls back to `name` when no `city`/`locality` is present —
+    useful for island / rural matches where Photon skips city tags.
+    """
+    props = feat.get("properties") or {}
+    geom = feat.get("geometry") or {}
+    coords = geom.get("coordinates") or [None, None]
+    lon, lat = (coords + [None, None])[:2]
+    city = (
+        props.get("city")
+        or props.get("locality")
+        or props.get("town")
+        or props.get("village")
+        or props.get("name")
+    )
+    cc = (props.get("countrycode") or "").upper() or None
+    # Photon's `name` can already be the best human label — use it to
+    # synthesise a display_name when the feature doesn't ship one.
+    display_parts = [p for p in (props.get("name"), props.get("city"),
+                                  props.get("state"), props.get("country"),
+                                  props.get("postcode")) if p]
+    return {
+        "address": address_input,
+        "city": city,
+        "state": props.get("state"),
+        "country": props.get("country"),
+        "country_code": cc,
+        "postcode": props.get("postcode"),
+        "latitude": float(lat) if lat is not None else None,
+        "longitude": float(lon) if lon is not None else None,
+        "display_name": ", ".join(display_parts) if display_parts else props.get("name"),
+        "source": "photon",
+    }
+
+
+async def _try_nominatim(address: str, country_code: str | None, accept_language: str) -> dict | None:
+    params: dict[str, str | int] = {
+        "q": address,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    if country_code:
+        params["countrycodes"] = country_code.strip().lower()
+    try:
+        data = await _fetch_json(
+            NOMINATIM_URL,
+            service="Nominatim",
+            timeout=5.0,
+            params=params,
+            headers={"User-Agent": OSM_UA, "Accept-Language": accept_language},
+        )
+    except Exception:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    return _normalise_nominatim_hit(data[0], address_input=address)
+
+
+async def _try_photon(address: str, country_code: str | None) -> dict | None:
+    params: dict[str, str | int] = {"q": address, "limit": 1}
+    if country_code:
+        # Photon uses lowercase ISO-2 via `lang` param? No — it uses
+        # `layer` and doesn't have a clean country filter. Skip.
+        pass
+    try:
+        data = await _fetch_json(
+            PHOTON_URL,
+            service="Photon",
+            timeout=5.0,
+            params=params,
+            headers={"User-Agent": OSM_UA},
+        )
+    except Exception:
+        return None
+    features = data.get("features") if isinstance(data, dict) else None
+    if not features:
+        return None
+    feat = features[0]
+    # Apply country_code filter client-side if requested. Photon puts
+    # the ISO-2 in `properties.countrycode`; a mismatch means we asked
+    # for US and got a Canadian hit on a spurious lexical match.
+    if country_code:
+        cc_want = country_code.strip().upper()
+        cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
+        if cc_got and cc_got != cc_want:
+            return None
+    return _normalise_photon_feature(feat, address_input=address)
+
+
+@mcp.tool()
+@_loop_guarded
+async def resolve_address(address: str, country_code: str | None = None) -> dict:
+    """Normalise a free-form postal address into structured components.
+
+    **When to use**: the user's text really is an address — multiple
+    comma-separated parts, a street number, a postcode, a full
+    "street, city, region, country" tail. Classic triggers:
+      - `"Bountiful, Utah, 84010"` — city + state + zip.
+      - `"221B Baker Street, London"` — street-level.
+      - `"Бульвар Лобановського, 23, Київ"` — Cyrillic full address.
+      - `"横浜市中区山下町"` — non-Latin address.
+
+    **When NOT to use**: a single canonical token (plain city name
+    OR bare postcode) — those belong in `find_place_coordinates` /
+    `search_places` / `get_current_weather_in_city` directly. This
+    tool is the escape hatch for the OTHER case.
+
+    **Response** carries latitude/longitude AND English-normalised
+    `city` + `country_code` you can feed straight into the weather /
+    time tools. For example:
+
+        1. `resolve_address("Bountiful, Utah, 84010")`
+           → `{"city": "Bountiful", "country_code": "US",
+                "latitude": 40.89, "longitude": -111.88, …}`
+        2. `get_current_weather_in_city(city="Bountiful",
+                                        country_code="US")`.
+
+    Alternatively for current weather only, one step:
+        `get_weather_by_coordinates(latitude, longitude)`.
+
+    `country_code` (optional, ISO-3166-1 alpha-2) narrows the
+    geocoder when the address is ambiguous across borders. Leave
+    unset if unsure.
+
+    Sources: Nominatim (OSM) primary, Photon fallback; both
+    keyless. See server.py module docstring for the fallback chain.
+    """
+    if not address or not address.strip():
+        raise ValueError("address must be a non-empty string")
+    query = address.strip()
+
+    # Hop 1: Nominatim, English output. OSM's multilingual name tags
+    # let the search match any script; accept-language=en picks the
+    # Latin display where available, keeping downstream weather tools
+    # on familiar ground.
+    hit = await _try_nominatim(query, country_code, accept_language="en")
+    if hit:
+        return _respond(hit)
+
+    # Hop 2: Photon. GeoJSON format, normalised to the same shape.
+    hit = await _try_photon(query, country_code)
+    if hit:
+        return _respond(hit)
+
+    # Hop 3: Nominatim with script-matched accept-language. Last
+    # chance when OSM has only a native-script name tag for the place
+    # and the Latin form we requested in hop 1 wasn't present.
+    for lang in _detect_query_languages(query):
+        if lang == "en":
+            continue  # already tried in hop 1
+        hit = await _try_nominatim(query, country_code, accept_language=lang)
+        if hit:
+            return _respond(hit)
+
+    return _respond(
+        {"address": query, "country_code": country_code, "candidates": []},
+        relay_to_user=False,
+        guidance=(
+            f"No address resolved for {query!r}. Ask the user to "
+            "rephrase or provide more detail (city, country)."
+        ),
+    )
+
+
 # ── No-arg "user-question" shortcuts ───────────────────────────────────────
 #
 # Pre-composed tools whose NAME alone tells a weak model which user question
@@ -1447,10 +1680,18 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
 async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
     """Current weather at raw lat/lon — skips the geocoder entirely.
 
-    Use when the user already has coordinates (e.g. from
-    `detect_my_location_by_ip` or pasted from a map app), or the
-    location isn't a named place (lake, trailhead, offshore). No city
-    lookup, no homonym disambiguation — just the weather at that point.
+    **DO NOT INVENT COORDINATES FROM MEMORY.** Never guess lat/lon for
+    a named place. Coordinates must come from one of:
+      - `detect_my_location_by_ip()` — the caller's own location,
+      - `resolve_address(address=...)` — a parsed postal address,
+      - `find_place_coordinates(city=...)` — a resolved city/postcode,
+      - an explicit value the user pasted from a map app.
+
+    For a named city (e.g. "погода в Bountiful, Utah"), call
+    `get_current_weather_in_city(city="Bountiful", country_code="US")`
+    directly — it does the geocode for you. This tool exists ONLY for
+    unnamed coordinates (lake, trailhead, offshore, or a pre-resolved
+    lat/lon).
     """
     if not (-90.0 <= latitude <= 90.0):
         raise ValueError(f"latitude must be in [-90, 90], got {latitude}")
