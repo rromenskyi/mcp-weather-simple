@@ -33,6 +33,29 @@ jobs:
       - name: Import server (smoke test)
         run: uv run python -c "import server; print(server.mcp.name)"
 
+  pytest:
+    # ~1 s unit suite (respx-mocked, no network). Kept as a separate job
+    # from `python` so the PR status check reads "pytest" cleanly and
+    # caching is per-concern. Runs in parallel with `docker`, so total
+    # wall-clock is unchanged for the build lane. Complements the eval
+    # harness (.github/workflows/eval.yml) which catches tool-selection
+    # regressions but doesn't exercise response shape.
+    name: pytest / unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync with test extras
+        run: uv sync --frozen --extra test
+
+      - name: Run unit tests
+        run: uv run pytest tests/test_server.py -v
+
   docker:
     name: docker / build & push
     runs-on: ubuntu-latest
