@@ -1680,10 +1680,18 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
 async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
     """Current weather at raw lat/lon — skips the geocoder entirely.
 
-    Use when the user already has coordinates (e.g. from
-    `detect_my_location_by_ip` or pasted from a map app), or the
-    location isn't a named place (lake, trailhead, offshore). No city
-    lookup, no homonym disambiguation — just the weather at that point.
+    **DO NOT INVENT COORDINATES FROM MEMORY.** Never guess lat/lon for
+    a named place. Coordinates must come from one of:
+      - `detect_my_location_by_ip()` — the caller's own location,
+      - `resolve_address(address=...)` — a parsed postal address,
+      - `find_place_coordinates(city=...)` — a resolved city/postcode,
+      - an explicit value the user pasted from a map app.
+
+    For a named city (e.g. "погода в Bountiful, Utah"), call
+    `get_current_weather_in_city(city="Bountiful", country_code="US")`
+    directly — it does the geocode for you. This tool exists ONLY for
+    unnamed coordinates (lake, trailhead, offshore, or a pre-resolved
+    lat/lon).
     """
     if not (-90.0 <= latitude <= 90.0):
         raise ValueError(f"latitude must be in [-90, 90], got {latitude}")
