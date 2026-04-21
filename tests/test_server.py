@@ -18,6 +18,181 @@ import respx
 import server
 
 
+# ── Shared fixtures ──────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_loop_detector():
+    # The #19 duplicate-call detector holds a process-wide deque of
+    # recent fingerprints. Without a reset between tests, a tool call
+    # in test A would short-circuit the same call in test B. Wiping
+    # before AND after is paranoid but cheap — keeps the invariant
+    # regardless of test ordering.
+    server._reset_recent_calls()
+    yield
+    server._reset_recent_calls()
+
+
+# ── Loop breaker (#19) ───────────────────────────────────────────────────
+
+
+def test_call_fingerprint_is_stable_across_kwarg_order():
+    # The 2026-04-20 mcphost loop flipped kwarg order on turn 9.
+    # Fingerprints that differ on {country: X, language: Y} vs
+    # {language: Y, country: X} would defeat the detector — sort keys.
+    a = server._call_fingerprint(
+        "list_radio_stations",
+        {"country": "The Russian Federation", "language": "russian", "limit": 5},
+    )
+    b = server._call_fingerprint(
+        "list_radio_stations",
+        {"language": "russian", "limit": 5, "country": "The Russian Federation"},
+    )
+    assert a == b
+
+
+def test_call_fingerprint_differs_when_arguments_differ():
+    a = server._call_fingerprint("get_current_weather_in_city", {"city": "Kyiv"})
+    b = server._call_fingerprint("get_current_weather_in_city", {"city": "Paris"})
+    assert a != b
+
+
+def test_detect_and_record_call_fires_on_second_identical_fingerprint():
+    fp = "deadbeef" * 2
+    assert server._detect_and_record_call(fp) is False  # first sighting
+    assert server._detect_and_record_call(fp) is True   # duplicate
+
+
+def test_detect_and_record_call_expires_entries_past_the_window(monkeypatch):
+    # Simulate time advancing past the window — the prior fingerprint
+    # should be pruned and a re-call is NOT a duplicate. Models genuinely
+    # re-querying five minutes later ("what's the weather in Kyiv now?")
+    # must not get stuck on a stale short-circuit.
+    clock = {"t": 1000.0}
+
+    def fake_monotonic():
+        return clock["t"]
+
+    monkeypatch.setattr(server.time, "monotonic", fake_monotonic)
+
+    fp = "cafebabe" * 2
+    assert server._detect_and_record_call(fp) is False
+    clock["t"] += server._LOOP_WINDOW_SECONDS + 1  # past the window
+    assert server._detect_and_record_call(fp) is False
+
+
+@respx.mock
+async def test_tool_second_identical_call_returns_duplicate_envelope():
+    # End-to-end: call get_current_weather_in_city twice back-to-back.
+    # First call goes through to Open-Meteo; second short-circuits with
+    # relay_to_user=false, guidance naming the tool. The forecast API
+    # is mocked once and would 500 on a second hit — test relies on
+    # the second call never reaching the upstream.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+                     "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "admin1": "Kyiv City", "population": 3_000_000},
+                ]
+            },
+        )
+    )
+    respx.get(server.FORECAST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": "2026-04-21T10:00",
+                    "temperature_2m": 12.3,
+                    "relative_humidity_2m": 60,
+                    "apparent_temperature": 11.0,
+                    "precipitation": 0.0,
+                    "weather_code": 2,
+                    "wind_speed_10m": 10.0,
+                    "wind_direction_10m": 180,
+                },
+            },
+        )
+    )
+
+    first = await server.get_current_weather_in_city("Kyiv")
+    assert first["relay_to_user"] is True
+    assert "location" in first
+
+    second = await server.get_current_weather_in_city("Kyiv")
+    assert second["relay_to_user"] is False
+    assert second["tool_name"] == "get_current_weather_in_city"
+    assert second["duplicate_of_recent_call"] is True
+    assert "Duplicate call" in second["guidance"]
+
+
+@respx.mock
+async def test_loop_guard_ignores_kwarg_order_end_to_end():
+    # Two calls that differ only in keyword order must collide on the
+    # SECOND one. (find_place_coordinates takes city + country_code; we
+    # pass them in opposite orders via **kwargs unpacking.)
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+                     "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "admin1": "Kyiv City", "population": 3_000_000},
+                ]
+            },
+        )
+    )
+
+    first = await server.find_place_coordinates(**{"city": "Kyiv", "country_code": "UA"})
+    assert first["relay_to_user"] is True
+
+    # Reverse the kwarg order on the caller side. Python dicts preserve
+    # insertion order, so sig.bind + sort_keys json is what actually
+    # makes these collide on the server side.
+    second = await server.find_place_coordinates(**{"country_code": "UA", "city": "Kyiv"})
+    assert second["relay_to_user"] is False
+    assert second["duplicate_of_recent_call"] is True
+
+
+@respx.mock
+async def test_loop_guard_allows_different_arguments_to_same_tool():
+    # Swapping city should NOT short-circuit.
+    respx.get(server.GEOCODE_URL).mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "name": req.url.params["name"],
+                        "country": "X", "country_code": "XX",
+                        "latitude": 0.0, "longitude": 0.0,
+                        "timezone": "UTC",
+                        "feature_code": "PPLC", "population": 1_000_000,
+                    }
+                ]
+            },
+        )
+    )
+    a = await server.find_place_coordinates("Kyiv")
+    b = await server.find_place_coordinates("Paris")
+    assert a["relay_to_user"] is True
+    assert b["relay_to_user"] is True
+
+
+def test_instructions_are_wired_into_fastmcp():
+    # FastMCP surfaces `instructions` verbatim in InitializeResult.
+    # The preamble text is part of the contract — pin the three rules.
+    assert "at most 3 tools" in server._INSTRUCTIONS
+    assert "Never repeat an identical tool call" in server._INSTRUCTIONS
+    assert "relay_to_user: false" in server._INSTRUCTIONS
+    # And it's actually attached to the FastMCP instance.
+    assert server.mcp.instructions == server._INSTRUCTIONS
+
+
 # ── Envelope contract (#18) ──────────────────────────────────────────────
 
 

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import collections
+import functools
+import hashlib
+import inspect
+import json
 import os
 import secrets
+import time
 from datetime import date, datetime, timezone as _tz
 from zoneinfo import ZoneInfo
 
@@ -13,7 +19,115 @@ HOST = os.getenv("MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("MCP_PORT", "8000"))
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
-mcp = FastMCP("weather", host=HOST, port=PORT, stateless_http=True)
+# ── Tool-calling policy (#19) ──────────────────────────────────────────────
+#
+# Rendered into `InitializeResult.instructions` so every MCP client
+# (mcphost, OWUI, custom) seeds the model with a short tool-policy
+# preamble. Short on purpose — long instruction blocks get skipped by
+# small models. The 2026-04-20 live session got stuck in an 11-call
+# identical-argument loop across 37 min; this preamble + the
+# server-side duplicate detector below are the two-part defence.
+_INSTRUCTIONS = (
+    "Tool-calling policy (read once per session):\n"
+    "- Call at most 3 tools per user turn. If you still lack what you need, ASK THE USER.\n"
+    "- Never repeat an identical tool call in the same turn — use the previous result or ask.\n"
+    "- When a tool response has `relay_to_user: false`, you MUST clarify with the user before replying. Do not try alternate tools.\n"
+    "- Short `guidance` strings in tool responses are instructions — follow them literally."
+)
+
+mcp = FastMCP(
+    "weather",
+    instructions=_INSTRUCTIONS,
+    host=HOST, port=PORT, stateless_http=True,
+)
+
+
+# ── Duplicate-call detector (#19) ──────────────────────────────────────────
+#
+# Rolling window of recent tool-call fingerprints. Per-process scope
+# is equivalent to per-session state in our sidecar topology — each
+# chat session runs in its own Pod with its own mcp-weather process,
+# so process-local memory IS the session.
+#
+# Tuple is (fingerprint, monotonic_timestamp). maxlen=10 caps memory;
+# entries older than `_LOOP_WINDOW_SECONDS` are pruned on each check.
+_RECENT_CALLS: "collections.deque[tuple[str, float]]" = collections.deque(maxlen=10)
+_LOOP_WINDOW_SECONDS = 120
+
+
+def _reset_recent_calls() -> None:
+    """Clear the detector's state. Exposed for tests — the fixture wipes
+    between cases so a `get_current_weather_in_city("Kyiv")` in test A
+    doesn't short-circuit the same call in test B."""
+    _RECENT_CALLS.clear()
+
+
+def _call_fingerprint(tool_name: str, arguments: dict) -> str:
+    # Sort arg keys so {country: X, language: Y} vs {language: Y,
+    # country: X} hash identically — exactly the argument-order flip
+    # observed on turn 9 of the 2026-04-20 mcphost loop. `default=str`
+    # survives non-JSON-native types (date, float with nan) without
+    # raising; the fingerprint just needs to be stable within the window.
+    payload = json.dumps({"t": tool_name, "a": arguments}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _detect_and_record_call(fingerprint: str) -> bool:
+    """True if this fingerprint matches a recent call still inside the window.
+
+    Always appends the current call (even on duplicates) so the window
+    stays fresh. Returning True does NOT stop the caller from running —
+    the decision to short-circuit is the caller's.
+    """
+    now = time.monotonic()
+    # Prune the left side of the deque until the head is within window.
+    while _RECENT_CALLS and now - _RECENT_CALLS[0][1] > _LOOP_WINDOW_SECONDS:
+        _RECENT_CALLS.popleft()
+    is_dup = any(fp == fingerprint for fp, _ in _RECENT_CALLS)
+    _RECENT_CALLS.append((fingerprint, now))
+    return is_dup
+
+
+def _loop_guarded(fn):
+    """Short-circuit duplicate tool calls with `relay_to_user=false`.
+
+    Wrapped tool, when called a second time with the same arguments
+    inside the window, returns an envelope telling the LLM to use the
+    previous result or clarify — never touches the upstream service
+    again. Signature is preserved via functools.wraps so FastMCP's
+    schema introspection still sees the original typed parameters.
+    """
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            arguments = dict(bound.arguments)
+        except TypeError:
+            # Fall back to kwargs if binding fails (defensive — should
+            # not happen for FastMCP-dispatched calls which always use
+            # kwargs derived from the input schema).
+            arguments = dict(kwargs)
+        fingerprint = _call_fingerprint(fn.__name__, arguments)
+        if _detect_and_record_call(fingerprint):
+            return _respond(
+                {
+                    "tool_name": fn.__name__,
+                    "arguments": arguments,
+                    "duplicate_of_recent_call": True,
+                },
+                relay_to_user=False,
+                guidance=(
+                    f"Duplicate call: you already ran `{fn.__name__}` with "
+                    "these arguments in the last few minutes. Use that "
+                    "previous result or ask the user to clarify — do NOT retry."
+                ),
+            )
+        return await fn(*args, **kwargs)
+
+    return wrapper
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -501,6 +615,7 @@ def _day_label(target: date, today: date) -> str:
 
 
 @mcp.tool()
+@_loop_guarded
 async def find_place_coordinates(city: str, country_code: str | None = None) -> dict:
     """Resolve a city name or postal code to lat/lon, country and timezone.
 
@@ -537,6 +652,7 @@ async def find_place_coordinates(city: str, country_code: str | None = None) -> 
 
 
 @mcp.tool()
+@_loop_guarded
 async def search_places(
     query: str,
     country_code: str | None = None,
@@ -707,6 +823,7 @@ def _respond(
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_weather_outside_right_now() -> dict:
     """What's the weather outside right now, where the user is.
 
@@ -730,6 +847,7 @@ async def get_weather_outside_right_now() -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_weather_forecast_for_today() -> dict:
     """Today's forecast (high / low / conditions / rain chance) where the user is.
 
@@ -748,6 +866,7 @@ async def get_weather_forecast_for_today() -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_current_time_where_i_am() -> dict:
     """What time / date / timezone it is right now, where the user is.
 
@@ -777,6 +896,7 @@ async def get_current_time_where_i_am() -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_weather_forecast_for_tomorrow() -> dict:
     """Tomorrow's forecast (high / low / conditions / rain chance) where the user is.
 
@@ -796,6 +916,7 @@ async def get_weather_forecast_for_tomorrow() -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def detect_my_location_by_ip(ip: str | None = None) -> dict:
     """Auto-detect the caller's approximate location. Takes NO arguments in normal use.
 
@@ -864,6 +985,7 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_current_time_in_city(city: str, country_code: str | None = None) -> dict:
     """Return the current local date, time and timezone of a city or zipcode.
 
@@ -899,6 +1021,7 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_current_date(timezone: str = "UTC") -> dict:
     """Return today's date, weekday and the timezone used for anchoring.
 
@@ -922,6 +1045,7 @@ async def get_current_date(timezone: str = "UTC") -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_current_weather_in_city(city: str, country_code: str | None = None) -> dict:
     """Get the current weather for a city, postal code, or lat/lon name.
 
@@ -966,6 +1090,7 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_weather_forecast(
     city: str,
     days: int = 7,
@@ -1030,6 +1155,7 @@ async def get_weather_forecast(
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_hourly_forecast(
     city: str,
     hours: int = 24,
@@ -1090,6 +1216,7 @@ async def get_hourly_forecast(
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_sunrise_sunset(
     city: str,
     date_iso: str | None = None,
@@ -1152,6 +1279,7 @@ async def get_sunrise_sunset(
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_air_quality(city: str, country_code: str | None = None) -> dict:
     """Current air quality (PM2.5, PM10, ozone, NO2, SO2, CO + AQI) in a city.
 
@@ -1196,6 +1324,7 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
     """Current weather at raw lat/lon — skips the geocoder entirely.
 
@@ -1237,6 +1366,7 @@ async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_historical_weather(
     city: str,
     start_date_iso: str,
@@ -1308,6 +1438,7 @@ async def get_historical_weather(
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
     """Short Wikipedia summary (~300 chars) + page URL for a topic.
 
@@ -1344,6 +1475,7 @@ async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_country_info(country: str) -> dict:
     """Country facts: capital, population, currencies, languages, calling code, neighbours.
 
@@ -1385,6 +1517,7 @@ async def get_country_info(country: str) -> dict:
 
 
 @mcp.tool()
+@_loop_guarded
 async def get_public_holidays(country_code: str, year: int | None = None) -> dict:
     """Public / bank holidays for a country in a given year.
 
@@ -1414,6 +1547,7 @@ async def get_public_holidays(country_code: str, year: int | None = None) -> dic
 
 
 @mcp.tool()
+@_loop_guarded
 async def convert_currency(
     amount: float,
     from_currency: str,
@@ -1447,6 +1581,7 @@ async def convert_currency(
 
 
 @mcp.tool()
+@_loop_guarded
 async def list_radio_stations(
     country: str | None = None,
     tag: str | None = None,
