@@ -40,16 +40,33 @@ on:
           - qwen2.5:14b
           - llama3.1:8b
           - llama3.2:3b
+      output_schema:
+        description: >-
+          outputSchema A/B experiment. Off = current (no spec 2025-06-18
+          outputSchema declared); on = every tool advertises the
+          envelope schema; both = fan out matrix to run each model
+          twice (on + off) so per-family hit-rate deltas and latency
+          deltas are visible on the same PR.
+        required: false
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - 'on'
+          - 'both'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
-    # 14b) so nightly trend data covers both sizes.
+    # 14b) so nightly trend data covers both sizes. Schedule uses the
+    # default `output_schema=off` so nightly-trend numbers stay
+    # comparable over time — flip to `on`/`both` via workflow_dispatch
+    # when you want to measure the experiment.
     - cron: "0 3 * * *"
 
-# Per-model concurrency lock — two runs on the same model never stack
-# up, but 7b and 14b can run side-by-side. Without the `-${{ matrix.model }}`
-# suffix the older run would cancel the newer one mid-flight.
+# Concurrency lock includes BOTH axes (model + output_schema) so
+# runs with different experiment settings don't cancel each other.
 concurrency:
-  group: eval-tool-calling-${{ github.event.inputs.model || 'matrix' }}
+  group: >-
+    eval-tool-calling-${{ github.event.inputs.model || 'matrix' }}-${{ github.event.inputs.output_schema || 'off' }}
   cancel-in-progress: false
 
 permissions:
@@ -57,15 +74,19 @@ permissions:
 
 jobs:
   plan:
-    # Compute the matrix dynamically:
-    #   - workflow_dispatch with `model` set → just that one model
-    #   - workflow_dispatch with `model` empty OR schedule → both 7b and 14b
-    # This lets a single workflow file serve both the "I want to iterate
-    # on descriptions fast, one model is enough" case and the "nightly
-    # regression sweep across sizes" case.
+    # Compute the matrix dynamically on TWO axes:
+    #   - model      → which Ollama model to pull (workflow_dispatch
+    #                  picker or default 7b+14b)
+    #   - schema     → the outputSchema A/B experiment dimension
+    #                  (off/on/both); `both` fans out so per-row
+    #                  deltas are visible on the same PR
+    # Total fanout is |models| × |schemas| parallel jobs. Each gets
+    # its own GHA runner so wall-clock is bounded by the slowest row,
+    # not the sum.
     runs-on: ubuntu-latest
     outputs:
       models: ${{ steps.pick.outputs.models }}
+      schemas: ${{ steps.pick.outputs.schemas }}
     steps:
       - id: pick
         run: |
@@ -75,10 +96,16 @@ jobs:
           else
             echo 'models=["qwen2.5:7b","qwen2.5:14b"]' >> "$GITHUB_OUTPUT"
           fi
+          schema='${{ github.event.inputs.output_schema || 'off' }}'
+          if [ "$schema" = "both" ]; then
+            echo 'schemas=["off","on"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "schemas=[\"$schema\"]" >> "$GITHUB_OUTPUT"
+          fi
 
   eval:
     needs: plan
-    name: eval / ${{ matrix.model }}
+    name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }}
     runs-on: ubuntu-latest
     # Generous but bounded — a cold 14b run pulls ~9 GB and inferences
     # at ~1.5-2 tok/s (vs ~3-4 tok/s for 7b). 40 prompts × ~30 s each
@@ -86,11 +113,12 @@ jobs:
     # hanging forever.
     timeout-minutes: 45
     strategy:
-      # A single model failure shouldn't cancel the sibling job — we
-      # want the other row's numbers even if one regressed badly.
+      # A single row failure shouldn't cancel its siblings — we want
+      # the other axis's numbers even if one regressed badly.
       fail-fast: false
       matrix:
         model: ${{ fromJSON(needs.plan.outputs.models) }}
+        schema: ${{ fromJSON(needs.plan.outputs.schemas) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -138,10 +166,12 @@ jobs:
         # Same entrypoint as the Docker image — uv + server.py with
         # the streamable-http transport bound to loopback. No auth
         # because nothing else on the runner has network access to it.
+        # `MCP_OUTPUT_SCHEMA` wires the A/B experiment into this row.
         env:
           MCP_TRANSPORT: streamable-http
           MCP_HOST: 127.0.0.1
           MCP_PORT: "8000"
+          MCP_OUTPUT_SCHEMA: ${{ matrix.schema }}
         run: |
           nohup uv run server.py > /tmp/mcp.log 2>&1 &
           for i in {1..30}; do
@@ -172,7 +202,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Tool-calling eval — ${{ matrix.model }}"
+            echo "### Tool-calling eval — ${{ matrix.model }} · outputSchema=${{ matrix.schema }}"
             echo ""
             echo '```'
             tail -60 /tmp/eval.out 2>/dev/null || echo "(no output captured)"
@@ -185,7 +215,9 @@ jobs:
         with:
           # Artifact name must be unique across matrix rows, otherwise
           # GHA refuses the upload with "artifact already exists".
-          name: eval-logs-${{ matrix.model }}
+          # Both matrix axes (model + schema) in the name so "both"
+          # fanouts don't collide.
+          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log

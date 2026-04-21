@@ -134,6 +134,54 @@ shortcut code for another reason.
 
 ## Experiments (measure before deciding)
 
+### Methodology: env-var toggle + eval matrix A/B
+
+Our pattern for any design question where the community (or we) have
+no strong prior:
+
+1. **Gate the variant behind an env var read at server module-load
+   time.** Current examples: `MCP_OUTPUT_SCHEMA=on|off` (outputSchema
+   experiment, below), `MCP_AUTH_TOKEN` (bearer-auth enable). The
+   default must match the current behaviour so unrelated callers
+   aren't affected.
+2. **Expose the var as a `workflow_dispatch` input with a
+   `both` option** in `.github/workflows/eval.yml`. Matrix fans out
+   on the new axis so one PR produces numbers for every combination
+   in parallel — wall-clock is bounded by the slowest row, not the
+   sum. Job names and step-summary headers MUST include the variant
+   so results are labelled.
+3. **Measure BOTH hit rate AND latency.** The summariser prints a
+   per-family `mean / p50 / p95 latency` column next to the rate
+   column — some experiments (schema declarations, tool-catalog
+   shape changes) can shift inference speed even when tool-selection
+   accuracy looks flat.
+4. **Promotion rule: ≥ 5 % hit-rate lift at the 7b tier OR a clear
+   latency win** to adopt. Otherwise revert and write the result up
+   here so the question is closed definitively rather than
+   re-surfacing in six months.
+
+The pattern is generic — re-use it for the naming experiment
+(`verb_object` vs `domain_prefix`), per-language dataset signals,
+any future structured-content tweak.
+
+### outputSchema A/B — MCP spec 2025-06-18, no community consensus
+
+modelcontextprotocol discussion #1121 has devs reporting "notable
+improvement" after removing `outputSchema` AND devs defending it. We
+run both through the eval matrix to get our own numbers on qwen2.5's
+tool-selection surface.
+
+- `MCP_OUTPUT_SCHEMA=off` (default): no `outputSchema` declared on
+  any tool — current behaviour, matches the plain-text position.
+- `MCP_OUTPUT_SCHEMA=on`: every tool advertises a shared envelope
+  schema (`relay_to_user` + `guidance` required,
+  `additionalProperties: true` for per-tool body shape). No body-
+  schema-per-tool yet — if hit rate or latency shifts meaningfully
+  we can chase per-tool schemas next.
+- Run `workflow_dispatch` with `output_schema=both` to get
+  4-row matrix (2 models × 2 modes) in one pass. Compare per-family
+  rates and latency percentiles side-by-side.
+
 ### Eval harness v2 (not tracked as a single issue yet — see todo-tomorrow)
 
 - **Per-model timeout bump**: 14b on 4 vCPU needs ~300 s per-request

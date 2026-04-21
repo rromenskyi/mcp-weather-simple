@@ -164,8 +164,36 @@ def _format_arguments(arguments: dict | None) -> str:
     return "(" + ", ".join(parts) + ")"
 
 
+def _latency_stats(rows: list[dict]) -> tuple[float, float, float]:
+    """(mean, p50, p95) in seconds over rows with non-zero latency.
+
+    Zero latencies come from cases that errored before the HTTP call
+    completed (see the `latency=0.0` assignment in `main_async`'s
+    exception branch), so including them would skew the aggregate
+    downward. A family where every case errors shows up as `—` in the
+    table.
+    """
+    lats = sorted(r["latency"] for r in rows if r["latency"] > 0)
+    if not lats:
+        return 0.0, 0.0, 0.0
+    n = len(lats)
+    mean = sum(lats) / n
+    p50 = lats[n // 2]
+    # NIST-style p95: cap at last index so short families don't wrap.
+    p95 = lats[min(n - 1, max(0, int(round(n * 0.95)) - 1))]
+    return mean, p50, p95
+
+
+def _fmt_latency(stats: tuple[float, float, float]) -> str:
+    mean, p50, p95 = stats
+    if mean == 0:
+        return "       —"
+    return f"{mean:5.1f}s / {p50:5.1f}s / {p95:5.1f}s"
+
+
 def summarise(results: list[dict], threshold: float) -> int:
-    """Print a pass/fail table grouped by intent family, return exit code."""
+    """Print a pass/fail + latency table grouped by intent family,
+    return exit code."""
     total = len(results)
     hits = sum(1 for r in results if r["picked"] == r["expected"])
     rate = hits / total if total else 0.0
@@ -176,15 +204,28 @@ def summarise(results: list[dict], threshold: float) -> int:
         family = "_".join(r["expected"].split("_")[:2])  # get_weather, get_current, list_radio, …
         by_family[family].append(r)
 
+    # Header includes latency (mean / p50 / p95) — lets the operator
+    # spot cases where an outputSchema or other tool-catalog change
+    # shifts inference speed even when hit rate looks flat.
     print()
-    print(f"{'family':<30} {'hits':>6} / {'total':>5}  {'rate':>6}")
-    print("-" * 58)
+    header = (
+        f"{'family':<28} {'hits':>6} / {'total':>5}  {'rate':>6}   "
+        f"{'mean / p50 / p95 latency':>28}"
+    )
+    print(header)
+    print("-" * len(header))
     for family, rows in sorted(by_family.items()):
         fhits = sum(1 for r in rows if r["picked"] == r["expected"])
         ftotal = len(rows)
-        print(f"{family:<30} {fhits:>6} / {ftotal:>5}  {fhits / ftotal:>6.1%}")
-    print("-" * 58)
-    print(f"{'OVERALL':<30} {hits:>6} / {total:>5}  {rate:>6.1%}   (threshold {threshold:.0%})")
+        print(
+            f"{family:<28} {fhits:>6} / {ftotal:>5}  {fhits / ftotal:>6.1%}   "
+            f"{_fmt_latency(_latency_stats(rows)):>28}"
+        )
+    print("-" * len(header))
+    print(
+        f"{'OVERALL':<28} {hits:>6} / {total:>5}  {rate:>6.1%}   "
+        f"{_fmt_latency(_latency_stats(results)):>28}   (threshold {threshold:.0%})"
+    )
 
     print()
     failures = [r for r in results if r["picked"] != r["expected"]]
