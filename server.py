@@ -313,6 +313,9 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
             results = filtered
     if not results:
         raise ValueError(_city_not_found_error(city, country_code))
+    # Internal helper — returns a bare annotated dict, callers wrap it
+    # with _respond() when they're exposed as a tool. _geocode itself
+    # is not a @mcp.tool.
     return _annotate(results[0])
 
 
@@ -360,7 +363,7 @@ async def find_place_coordinates(city: str, country_code: str | None = None) -> 
     first if you want to see every candidate, filter by feature type,
     and pick one explicitly.
     """
-    return await _geocode(city, country_code=country_code)
+    return _respond(await _geocode(city, country_code=country_code))
 
 
 @mcp.tool()
@@ -443,7 +446,26 @@ async def search_places(
     # call instead of reporting "no such place".
     if not candidates and "," in query:
         response["hint"] = _city_not_found_error(query, country_code)
-    return response
+    # Envelope guidance:
+    # - 0 candidates → relay "nothing found" (+ hint when present).
+    # - 1 candidate → relay directly.
+    # - 2+ candidates → tell the model to list them if the user asked
+    #   for a list, or to clarify otherwise. The `relay_to_user: true`
+    #   stays on here because search_places is EXPLICITLY called for
+    #   disambiguation — flipping it to false would make the model
+    #   stall on every intentional "list all Springfields" request.
+    #   #17 takes over the relay_to_user=false path for the implicit
+    #   disambiguation case inside `_geocode`.
+    if not candidates:
+        guidance = response.get("hint") or f"No places found for {query!r}. Ask the user to rephrase."
+    elif len(candidates) == 1:
+        guidance = _GUIDANCE_DIRECT
+    else:
+        guidance = (
+            f"{len(candidates)} candidates — if the user asked for a list, "
+            "relay them; otherwise ask which one."
+        )
+    return _respond(response, guidance=guidance)
 
 
 # ── No-arg "user-question" shortcuts ───────────────────────────────────────
@@ -468,13 +490,50 @@ async def _here_city() -> tuple[str, str | None]:
     return city, cc
 
 
-# Same warning attached to every GeoIP-backed response so the model never
-# forgets to surface the uncertainty to the user.
-_GEOIP_WARNING = (
-    "Location was auto-detected from the caller's public IP — it may be "
-    "wrong when the user is behind a VPN, a corporate NAT or a data-center "
-    "egress. If the user contradicts the result, ask them to name their city."
+# ── Response envelope (#18) ────────────────────────────────────────────────
+#
+# Every successful tool response carries two top-level fields:
+#   relay_to_user: bool - true  = model can answer directly from this data
+#                         false = model MUST clarify with the user first
+#                                 (e.g. ambiguous input, multiple candidates,
+#                                 duplicate call — see #17, #19)
+#   guidance:      str  - plain-English one-liner telling the model what to
+#                         do with the body. Small models follow instructions
+#                         better than they interpret a controlled vocabulary
+#                         like `confidence: enum`, so we use prose.
+#
+# The envelope is the substrate for the loop-breaking work: #17 flips
+# `relay_to_user` to false when the geocoder finds multiple strong
+# matches, and #19's duplicate-call detector will return a short-circuit
+# envelope with guidance like "you just ran this, ask the user instead".
+
+
+_GUIDANCE_DIRECT = "Relay directly."
+
+# Guidance for every GeoIP-backed path. Kept short on purpose — small
+# models truncate or ignore long instructions. The full rationale
+# (VPN / NAT / cluster egress specifics) is in the repo; the LLM just
+# needs the action verb + the uncertainty flag.
+_GUIDANCE_GEOIP_AUTODETECT = (
+    "Relay with a caveat: city was auto-detected from the caller's IP and "
+    "may be wrong (VPN / NAT). If the user disagrees, ask for the city."
 )
+_GUIDANCE_GEOIP_EXPLICIT = (
+    "Relay with a caveat: city is a GeoIP approximation, may be off for "
+    "VPN / mobile / data-center IPs."
+)
+
+
+def _respond(
+    data: dict,
+    *,
+    relay_to_user: bool = True,
+    guidance: str = _GUIDANCE_DIRECT,
+) -> dict:
+    # Merge the envelope on top of the payload so it always takes
+    # precedence — tools that accidentally emit a `relay_to_user` or
+    # `guidance` key in their body cannot override the contract.
+    return {**data, "relay_to_user": relay_to_user, "guidance": guidance}
 
 
 @mcp.tool()
@@ -489,11 +548,10 @@ async def get_weather_outside_right_now() -> dict:
     """
     city, cc = await _here_city()
     weather = await get_current_weather_in_city(city, country_code=cc)
-    return {
-        **weather,
-        "location_source": "geoip_autodetected",
-        "accuracy_warning": _GEOIP_WARNING,
-    }
+    return _respond(
+        {**weather, "location_source": "geoip_autodetected"},
+        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+    )
 
 
 @mcp.tool()
@@ -506,11 +564,10 @@ async def get_weather_forecast_for_today() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=1, country_code=cc)
-    return {
-        **result,
-        "location_source": "geoip_autodetected",
-        "accuracy_warning": _GEOIP_WARNING,
-    }
+    return _respond(
+        {**result, "location_source": "geoip_autodetected"},
+        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+    )
 
 
 @mcp.tool()
@@ -525,19 +582,21 @@ async def get_current_time_where_i_am() -> dict:
     `get_current_time_in_city(city)`.
     """
     loc = await detect_my_location_by_ip()
-    return {
-        "city": loc.get("city"),
-        "country": loc.get("country"),
-        "country_code": loc.get("country_code"),
-        "timezone_id": loc.get("timezone_id"),
-        "local_date": loc.get("local_date"),
-        "local_time": loc.get("local_time"),
-        "weekday": loc.get("weekday"),
-        "utc_offset": loc.get("utc_offset"),
-        "iso_datetime": loc.get("iso_datetime"),
-        "location_source": "geoip_autodetected",
-        "accuracy_warning": _GEOIP_WARNING,
-    }
+    return _respond(
+        {
+            "city": loc.get("city"),
+            "country": loc.get("country"),
+            "country_code": loc.get("country_code"),
+            "timezone_id": loc.get("timezone_id"),
+            "local_date": loc.get("local_date"),
+            "local_time": loc.get("local_time"),
+            "weekday": loc.get("weekday"),
+            "utc_offset": loc.get("utc_offset"),
+            "iso_datetime": loc.get("iso_datetime"),
+            "location_source": "geoip_autodetected",
+        },
+        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+    )
 
 
 @mcp.tool()
@@ -551,11 +610,10 @@ async def get_weather_forecast_for_tomorrow() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=2, country_code=cc)
-    return {
-        **result,
-        "location_source": "geoip_autodetected",
-        "accuracy_warning": _GEOIP_WARNING,
-    }
+    return _respond(
+        {**result, "location_source": "geoip_autodetected"},
+        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+    )
 
 
 @mcp.tool()
@@ -597,43 +655,33 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
         tz = _tz.utc
         tz_id = "UTC"
     now = datetime.now(tz)
-    # Warning depends on whether the caller supplied an explicit IP:
+    # Guidance depends on whether the caller supplied an explicit IP:
     # auto-detect inherits the caller's NAT/VPN/egress uncertainty,
     # while an explicit lookup is only as accurate as the GeoIP
-    # database for THAT address.
-    if ip:
-        warning = (
-            f"Location is an approximation based on the GeoIP lookup of the explicit "
-            f"IP address {ip!r}. Accuracy depends on the IP-to-geo database used by "
-            "ipwho.is (which itself aggregates multiple upstream sources), and on "
-            "whether the IP belongs to a mobile carrier / VPN / data-center — in any "
-            "of those cases the resolved city can be far from the user's physical "
-            "location. If the user contradicts the result, ask them to name their city."
-        )
-    else:
-        warning = (
-            "Location is an approximation based on the caller's public IP address. "
-            "It may differ from the user's actual location — especially when behind "
-            "a VPN, a data-center / cluster egress, or a carrier-grade NAT. "
-            "If the user contradicts the result, ask them to name their city."
-        )
-    return {
-        "ip": data.get("ip"),
-        "city": data.get("city"),
-        "region": data.get("region"),
-        "country": data.get("country"),
-        "country_code": data.get("country_code"),
-        "latitude": data.get("latitude"),
-        "longitude": data.get("longitude"),
-        "timezone_id": tz_id,
-        "local_time": now.strftime("%H:%M:%S"),
-        "local_date": now.date().isoformat(),
-        "weekday": now.strftime("%A"),
-        "iso_datetime": now.isoformat(timespec="seconds"),
-        "utc_offset": now.strftime("%z"),
-        "location_source": "geoip_explicit" if ip else "geoip_autodetected",
-        "accuracy_warning": warning,
-    }
+    # database for THAT address. Either way the LLM must flag the
+    # uncertainty to the user — that's what `_GUIDANCE_GEOIP_*` does
+    # under #18. Previously this lived in an ad-hoc `accuracy_warning`
+    # body field, which small models often skipped; moving it into
+    # `guidance` elevates it from advisory data to an instruction.
+    return _respond(
+        {
+            "ip": data.get("ip"),
+            "city": data.get("city"),
+            "region": data.get("region"),
+            "country": data.get("country"),
+            "country_code": data.get("country_code"),
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "timezone_id": tz_id,
+            "local_time": now.strftime("%H:%M:%S"),
+            "local_date": now.date().isoformat(),
+            "weekday": now.strftime("%A"),
+            "iso_datetime": now.isoformat(timespec="seconds"),
+            "utc_offset": now.strftime("%z"),
+            "location_source": "geoip_explicit" if ip else "geoip_autodetected",
+        },
+        guidance=_GUIDANCE_GEOIP_EXPLICIT if ip else _GUIDANCE_GEOIP_AUTODETECT,
+    )
 
 
 @mcp.tool()
@@ -656,7 +704,7 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
     except Exception:
         tz = _tz.utc
     now = datetime.now(tz)
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc.get('country', '')}".rstrip(", "),
         "admin1": loc.get("admin1"),
         "country_code": loc.get("country_code"),
@@ -666,7 +714,7 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
         "weekday": now.strftime("%A"),
         "iso_datetime": now.isoformat(timespec="seconds"),
         "utc_offset": now.strftime("%z"),
-    }
+    })
 
 
 @mcp.tool()
@@ -684,12 +732,12 @@ async def get_current_date(timezone: str = "UTC") -> dict:
         tz = _tz.utc
         timezone = "UTC"
     now = datetime.now(tz)
-    return {
+    return _respond({
         "date": now.date().isoformat(),
         "weekday": now.strftime("%A"),
         "iso_datetime": now.isoformat(timespec="seconds"),
         "timezone": timezone,
-    }
+    })
 
 
 @mcp.tool()
@@ -718,7 +766,7 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
         },
     )
     cur = data.get("current", {})
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "time": cur.get("time"),
         "temperature_c": cur.get("temperature_2m"),
@@ -728,7 +776,7 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
         "wind_kmh": cur.get("wind_speed_10m"),
         "wind_direction_deg": cur.get("wind_direction_10m"),
         "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
-    }
+    })
 
 
 @mcp.tool()
@@ -786,11 +834,11 @@ async def get_weather_forecast(
             "precipitation_probability_pct": d["precipitation_probability_max"][i],
             "wind_max_kmh": d["wind_speed_10m_max"][i],
         })
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "days": out,
-    }
+    })
 
 
 @mcp.tool()
@@ -844,11 +892,11 @@ async def get_hourly_forecast(
             "wind_kmh": h["wind_speed_10m"][i],
             "wind_direction_deg": h["wind_direction_10m"][i],
         })
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "hours": out,
-    }
+    })
 
 
 @mcp.tool()
@@ -904,11 +952,11 @@ async def get_sunrise_sunset(
             "daylight_duration_hhmm": f"{int(dl_s // 3600):02d}:{int((dl_s % 3600) // 60):02d}",
             "sunshine_duration_hhmm": f"{int(ss_s // 3600):02d}:{int((ss_s % 3600) // 60):02d}",
         })
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "days": out,
-    }
+    })
 
 
 @mcp.tool()
@@ -938,7 +986,7 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
         },
     )
     cur = data.get("current", {})
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "time": cur.get("time"),
@@ -950,7 +998,7 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
         "nitrogen_dioxide_ugm3": cur.get("nitrogen_dioxide"),
         "sulphur_dioxide_ugm3": cur.get("sulphur_dioxide"),
         "carbon_monoxide_ugm3": cur.get("carbon_monoxide"),
-    }
+    })
 
 
 @mcp.tool()
@@ -979,7 +1027,7 @@ async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
         },
     )
     cur = data.get("current", {})
-    return {
+    return _respond({
         "latitude": latitude,
         "longitude": longitude,
         "timezone_id": data.get("timezone"),
@@ -991,7 +1039,7 @@ async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
         "wind_kmh": cur.get("wind_speed_10m"),
         "wind_direction_deg": cur.get("wind_direction_10m"),
         "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
-    }
+    })
 
 
 @mcp.tool()
@@ -1049,11 +1097,11 @@ async def get_historical_weather(
             "precipitation_mm": d["precipitation_sum"][i],
             "wind_max_kmh": d["wind_speed_10m_max"][i],
         })
-    return {
+    return _respond({
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "days": out,
-    }
+    })
 
 
 # ── Non-weather knowledge tools ────────────────────────────────────────────
@@ -1090,13 +1138,13 @@ async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
         timeout=5.0,
         headers={"Accept": "application/json"},
     )
-    return {
+    return _respond({
         "title": data.get("title"),
         "description": data.get("description"),
         "extract": data.get("extract"),
         "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
         "lang": lang,
-    }
+    })
 
 
 @mcp.tool()
@@ -1119,7 +1167,7 @@ async def get_country_info(country: str) -> dict:
     languages = hit.get("languages") or {}
     idd = hit.get("idd") or {}
     suffixes = idd.get("suffixes") or [""]
-    return {
+    return _respond({
         "name": (hit.get("name") or {}).get("common"),
         "official_name": (hit.get("name") or {}).get("official"),
         "country_code": hit.get("cca2"),
@@ -1137,7 +1185,7 @@ async def get_country_info(country: str) -> dict:
         "borders": hit.get("borders") or [],
         "timezones": hit.get("timezones") or [],
         "flag_emoji": hit.get("flag"),
-    }
+    })
 
 
 @mcp.tool()
@@ -1162,11 +1210,11 @@ async def get_public_holidays(country_code: str, year: int | None = None) -> dic
         }
         for h in data or []
     ]
-    return {
+    return _respond({
         "country_code": country_code.upper(),
         "year": year,
         "holidays": holidays,
-    }
+    })
 
 
 @mcp.tool()
@@ -1192,14 +1240,14 @@ async def convert_currency(
     if target not in rates:
         raise ValueError(f"Unknown target currency: {target}")
     rate = rates[target]
-    return {
+    return _respond({
         "amount": amount,
         "from": base,
         "to": target,
         "rate": rate,
         "converted": round(amount * rate, 4),
         "rate_date": data.get("time_last_update_utc"),
-    }
+    })
 
 
 @mcp.tool()
@@ -1291,11 +1339,11 @@ async def list_radio_stations(
         }
         for s in filtered[:limit]
     ]
-    return {
+    return _respond({
         "filters": {"country": country, "tag": tag, "language": language},
         "count": len(stations),
         "stations": stations,
-    }
+    })
 
 
 def _run_http_with_auth() -> None:

@@ -17,6 +17,54 @@ import respx
 import server
 
 
+# ── Envelope contract (#18) ──────────────────────────────────────────────
+
+
+def test_respond_adds_default_envelope_fields():
+    # Default path = `relay_to_user=True` + direct-relay guidance; body
+    # is merged underneath so callers can't accidentally overwrite the
+    # envelope.
+    env = server._respond({"foo": 1, "bar": "x"})
+    assert env["foo"] == 1
+    assert env["bar"] == "x"
+    assert env["relay_to_user"] is True
+    assert env["guidance"] == server._GUIDANCE_DIRECT
+
+
+def test_respond_overrides_envelope_even_when_body_sets_the_same_keys():
+    # Tool bodies that accidentally include `relay_to_user` or
+    # `guidance` MUST NOT be able to undermine the contract.
+    env = server._respond(
+        {"relay_to_user": False, "guidance": "attacker-controlled"},
+        relay_to_user=True,
+        guidance="trusted",
+    )
+    assert env["relay_to_user"] is True
+    assert env["guidance"] == "trusted"
+
+
+@respx.mock
+async def test_search_places_guidance_reflects_candidate_count():
+    # Single hit → direct relay. Two+ hits → tell the model to either
+    # list or clarify. Zero hits → error-ish guidance.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "IL",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA"},
+                    {"name": "Springfield", "country_code": "US", "admin1": "MA",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL"},
+                ]
+            },
+        )
+    )
+    multi = await server.search_places("Springfield")
+    assert multi["relay_to_user"] is True  # list-all-Springfields is a legitimate intent
+    assert "candidates" in multi["guidance"] or "candidate" in multi["guidance"]
+
+
 # ── Pure helpers ─────────────────────────────────────────────────────────
 
 
@@ -331,7 +379,11 @@ async def test_shortcut_for_tomorrow_uses_geoip_then_forecast():
 
     assert [d["day_label"] for d in result["days"]] == ["today", "tomorrow"]
     assert result["location_source"] == "geoip_autodetected"
-    assert "accuracy_warning" in result
+    # The old `accuracy_warning` body field is subsumed by #18's
+    # `guidance` envelope — the uncertainty is surfaced as an
+    # instruction to the LLM, not an optional body hint.
+    assert result["relay_to_user"] is True
+    assert "caveat" in result["guidance"].lower()
 
 
 # ── Air quality shape ────────────────────────────────────────────────────
@@ -635,6 +687,11 @@ async def test_geocode_falls_back_from_zh_to_ja_for_han_only_japanese_cities():
 
 @respx.mock
 async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
+    # Addresses below come from RFC 5737 reserved "documentation" ranges
+    # (TEST-NET-2 and TEST-NET-3) — the IETF-sanctioned placeholders for
+    # test / docs / examples. They never route on the public internet,
+    # so accidentally sending a live request would still fail safely
+    # instead of hitting a real host.
     respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={}))
     respx.get(f"{server.GEOIP_URL}/").mock(
         return_value=httpx.Response(
@@ -661,12 +718,16 @@ async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
 
     auto = await server.detect_my_location_by_ip()
     assert auto["location_source"] == "geoip_autodetected"
-    assert "caller's public IP address" in auto["accuracy_warning"]
+    # Guidance strings differ between auto-detect and explicit-IP paths
+    # (subsumed `accuracy_warning` field under #18): auto-detect warns
+    # about the caller's IP being wrong behind NAT/VPN; explicit-IP
+    # warns the IP-to-geo resolution may be off.
+    assert auto["guidance"] == server._GUIDANCE_GEOIP_AUTODETECT
 
     explicit = await server.detect_my_location_by_ip(ip="198.51.100.7")
     assert explicit["location_source"] == "geoip_explicit"
-    assert "198.51.100.7" in explicit["accuracy_warning"]
-    assert "caller's public IP address" not in explicit["accuracy_warning"]
+    assert explicit["guidance"] == server._GUIDANCE_GEOIP_EXPLICIT
+    assert auto["guidance"] != explicit["guidance"]
 
 
 # ── Happy paths for the remaining tools ──────────────────────────────────
