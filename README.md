@@ -168,14 +168,26 @@ env var:
 - `stdio` — default, used when an MCP client spawns the server as a
   subprocess on the same host (Option B).
 
-The HTTP transport exposes three unauthenticated liveness / readiness
-paths (`/healthz`, `/livez`, `/readyz`) that return
-`{"status": "ok", "service": "mcp-weather"}`. They bypass the MCP
-initialize handshake and the bearer-auth middleware entirely, so
-Kubernetes probes stay cheap and don't need a token:
+The HTTP transport exposes three unauthenticated probe paths, split
+by Kubernetes convention. All three bypass the MCP initialize
+handshake and the bearer-auth middleware so probes are cheap and
+never need a token.
+
+- **`/healthz` and `/livez`** — liveness. No I/O; always 200 OK with
+  `{"status": "ok", "service": "mcp-weather", "probe": "liveness"}`.
+  A hung upstream dependency cannot flip liveness, so k8s will never
+  restart the pod just because Open-Meteo is slow.
+- **`/readyz`** — readiness. Actively probes Open-Meteo's geocoder
+  with a 2 s timeout and reports the result. On success: 200 OK with
+  `{"status": "ok", "probe": "readiness", "checks": {"open_meteo": "ok"}}`.
+  On upstream failure: 503 with `{"status": "not_ready", ...,
+  "checks": {"open_meteo": "ReadTimeout"}}` — k8s then drains
+  traffic until upstream clears instead of our server faking
+  readiness.
 
 ```
 curl -sf http://127.0.0.1:8000/healthz
+curl -sf http://127.0.0.1:8000/readyz
 ```
 
 ### Option A — everything in k3s (production path)

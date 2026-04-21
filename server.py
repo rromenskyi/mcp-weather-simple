@@ -1720,17 +1720,44 @@ async def list_radio_stations(
     })
 
 
-HEALTH_PATHS = frozenset({"/healthz", "/livez", "/readyz"})
+LIVENESS_PATHS = frozenset({"/healthz", "/livez"})
+READINESS_PATH = "/readyz"
+HEALTH_PATHS = LIVENESS_PATHS | {READINESS_PATH}
+
+
+async def _readiness_check() -> tuple[bool, dict]:
+    """Probe Open-Meteo's geocoder to decide whether we can serve work.
+
+    The sidecar is a thin wrapper over Open-Meteo — if the geocoder
+    is unreachable, every real tool call will fail the same way, so
+    flipping `/readyz` to 503 lets k8s / the orchestrator surface
+    that signal instead of us faking readiness. Kept ~2 s total so
+    a probe doesn't wedge if upstream is genuinely hanging.
+
+    Returns `(ok, checks_payload)` where `checks_payload` is the
+    per-dependency dict that goes into the JSON response.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            r = await client.get(
+                GEOCODE_URL,
+                params={"name": "Kyiv", "count": 1},
+            )
+            r.raise_for_status()
+        return True, {"open_meteo": "ok"}
+    except Exception as exc:
+        return False, {"open_meteo": f"{type(exc).__name__}"}
 
 
 def _build_http_app():
-    """Build the Starlette app with /healthz + optional bearer auth.
+    """Build the Starlette app with probe endpoints + optional bearer auth.
 
     Extracted from `_run_http_with_auth` so unit tests can drive the
     full middleware stack through an ASGI transport without binding a
-    port. Middleware layering is load-bearing: healthz MUST run BEFORE
-    bearer auth so probes never need a token (Starlette stacks
-    middleware LIFO on the incoming side — last added = outermost).
+    port. Middleware layering is load-bearing: the probe middleware
+    MUST run BEFORE bearer auth so probes never need a token
+    (Starlette stacks middleware LIFO on the incoming side — last
+    added = outermost).
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
@@ -1755,18 +1782,38 @@ def _build_http_app():
         app.add_middleware(BearerAuthMiddleware)
 
     class HealthzMiddleware(BaseHTTPMiddleware):
-        """Cheap liveness / readiness probe paths for Kubernetes.
+        """Kubernetes-style probe paths, split by k8s convention.
 
-        Probes need a tiny unauthenticated 200-OK. Going through `/mcp`
-        would force every probe to do the full MCP `initialize`
-        handshake, which is wasteful and noisy in k8s logs. Intercept
-        the three conventional paths (`/healthz`, `/livez`, `/readyz`)
-        — anything else falls through to the MCP app (and bearer
-        middleware if configured).
+        - `/healthz`, `/livez` — liveness. Process is up, event loop
+          responsive. No I/O — returns 200 immediately so a hung
+          upstream can never fail-loop the pod restart.
+        - `/readyz` — readiness. Active probe against Open-Meteo's
+          geocoder; 503 with details if upstream is unreachable.
+          k8s drains traffic until it clears. Bypasses bearer-auth
+          so k8s probes never need a token.
+
+        All three routes short-circuit before the MCP initialize
+        handshake, which is too expensive to do per probe tick.
         """
         async def dispatch(self, request, call_next):
-            if request.url.path in HEALTH_PATHS:
-                return JSONResponse({"status": "ok", "service": "mcp-weather"})
+            path = request.url.path
+            if path in LIVENESS_PATHS:
+                return JSONResponse({
+                    "status": "ok",
+                    "service": "mcp-weather",
+                    "probe": "liveness",
+                })
+            if path == READINESS_PATH:
+                ok, checks = await _readiness_check()
+                return JSONResponse(
+                    {
+                        "status": "ok" if ok else "not_ready",
+                        "service": "mcp-weather",
+                        "probe": "readiness",
+                        "checks": checks,
+                    },
+                    status_code=200 if ok else 503,
+                )
             return await call_next(request)
 
     # Added LAST so it wraps bearer auth — incoming request hits
