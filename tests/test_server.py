@@ -250,6 +250,40 @@ async def test_shortcut_does_not_leak_inner_call_into_loop_detector():
     assert direct["location"] == "Kyiv, Ukraine"
 
 
+async def test_output_schema_experiment_off_by_default():
+    # Baseline: no tool declares an outputSchema — matches our
+    # pre-experiment behaviour and the MCP ecosystem's plain-text
+    # position (discussion #1121).
+    assert server._OUTPUT_SCHEMA_MODE == "off"
+    tools = await server.mcp.list_tools()
+    assert tools, "expected registered tools"
+    for t in tools:
+        assert t.outputSchema is None, f"{t.name} unexpectedly has an outputSchema"
+
+
+async def test_output_schema_experiment_on_attaches_envelope_schema(monkeypatch):
+    # When the env var is flipped on and the patch function is
+    # re-applied, every tool's wire-level outputSchema is the shared
+    # envelope contract. `relay_to_user` + `guidance` are declared
+    # required; other body fields pass through via additionalProperties.
+    monkeypatch.setattr(server, "_OUTPUT_SCHEMA_MODE", "on")
+    server._apply_output_schema_experiment()
+    try:
+        tools = await server.mcp.list_tools()
+        assert tools, "expected registered tools"
+        for t in tools:
+            schema = t.outputSchema
+            assert schema is not None, f"{t.name} missing outputSchema"
+            assert set(schema["required"]) == {"relay_to_user", "guidance"}
+            assert schema["additionalProperties"] is True
+            assert schema["properties"]["relay_to_user"]["type"] == "boolean"
+            assert schema["properties"]["guidance"]["type"] == "string"
+    finally:
+        # Undo for the rest of the suite — the patch is process-wide.
+        for tool in server.mcp._tool_manager._tools.values():
+            tool.output_schema = None
+
+
 def test_instructions_are_wired_into_fastmcp():
     # FastMCP surfaces `instructions` verbatim in InitializeResult.
     # The preamble text is part of the contract — pin the three rules.

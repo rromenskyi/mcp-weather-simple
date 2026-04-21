@@ -1905,6 +1905,69 @@ def _run_http_with_auth() -> None:
     uvicorn.run(_build_http_app(), host=HOST, port=PORT, log_level="info")
 
 
+# ── outputSchema A/B experiment (no community consensus) ──────────────────
+#
+# MCP spec 2025-06-18 added `outputSchema` + `structuredContent` for tools.
+# Community is split — modelcontextprotocol discussion #1121 has devs
+# reporting "notable improvement" on plain text and others defending
+# schemas. Rather than pick on vibes we run it through the eval matrix.
+#
+# MCP_OUTPUT_SCHEMA="on"  → every tool declares the shared envelope schema
+#                           below (relay_to_user + guidance required, extra
+#                           body fields permitted).
+# MCP_OUTPUT_SCHEMA="off" → no outputSchema on any tool (current default).
+#
+# Set at module import time; the env var is read once and baked into the
+# tool catalog. The eval workflow (.github/workflows/eval.yml) can flip
+# it per-matrix-row so 7b and 14b each get measured on both settings.
+
+_OUTPUT_SCHEMA_MODE = os.getenv("MCP_OUTPUT_SCHEMA", "off").strip().lower()
+
+# Shared schema: every tool's response conforms to the envelope from #18.
+# `additionalProperties: true` lets each tool's body shape vary (weather
+# fields, radio stations, wikipedia snippets, ...) without having to
+# declare per-tool schemas.
+_ENVELOPE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "relay_to_user": {
+            "type": "boolean",
+            "description": (
+                "True = model can answer the user from this body. "
+                "False = model MUST clarify with the user before replying "
+                "(ambiguous input, duplicate call, missing context)."
+            ),
+        },
+        "guidance": {
+            "type": "string",
+            "description": (
+                "Plain-English one-liner instructing the LLM what to do "
+                "with the body. Short on purpose — follow it literally."
+            ),
+        },
+    },
+    "required": ["relay_to_user", "guidance"],
+    "additionalProperties": True,
+}
+
+
+def _apply_output_schema_experiment() -> None:
+    """When MCP_OUTPUT_SCHEMA=on, attach _ENVELOPE_OUTPUT_SCHEMA to every
+    registered tool so the MCP catalog advertises the envelope contract
+    via spec 2025-06-18's `outputSchema` field.
+
+    Runs after all @mcp.tool decorators have registered, so every Tool
+    object is in `mcp._tool_manager._tools` by the time we iterate.
+    """
+    if _OUTPUT_SCHEMA_MODE != "on":
+        return
+    for tool in mcp._tool_manager._tools.values():
+        tool.output_schema = _ENVELOPE_OUTPUT_SCHEMA
+
+
+_apply_output_schema_experiment()
+
+
 if __name__ == "__main__":
     if TRANSPORT == "streamable-http":
         _run_http_with_auth()
