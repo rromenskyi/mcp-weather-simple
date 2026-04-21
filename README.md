@@ -47,6 +47,55 @@ Pre-composed tools whose **name alone** tells the model which user question they
 
 The lower-level tools stay available for precise follow-ups (another city, a specific date, longer horizon).
 
+## Multilingual queries
+
+The geocoder auto-detects the query's writing system and picks the
+matching Open-Meteo `language` index, with a fallback chain for
+scripts that are shared across languages:
+
+| Query example      | Detected script    | Language fallback chain |
+|--------------------|--------------------|--------------------------|
+| `Paris`, `90210`   | Latin              | `en`                     |
+| `Москва`, `Одеса`  | Cyrillic (generic) | `ru` → `uk`              |
+| `Київ`, `Львів`    | Cyrillic with Ukrainian-unique glyphs (`і ї є ґ`) | `uk` → `ru` |
+| `Αθήνα`            | Greek              | `el`                     |
+| `القاهرة`           | Arabic             | `ar`                     |
+| `ירושלים`           | Hebrew             | `he`                     |
+| `北京`, `東京`, `横浜` | CJK Han           | `zh` → `ja` → `ko`      |
+| `東京タワー`        | Japanese (Kana)    | `ja`                     |
+| `서울`             | Korean (Hangul)    | `ko`                     |
+
+The helper tries each language in order and stops at the first
+non-empty result set. Without this chain, `language=en` returns only
+Latin-name hits — so a Cyrillic `Москва` used to resolve to two tiny
+Tajik villages named `Moskva` instead of the Russian capital, and
+`横浜` picked a non-existent Chinese hit instead of Yokohama-JP. The
+fallback means callers can paste any name in its native script and
+get the right city on the first try.
+
+Postal-code queries (`90210`, `SW1A 1AA`) flow through the same
+helper — US/DE/FR postal codes resolve cleanly, UK postcodes are not
+indexed by Open-Meteo. Pair a postal code with `country_code=` to
+avoid cross-country collisions (`10001` matches both New York, US
+and Troyes, FR).
+
+## Location source transparency
+
+Every tool that returns a location derived from GeoIP rather than an
+explicit user input annotates the response with:
+
+- `location_source`: `"geoip_autodetected"` when the caller's public
+  IP was used (the default path) and `"geoip_explicit"` when an IP
+  was supplied as a parameter.
+- `accuracy_warning`: human-readable disclaimer that tells the model
+  to surface the uncertainty to the user — VPN, corporate NAT, cluster
+  egress and mobile carriers all shift the resolved city.
+
+The four no-arg shortcuts (`get_weather_outside_right_now` et al.)
+carry these fields automatically. Explicit-city tools
+(`get_current_weather_in_city(city="Kyiv")`) do not — the caller
+owns the location and no disclaimer is needed.
+
 ## What is `uv`?
 
 [`uv`](https://docs.astral.sh/uv/) is a fast Python project and
