@@ -764,10 +764,16 @@ async def search_places(
 
 
 async def _here_city() -> tuple[str, str | None]:
-    """Resolve the caller's city + country_code from its public IP."""
-    loc = await detect_my_location_by_ip()
-    city = loc.get("city")
-    cc = loc.get("country_code")
+    """Resolve the caller's city + country_code from its public IP.
+
+    Uses `_detect_my_location_by_ip_impl` rather than the @mcp.tool
+    wrapper so the GeoIP call does NOT register with the #19
+    duplicate-call detector — only USER-facing tool invocations
+    should populate that window.
+    """
+    body, _ = await _detect_my_location_by_ip_impl()
+    city = body.get("city")
+    cc = body.get("country_code")
     if not city:
         raise ValueError(
             "GeoIP lookup did not resolve a city for the caller's public IP. "
@@ -834,14 +840,14 @@ async def get_weather_outside_right_now() -> dict:
     name, call `get_current_weather_in_city(city)` instead.
     """
     city, cc = await _here_city()
-    weather = await get_current_weather_in_city(city, country_code=cc)
-    # Pass through a `relay_to_user=False` response verbatim — the inner
-    # call flagged geocoder ambiguity (#17) and re-wrapping with the
-    # GeoIP guidance below would silently override that contract.
-    if not weather.get("relay_to_user", True):
-        return weather
+    body = await _get_current_weather_in_city_impl(city, country_code=cc)
+    # On geocoder ambiguity (#17) the impl returns an envelope with
+    # relay_to_user=False; pass it through verbatim instead of wrapping
+    # it in our GeoIP guidance (which would override the contract).
+    if body.get("relay_to_user") is False:
+        return body
     return _respond(
-        {**weather, "location_source": "geoip_autodetected"},
+        {**body, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
     )
 
@@ -856,11 +862,11 @@ async def get_weather_forecast_for_today() -> dict:
     returns ONE entry from the daily forecast labelled "today".
     """
     city, cc = await _here_city()
-    result = await get_weather_forecast(city, days=1, country_code=cc)
-    if not result.get("relay_to_user", True):
-        return result
+    body = await _get_weather_forecast_impl(city, days=1, country_code=cc)
+    if body.get("relay_to_user") is False:
+        return body
     return _respond(
-        {**result, "location_source": "geoip_autodetected"},
+        {**body, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
     )
 
@@ -877,7 +883,7 @@ async def get_current_time_where_i_am() -> dict:
     about a specific city instead of themselves, call
     `get_current_time_in_city(city)`.
     """
-    loc = await detect_my_location_by_ip()
+    loc, _ = await _detect_my_location_by_ip_impl()
     return _respond(
         {
             "city": loc.get("city"),
@@ -906,13 +912,58 @@ async def get_weather_forecast_for_tomorrow() -> dict:
     so the model can compare); `day_label` on each says which is which.
     """
     city, cc = await _here_city()
-    result = await get_weather_forecast(city, days=2, country_code=cc)
-    if not result.get("relay_to_user", True):
-        return result
+    body = await _get_weather_forecast_impl(city, days=2, country_code=cc)
+    if body.get("relay_to_user") is False:
+        return body
     return _respond(
-        {**result, "location_source": "geoip_autodetected"},
+        {**body, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
     )
+
+
+async def _detect_my_location_by_ip_impl(ip: str | None = None) -> tuple[dict, str]:
+    """Raw GeoIP lookup — returns (body, guidance) without the envelope.
+
+    Decoupled from `@mcp.tool` so internal callers (`_here_city`,
+    shortcut tools) can invoke it without going through the #19 loop
+    guard — otherwise nested calls from a shortcut fingerprint the
+    GeoIP lookup AND the shortcut, turning a second shortcut invocation
+    into a false-positive "duplicate" short-circuit of the inner
+    GeoIP.
+
+    Returning a 2-tuple instead of a ready envelope lets the caller
+    decide whether to expose GeoIP guidance or subsume it into its
+    own guidance (shortcuts do the latter).
+    """
+    target = f"{GEOIP_URL}/{ip}" if ip else f"{GEOIP_URL}/"
+    data = await _fetch_json(target, service="ipwho.is GeoIP", timeout=5.0)
+    if not data.get("success", True):
+        raise ValueError(f"GeoIP lookup failed: {data.get('message', 'unknown reason')}")
+    tz_id = (data.get("timezone") or {}).get("id") or "UTC"
+    try:
+        tz = ZoneInfo(tz_id)
+    except Exception:
+        tz = _tz.utc
+        tz_id = "UTC"
+    now = datetime.now(tz)
+    body = {
+        "ip": data.get("ip"),
+        "city": data.get("city"),
+        "region": data.get("region"),
+        "country": data.get("country"),
+        "country_code": data.get("country_code"),
+        "latitude": data.get("latitude"),
+        "longitude": data.get("longitude"),
+        "timezone_id": tz_id,
+        "local_time": now.strftime("%H:%M:%S"),
+        "local_date": now.date().isoformat(),
+        "weekday": now.strftime("%A"),
+        "iso_datetime": now.isoformat(timespec="seconds"),
+        "utc_offset": now.strftime("%z"),
+        "location_source": "geoip_explicit" if ip else "geoip_autodetected",
+    }
+    guidance = _GUIDANCE_GEOIP_EXPLICIT if ip else _GUIDANCE_GEOIP_AUTODETECT
+    return body, guidance
 
 
 @mcp.tool()
@@ -944,44 +995,8 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
     city is where the server's uplink terminates, which may be far
     from the user.
     """
-    target = f"{GEOIP_URL}/{ip}" if ip else f"{GEOIP_URL}/"
-    data = await _fetch_json(target, service="ipwho.is GeoIP", timeout=5.0)
-    if not data.get("success", True):
-        raise ValueError(f"GeoIP lookup failed: {data.get('message', 'unknown reason')}")
-    tz_id = (data.get("timezone") or {}).get("id") or "UTC"
-    try:
-        tz = ZoneInfo(tz_id)
-    except Exception:
-        tz = _tz.utc
-        tz_id = "UTC"
-    now = datetime.now(tz)
-    # Guidance depends on whether the caller supplied an explicit IP:
-    # auto-detect inherits the caller's NAT/VPN/egress uncertainty,
-    # while an explicit lookup is only as accurate as the GeoIP
-    # database for THAT address. Either way the LLM must flag the
-    # uncertainty to the user — that's what `_GUIDANCE_GEOIP_*` does
-    # under #18. Previously this lived in an ad-hoc `accuracy_warning`
-    # body field, which small models often skipped; moving it into
-    # `guidance` elevates it from advisory data to an instruction.
-    return _respond(
-        {
-            "ip": data.get("ip"),
-            "city": data.get("city"),
-            "region": data.get("region"),
-            "country": data.get("country"),
-            "country_code": data.get("country_code"),
-            "latitude": data.get("latitude"),
-            "longitude": data.get("longitude"),
-            "timezone_id": tz_id,
-            "local_time": now.strftime("%H:%M:%S"),
-            "local_date": now.date().isoformat(),
-            "weekday": now.strftime("%A"),
-            "iso_datetime": now.isoformat(timespec="seconds"),
-            "utc_offset": now.strftime("%z"),
-            "location_source": "geoip_explicit" if ip else "geoip_autodetected",
-        },
-        guidance=_GUIDANCE_GEOIP_EXPLICIT if ip else _GUIDANCE_GEOIP_AUTODETECT,
-    )
+    body, guidance = await _detect_my_location_by_ip_impl(ip=ip)
+    return _respond(body, guidance=guidance)
 
 
 @mcp.tool()
@@ -1044,6 +1059,41 @@ async def get_current_date(timezone: str = "UTC") -> dict:
     })
 
 
+async def _get_current_weather_in_city_impl(city: str, country_code: str | None = None) -> dict:
+    """Raw current-weather fetch — returns either a bare body dict or,
+    on geocoder ambiguity (#17), a pre-built envelope with
+    `relay_to_user=False`. Decoupled from @mcp.tool so shortcut tools
+    can call it without hitting the #19 loop guard twice.
+    """
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify  # already an envelope (relay_to_user=False)
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                       "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
+            "timezone": "auto",
+        },
+    )
+    cur = data.get("current", {})
+    return {
+        "location": f"{loc['name']}, {loc['country']}",
+        "time": cur.get("time"),
+        "temperature_c": cur.get("temperature_2m"),
+        "apparent_temperature_c": cur.get("apparent_temperature"),
+        "humidity_pct": cur.get("relative_humidity_2m"),
+        "precipitation_mm": cur.get("precipitation"),
+        "wind_kmh": cur.get("wind_speed_10m"),
+        "wind_direction_deg": cur.get("wind_direction_10m"),
+        "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
+    }
+
+
 @mcp.tool()
 @_loop_guarded
 async def get_current_weather_in_city(city: str, country_code: str | None = None) -> dict:
@@ -1060,53 +1110,21 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
     `relay_to_user: false` and the LLM is expected to ask the user
     which place before re-calling.
     """
-    loc, clarify = await _resolve_place(city, country_code=country_code)
-    if clarify:
-        return clarify
-    data = await _fetch_json(
-        FORECAST_URL,
-        service="Open-Meteo forecast",
-        timeout=8.0,
-        params={
-            "latitude": loc["latitude"],
-            "longitude": loc["longitude"],
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                       "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
-            "timezone": "auto",
-        },
-    )
-    cur = data.get("current", {})
-    return _respond({
-        "location": f"{loc['name']}, {loc['country']}",
-        "time": cur.get("time"),
-        "temperature_c": cur.get("temperature_2m"),
-        "apparent_temperature_c": cur.get("apparent_temperature"),
-        "humidity_pct": cur.get("relative_humidity_2m"),
-        "precipitation_mm": cur.get("precipitation"),
-        "wind_kmh": cur.get("wind_speed_10m"),
-        "wind_direction_deg": cur.get("wind_direction_10m"),
-        "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
-    })
+    body = await _get_current_weather_in_city_impl(city, country_code=country_code)
+    if body.get("relay_to_user") is False:
+        return body  # ambiguity envelope — already final
+    return _respond(body)
 
 
-@mcp.tool()
-@_loop_guarded
-async def get_weather_forecast(
+async def _get_weather_forecast_impl(
     city: str,
     days: int = 7,
     country_code: str | None = None,
 ) -> dict:
-    """Get a daily forecast (1-16 days) for a city or postal code.
-
-    Each day entry includes `date` (ISO) plus `day_label` ("today",
-    "tomorrow", "in N days") anchored to the city's local timezone —
-    so the model does not need to know the current date to answer
-    "what's tomorrow". `country_code` is an optional disambiguation
-    hint; see `find_place_coordinates` for details.
-
-    `city` must be a SINGLE token — place name ("Paris") or postal
-    code ("10001"), NEVER a comma-separated address. Put country into
-    `country_code` (ISO-3166 alpha-2).
+    """Raw daily-forecast fetch — returns either a bare body dict or,
+    on geocoder ambiguity (#17), a pre-built envelope with
+    `relay_to_user=False`. Decoupled from @mcp.tool so shortcut tools
+    can call it without hitting the #19 loop guard twice.
     """
     days = max(1, min(int(days), 16))
     loc, clarify = await _resolve_place(city, country_code=country_code)
@@ -1147,11 +1165,36 @@ async def get_weather_forecast(
             "precipitation_probability_pct": d["precipitation_probability_max"][i],
             "wind_max_kmh": d["wind_speed_10m_max"][i],
         })
-    return _respond({
+    return {
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "days": out,
-    })
+    }
+
+
+@mcp.tool()
+@_loop_guarded
+async def get_weather_forecast(
+    city: str,
+    days: int = 7,
+    country_code: str | None = None,
+) -> dict:
+    """Get a daily forecast (1-16 days) for a city or postal code.
+
+    Each day entry includes `date` (ISO) plus `day_label` ("today",
+    "tomorrow", "in N days") anchored to the city's local timezone —
+    so the model does not need to know the current date to answer
+    "what's tomorrow". `country_code` is an optional disambiguation
+    hint; see `find_place_coordinates` for details.
+
+    `city` must be a SINGLE token — place name ("Paris") or postal
+    code ("10001"), NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2).
+    """
+    body = await _get_weather_forecast_impl(city, days=days, country_code=country_code)
+    if body.get("relay_to_user") is False:
+        return body  # ambiguity envelope
+    return _respond(body)
 
 
 @mcp.tool()
