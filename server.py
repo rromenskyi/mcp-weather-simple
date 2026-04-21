@@ -249,6 +249,29 @@ def _detect_query_language(query: str) -> str:
     return _detect_query_languages(query)[0]
 
 
+def _city_not_found_error(query: str, country_code: str | None) -> str:
+    # Open-Meteo matches the whole `name` string literally, so
+    # "Bountiful, Utah, 84010" returns nothing even though Bountiful-UT
+    # is a perfect match for the first token. Rather than leaving the
+    # model guessing, we detect a comma in an empty-result query and
+    # hand back a self-correcting hint: split on the first comma, keep
+    # the head as the probable place name, and suggest re-calling with
+    # `country_code` set.
+    if "," in query:
+        head = query.split(",", 1)[0].strip()
+        suggestion = f"try {head!r}"
+        if not country_code:
+            suggestion += ' with country_code="US" (ISO-3166 alpha-2)'
+        return (
+            f"City not found: {query!r}. This endpoint matches the whole "
+            f"string literally — pass a SINGLE token (place name OR postal "
+            f"code, never a comma-separated address). Put country into "
+            f"`country_code` (ISO-3166 alpha-2). {suggestion}."
+        )
+    tail = f" in {country_code}" if country_code else ""
+    return f"City not found: {query}{tail}"
+
+
 async def _geocode(city: str, country_code: str | None = None) -> dict:
     # Pull candidates so we can filter by `country_code` client-side —
     # Open-Meteo's geocoding endpoint does not accept a country filter and
@@ -289,9 +312,7 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
         if filtered:
             results = filtered
     if not results:
-        raise ValueError(
-            f"City not found: {city}" + (f" in {country_code}" if country_code else "")
-        )
+        raise ValueError(_city_not_found_error(city, country_code))
     return _annotate(results[0])
 
 
@@ -313,22 +334,29 @@ def _day_label(target: date, today: date) -> str:
 async def find_place_coordinates(city: str, country_code: str | None = None) -> dict:
     """Resolve a city name or postal code to lat/lon, country and timezone.
 
-    `city` accepts plain names ("Kyiv", "Paris") and numeric postal
-    codes ("90210", "10001"). Support varies by country — US/DE/FR
-    zipcodes resolve cleanly, UK postcodes (e.g. "SW1A 1AA") are
-    **not** indexed by Open-Meteo and return no result. For a postal
-    code always pass `country_code` too — e.g. `10001` matches both
-    New York, US and Troyes, FR.
+    **Argument contract — read before calling:** `city` MUST be a
+    single canonical token. Valid shapes:
+      - a plain place name: `"Kyiv"`, `"Paris"`, `"Bountiful"`.
+      - a numeric postal code: `"90210"`, `"10001"`, `"84010"`.
+    Invalid — Open-Meteo matches the whole string literally and will
+    return no result:
+      - `"Paris, France"` — country goes into `country_code`, not the name.
+      - `"Bountiful, Utah, 84010"` — address string, never works.
+      - `"Kyiv, Ukraine"` — comma kills the match.
+
+    Postal-code support varies: US/DE/FR zipcodes resolve cleanly;
+    UK postcodes (`"SW1A 1AA"`) are **not** indexed and return empty.
+    For a postal code always pass `country_code` too — `"10001"`
+    matches both New York, US and Troyes, FR.
 
     `country_code` is an optional ISO-3166-1 alpha-2 hint ("US", "UA",
-    "GB"): use it to disambiguate homonyms like "Moscow, RU" vs
-    "Moscow, ID". The response includes `admin1` (state/region) and
-    `postcodes` (list of zip codes tied to the hit) so the caller can
-    verify the right place was picked.
+    "GB") to disambiguate homonyms like "Moscow, RU" vs "Moscow, ID".
+    The response includes `admin1` (state/region) and `postcodes` so
+    the caller can verify the right place was picked.
 
-    Ambiguous queries (e.g. "Springfield" without a country, or a
-    query that could resolve to a town OR a mountain of the same name)
-    still return a single top-ranked hit here — call `search_places(...)`
+    Ambiguous queries (e.g. "Springfield" without a country, or a query
+    that could resolve to a town OR a mountain of the same name) still
+    return a single top-ranked hit here — call `search_places(...)`
     first if you want to see every candidate, filter by feature type,
     and pick one explicitly.
     """
@@ -353,7 +381,11 @@ async def search_places(
     "weather in Bountiful" are legitimately different places).
 
     Parameters:
-    - `query`: name or postal code. Same semantics as `find_place_coordinates`.
+    - `query`: a SINGLE canonical token — place name (`"Springfield"`,
+      `"Bountiful"`) OR postal code (`"84010"`). Do NOT pass a
+      comma-separated address (`"Bountiful, Utah, 84010"`) — Open-Meteo
+      matches the whole string literally and will return empty.
+      Put country into `country_code` below.
     - `country_code`: ISO-3166-1 alpha-2 hint ("US", "UA"). Narrows the
       candidate pool server-side.
     - `feature_types`: optional allowlist of human labels
@@ -368,6 +400,9 @@ async def search_places(
     doesn't match what the user seems to want. The caller can then
     surface the disambiguation choice to the user or pick one on their
     behalf.
+
+    When the query has a comma AND no candidates are found the response
+    grows a `hint` field telling the caller how to rewrite the query.
     """
     limit = max(1, min(int(limit), 10))
     # Same fallback-chain as _geocode — try every candidate language
@@ -396,13 +431,19 @@ async def search_places(
         allowed = {ft.strip().lower() for ft in feature_types if ft}
         results = [h for h in results if (_feature_type(h.get("feature_code")) or "").lower() in allowed]
     candidates = [_annotate(h) for h in results[:limit]]
-    return {
+    response = {
         "query": query,
         "country_code": country_code,
         "feature_types": feature_types,
         "candidates": candidates,
         "ambiguous": len(candidates) > 1,
     }
+    # When the query has a comma and we found nothing, surface the same
+    # self-correcting hint as `_geocode` so the caller can rewrite the
+    # call instead of reporting "no such place".
+    if not candidates and "," in query:
+        response["hint"] = _city_not_found_error(query, country_code)
+    return response
 
 
 # ── No-arg "user-question" shortcuts ───────────────────────────────────────
@@ -604,6 +645,10 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
     tools use — so `country_code` is an optional ISO-3166-1 alpha-2
     hint and the response's `name` / `country` / `admin1` confirm which
     place was picked.
+
+    `city` must be a SINGLE token — place name ("Kyiv") or postal code
+    ("10001"), NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2 like "US", "UA").
     """
     loc = await _geocode(city, country_code=country_code)
     try:
@@ -651,6 +696,11 @@ async def get_current_date(timezone: str = "UTC") -> dict:
 async def get_current_weather_in_city(city: str, country_code: str | None = None) -> dict:
     """Get the current weather for a city, postal code, or lat/lon name.
 
+    `city` must be a SINGLE token — place name ("Kyiv") or postal code
+    ("10001"), NEVER a comma-separated address ("Kyiv, Ukraine" fails;
+    "Bountiful, Utah, 84010" fails). Put country into `country_code`
+    (ISO-3166 alpha-2 like "US", "UA").
+
     `country_code` is an optional ISO-3166-1 alpha-2 hint to disambiguate
     homonyms (e.g. `Moscow, RU` vs `Moscow, ID`).
     """
@@ -694,6 +744,10 @@ async def get_weather_forecast(
     so the model does not need to know the current date to answer
     "what's tomorrow". `country_code` is an optional disambiguation
     hint; see `find_place_coordinates` for details.
+
+    `city` must be a SINGLE token — place name ("Paris") or postal
+    code ("10001"), NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2).
     """
     days = max(1, min(int(days), 16))
     loc = await _geocode(city, country_code=country_code)
@@ -751,6 +805,10 @@ async def get_hourly_forecast(
     tomorrow morning?" — questions where daily aggregates hide the
     timing. Each hour entry is anchored to the city's local timezone.
     `hours` caps the output length (max 168 = 7 days ahead).
+
+    `city` must be a SINGLE token — place name ("Rome") or postal code
+    ("00100"), NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2).
     """
     hours = max(1, min(int(hours), 168))
     # `forecast_days` controls how many days Open-Meteo computes;
@@ -805,6 +863,8 @@ async def get_sunrise_sunset(
     Answers "when does the sun set in Reykjavik today?", "what's the
     daylight duration on June 21 in Kyiv?". Defaults to today (1 day).
 
+    - `city`: a SINGLE token — place name ("Reykjavik") or postal code,
+      NEVER a comma-separated address. Put country into `country_code`.
     - `date_iso`: optional anchor (YYYY-MM-DD). When set, the window
       starts on that date. When `None`, starts today in the city's
       local timezone.
@@ -859,6 +919,10 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
     both the European AQI and the US AQI scales — the model can pick
     the right one for the user's region. Answers "is the air safe in
     Delhi today?", "should I wear a mask outside?".
+
+    `city` must be a SINGLE token — place name ("Delhi") or postal
+    code, NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2).
     """
     loc = await _geocode(city, country_code=country_code)
     data = await _fetch_json(
@@ -943,6 +1007,10 @@ async def get_historical_weather(
     unusually cold in Kyiv last February?". `start_date_iso` is
     required (YYYY-MM-DD); `end_date_iso` defaults to `start_date_iso`
     for a single-day lookup. Max 31 days per request.
+
+    `city` must be a SINGLE token — place name ("Kyiv") or postal
+    code, NEVER a comma-separated address. Put country into
+    `country_code` (ISO-3166 alpha-2).
     """
     start = date.fromisoformat(start_date_iso)
     end = date.fromisoformat(end_date_iso) if end_date_iso else start
