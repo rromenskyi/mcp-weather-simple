@@ -217,6 +217,17 @@ jobs:
           key: ollama-${{ matrix.model }}-v1
 
       - name: Start Ollama in the background
+        # OLLAMA_CONTEXT_LENGTH=8192 bumps the default 4096-token
+        # context so our ~4500-token tool catalog (22 tools × ~150
+        # tokens desc + schemas + instructions preamble) fits
+        # without silent tail truncation. Observed 2026-04-21 on
+        # the GPU VM: default 4096 was chopping the later tools
+        # from the catalog, and every chat completion came back
+        # coherent-looking but with an empty tool_call — the model
+        # literally didn't see those tools. qwen2.5 supports 128K
+        # natively so 8K is well within spec.
+        env:
+          OLLAMA_CONTEXT_LENGTH: "8192"
         run: |
           ollama serve > /tmp/ollama.log 2>&1 &
           for i in {1..30}; do
