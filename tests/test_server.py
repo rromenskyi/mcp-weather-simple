@@ -81,6 +81,46 @@ async def test_geocode_raises_when_empty():
 
 
 @respx.mock
+async def test_geocode_error_is_self_correcting_for_comma_separated_queries():
+    # Open-Meteo treats `name` as a literal match, so a postal-address
+    # string like "Bountiful, Utah, 84010" yields zero results even
+    # though the first token is a real city. The error must hand the
+    # model a corrective hint — single-token contract, country_code
+    # suggestion, split-on-comma rewrite — instead of a generic
+    # "not found" that the LLM cannot recover from.
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError) as excinfo:
+        await server._geocode("Bountiful, Utah, 84010")
+    msg = str(excinfo.value)
+    assert "SINGLE token" in msg
+    assert "'Bountiful'" in msg  # split-on-comma suggestion
+    assert "country_code" in msg
+
+
+@respx.mock
+async def test_search_places_returns_hint_when_comma_query_is_empty():
+    # search_places doesn't raise (returns empty candidates), but the
+    # hint field surfaces the same self-correcting contract so the
+    # LLM can re-call without a second user prompt.
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={"results": []}))
+    resp = await server.search_places("Bountiful, Utah, 84010")
+    assert resp["candidates"] == []
+    assert "hint" in resp
+    assert "SINGLE token" in resp["hint"]
+
+
+@respx.mock
+async def test_geocode_error_stays_generic_without_comma():
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={"results": []}))
+    with pytest.raises(ValueError) as excinfo:
+        await server._geocode("Nowhereville", country_code="XX")
+    msg = str(excinfo.value)
+    # No comma → no self-correcting hint, just the short form.
+    assert "City not found: Nowhereville in XX" in msg
+    assert "SINGLE token" not in msg
+
+
+@respx.mock
 async def test_geocode_exposes_feature_type_and_postcodes():
     respx.get(server.GEOCODE_URL).mock(
         return_value=httpx.Response(

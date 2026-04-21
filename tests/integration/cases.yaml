@@ -132,6 +132,18 @@ cases:
   - prompt: "Which Springfield is the user asking about? List all options."
     expected_tool: search_places
 
+  # ── Docstring-first: single-token geocoder contract (issue #14) ────────
+  # These prompts are the realistic failure mode — the user drops a
+  # full address in. The model should follow the docstring contract
+  # and pick search_places / get_current_weather_in_city with a clean
+  # `city` token + `country_code`, not paste the whole string in as
+  # `query`. Scoring tool-name only (cases.yaml invariant); #15 adds
+  # the follow-up signal "right tool + wrong args".
+  - prompt: "Is it raining in Bountiful, Utah, 84010?"
+    expected_tool: get_current_weather_in_city
+  - prompt: "Looking up the place: Bountiful, Utah, 84010"
+    expected_tool: search_places
+
 # Minimum hit-rate to consider the model "dialed in" for this surface.
 # Set below 1.0 because LLMs are not deterministic even at T=0 — a
 # single spurious tool pick is not a regression. Tightened over time
