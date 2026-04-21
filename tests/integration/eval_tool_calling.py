@@ -282,14 +282,56 @@ async def main_async(args: argparse.Namespace) -> int:
     return summarise(results, threshold)
 
 
+# Per-model inference speed on the 4 vCPU GHA runner differs by ~2×:
+# qwen2.5:7b runs at ~3-4 tok/s, qwen2.5:14b at ~1.5-2 tok/s. A single
+# tool-call round-trip is therefore 60-150 s on 14b — well over the
+# old 120 s ceiling, which caused 11/13 failures on the 2026-04-20
+# nightly to be `<error: ReadTimeout>` rather than real regressions.
+# Pick a generous default for the larger model; callers can override
+# with `--timeout` / `EVAL_TIMEOUT`.
+_DEFAULT_TIMEOUTS_BY_MODEL_SIZE = {
+    "14b": 300.0,
+    "7b":  120.0,
+}
+
+
+def _default_timeout_for_model(model: str) -> float:
+    """Pick a per-request timeout that fits the model's CPU inference speed.
+
+    Matches on the parameter-count suffix in Ollama model names
+    (`qwen2.5:14b`, `qwen2.5:7b`, `qwen2.5-coder:7b`, ...). Unknown
+    sizes fall back to the 7b ceiling — safe for models this size or
+    smaller, and at least produces a real error instead of silent
+    `<ReadTimeout>` for larger unexpected models.
+    """
+    lowered = model.lower()
+    for tag, seconds in _DEFAULT_TIMEOUTS_BY_MODEL_SIZE.items():
+        if tag in lowered:
+            return seconds
+    return _DEFAULT_TIMEOUTS_BY_MODEL_SIZE["7b"]
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--cases", default=str(Path(__file__).parent / "cases.yaml"))
     p.add_argument("--mcp-url", default=os.environ.get("MCP_URL", "http://127.0.0.1:8000/mcp"))
     p.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"))
     p.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b"))
-    p.add_argument("--timeout", type=float, default=120.0, help="Per-request timeout in seconds")
+    # Timeout can be overridden via `--timeout` or `EVAL_TIMEOUT`.
+    # Leaving it unset auto-picks a ceiling that matches the model size
+    # — 300 s for 14b, 120 s for 7b — so the nightly matrix stops
+    # false-failing on ReadTimeout for the slower row.
+    timeout_env = os.environ.get("EVAL_TIMEOUT")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=float(timeout_env) if timeout_env else None,
+        help="Per-request timeout in seconds (default: 300 for 14b, 120 for 7b)",
+    )
     args = p.parse_args()
+    if args.timeout is None:
+        args.timeout = _default_timeout_for_model(args.model)
+    print(f"Per-request timeout: {args.timeout:.0f}s (model={args.model})")
     return asyncio.run(main_async(args))
 
 
