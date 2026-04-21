@@ -1215,6 +1215,21 @@ async def list_radio_stations(
     "jazz stations". Pass at least one filter; `limit` caps the
     result count (1-50). Data from radio-browser.info (volunteer
     community catalogue).
+
+    **`country` accepts two shapes** — prefer ISO for correctness:
+      - ISO-3166-1 alpha-2 code ("US", "UA", "DE") — routed to
+        radio-browser's exact-code endpoint, returns only stations
+        actually registered in that country.
+      - Full English country name ("United States", "Ukraine",
+        "Germany") — routed to radio-browser's name endpoint, which
+        does a FUZZY substring match. `"US"` passed as a name would
+        wrongly match "Russian Federation", "Australia" etc. —
+        that's why the 2-letter path exists and is preferred.
+
+    **`language` is a full English name**, not an ISO code:
+      - Correct: `"russian"`, `"ukrainian"`, `"english"`, `"spanish"`.
+      - Wrong: `"ru"`, `"uk"`, `"en"` — radio-browser indexes by the
+        spelled-out name and an ISO code returns empty results.
     """
     limit = max(1, min(int(limit), 50))
     if not any([country, tag, language]):
@@ -1225,8 +1240,22 @@ async def list_radio_stations(
     # radio-browser has dedicated /bycountry, /bytag, /bylanguage endpoints;
     # combine filters by intersecting client-side — the API accepts only one
     # selector per call. Start with the most specific filter.
+    #
+    # For `country` we split the path on input shape: a bare 2-letter
+    # alpha token ("US", "ua", "De") hits the exact-code endpoint so the
+    # result set is actually that country. Anything else goes to the
+    # name endpoint. Without this split, "US" passes as a name and the
+    # fuzzy substring match drags back "Russian Federation",
+    # "Australia", etc. (observed live during a 2026-04-20 mcphost
+    # session, issue #13).
     if country:
-        path = f"/stations/bycountry/{httpx.QueryParams({'q': country})['q']}"
+        token = country.strip()
+        if len(token) == 2 and token.isalpha():
+            quoted = httpx.QueryParams({'q': token.upper()})['q']
+            path = f"/stations/bycountrycodeexact/{quoted}"
+        else:
+            quoted = httpx.QueryParams({'q': token})['q']
+            path = f"/stations/bycountry/{quoted}"
     elif tag:
         path = f"/stations/bytag/{httpx.QueryParams({'q': tag})['q']}"
     else:
