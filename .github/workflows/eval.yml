@@ -4,58 +4,93 @@ name: eval tool-calling
 # catalog, walk `tests/integration/cases.yaml`, score tool-selection
 # accuracy. Lives separately from the main `build` workflow because:
 #
-#   - It takes ~10-15 min per run (7B inference on the 2-vCPU runner is
-#     2-4 tok/s, amortised over 40 prompts and a ~5 GB initial pull).
+#   - Each model takes ~10-15 min on the 2-vCPU GHA runner (2-4 tok/s
+#     inference, amortised over 40 prompts and a ~5 GB initial pull).
 #   - It's not on the hot path: a failing tool-selection score is a
 #     signal to re-tune tool docstrings / descriptions, not a blocker
 #     for shipping code changes.
 #
 # Triggers:
-#   - `workflow_dispatch`: manual button in the Actions tab. Use this
-#     when iterating on tool descriptions.
-#   - `schedule`: one nightly run at 03:00 UTC to spot regressions
-#     without the operator thinking about it.
+#   - `workflow_dispatch`: manual button in the Actions tab. By default
+#     runs the full matrix (qwen2.5:7b + qwen2.5:14b, in parallel); an
+#     optional `model` input picks a single model for quick iteration.
+#   - `schedule`: one nightly run at 03:00 UTC across the matrix to
+#     catch regressions over time. The two runners fan out in parallel
+#     so wall-clock is bounded by the slower model, not the sum.
 #
 # Usage guard: GitHub's Additional Product Terms allow Actions for
-# "testing of the software project", which this clearly is. We stay
-# well inside proportionality by capping at ~15 min/day.
+# "testing of the software project", which this clearly is. Matrix of
+# two ~15-min jobs once a day = ~0.5 CPU-hours — well inside anyone's
+# definition of proportional.
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: Ollama model tag to evaluate
-        required: true
-        default: qwen2.5:7b
+        description: >-
+          Single model to evaluate (overrides the default matrix).
+          Leave empty to run qwen2.5:7b + qwen2.5:14b in parallel.
+        required: false
+        default: ''
         type: choice
         options:
+          - ''
           - qwen2.5:7b
           - qwen2.5-coder:7b
           - qwen2.5:14b
           - llama3.1:8b
           - llama3.2:3b
   schedule:
-    # 03:00 UTC every day. Scheduled runs always use qwen2.5:7b —
-    # matches what the platform chat.yaml ships with.
+    # 03:00 UTC every day. Runs the full default matrix (both 7b and
+    # 14b) so nightly trend data covers both sizes.
     - cron: "0 3 * * *"
 
-# Never run two eval jobs at once — the runner can barely hold one 7B
-# model in RAM alongside Ollama, MCP server and the script itself.
+# Per-model concurrency lock — two runs on the same model never stack
+# up, but 7b and 14b can run side-by-side. Without the `-${{ matrix.model }}`
+# suffix the older run would cancel the newer one mid-flight.
 concurrency:
-  group: eval-tool-calling
+  group: eval-tool-calling-${{ github.event.inputs.model || 'matrix' }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  eval:
-    name: eval / ${{ inputs.model || 'qwen2.5:7b' }}
+  plan:
+    # Compute the matrix dynamically:
+    #   - workflow_dispatch with `model` set → just that one model
+    #   - workflow_dispatch with `model` empty OR schedule → both 7b and 14b
+    # This lets a single workflow file serve both the "I want to iterate
+    # on descriptions fast, one model is enough" case and the "nightly
+    # regression sweep across sizes" case.
     runs-on: ubuntu-latest
-    # Generous but bounded — a cold run with first-time model pull
-    # (~5 GB) + 40 prompts @ ~20 s each lands around 25 min. 40 min
-    # leaves headroom for a slower runner without hanging forever.
-    timeout-minutes: 40
+    outputs:
+      models: ${{ steps.pick.outputs.models }}
+    steps:
+      - id: pick
+        run: |
+          single='${{ github.event.inputs.model }}'
+          if [ -n "$single" ]; then
+            echo "models=[\"$single\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo 'models=["qwen2.5:7b","qwen2.5:14b"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  eval:
+    needs: plan
+    name: eval / ${{ matrix.model }}
+    runs-on: ubuntu-latest
+    # Generous but bounded — a cold 14b run pulls ~9 GB and inferences
+    # at ~1.5-2 tok/s (vs ~3-4 tok/s for 7b). 40 prompts × ~30 s each
+    # + pull = ~25-30 min for 14b. 45 min gives headroom without
+    # hanging forever.
+    timeout-minutes: 45
+    strategy:
+      # A single model failure shouldn't cancel the sibling job — we
+      # want the other row's numbers even if one regressed badly.
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.plan.outputs.models) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -75,14 +110,13 @@ jobs:
         run: curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Cache Ollama models
-        # Model blobs live under ~/.ollama/models/blobs; each 7B weighs
-        # ~4.7 GB. Without caching every run re-downloads (~2 min).
-        # Key includes the model name so a matrix across 7b / coder-7b
-        # keeps separate caches.
+        # Model blobs live under ~/.ollama/models/blobs; 7B ~4.7 GB,
+        # 14B ~9 GB. Cache keyed on model so each matrix row has its
+        # own slot — no collisions, no unnecessary evictions.
         uses: actions/cache@v4
         with:
           path: ~/.ollama
-          key: ollama-${{ inputs.model || 'qwen2.5:7b' }}-v1
+          key: ollama-${{ matrix.model }}-v1
 
       - name: Start Ollama in the background
         run: |
@@ -97,7 +131,7 @@ jobs:
 
       - name: Pull model
         env:
-          MODEL: ${{ inputs.model || 'qwen2.5:7b' }}
+          MODEL: ${{ matrix.model }}
         run: ollama pull "$MODEL"
 
       - name: Start mcp-weather over streamable HTTP
@@ -127,7 +161,7 @@ jobs:
         env:
           OLLAMA_URL: http://127.0.0.1:11434
           MCP_URL: http://127.0.0.1:8000/mcp
-          OLLAMA_MODEL: ${{ inputs.model || 'qwen2.5:7b' }}
+          OLLAMA_MODEL: ${{ matrix.model }}
         # Tee'ing so the raw table lives in the log AND gets captured
         # for the step summary below.
         run: |
@@ -138,7 +172,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Tool-calling eval — ${{ inputs.model || 'qwen2.5:7b' }}"
+            echo "### Tool-calling eval — ${{ matrix.model }}"
             echo ""
             echo '```'
             tail -60 /tmp/eval.out 2>/dev/null || echo "(no output captured)"
@@ -149,7 +183,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: eval-logs
+          # Artifact name must be unique across matrix rows, otherwise
+          # GHA refuses the upload with "artifact already exists".
+          name: eval-logs-${{ matrix.model }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log
