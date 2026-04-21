@@ -290,7 +290,8 @@ async def test_shortcut_for_tomorrow_uses_geoip_then_forecast():
         result = await server.get_weather_forecast_for_tomorrow()
 
     assert [d["day_label"] for d in result["days"]] == ["today", "tomorrow"]
-    assert "_note" in result  # shortcut annotates where the city came from
+    assert result["location_source"] == "geoip_autodetected"
+    assert "accuracy_warning" in result
 
 
 # ── Air quality shape ────────────────────────────────────────────────────
@@ -439,3 +440,44 @@ async def test_weather_by_coordinates_rejects_out_of_range_lat():
 async def test_weather_by_coordinates_rejects_out_of_range_lon():
     with pytest.raises(ValueError, match="longitude"):
         await server.get_weather_by_coordinates(latitude=0.0, longitude=-200.0)
+
+
+# ── Script detection for multilingual queries ────────────────────────────
+
+
+def test_detect_query_language_maps_common_scripts():
+    assert server._detect_query_language("Paris") == "en"
+    assert server._detect_query_language("Москва") == "ru"        # Russian Cyrillic
+    assert server._detect_query_language("Київ") == "ru"          # Ukrainian Cyrillic — same script bucket
+    assert server._detect_query_language("Αθήνα") == "el"         # Greek
+    assert server._detect_query_language("القاهرة") == "ar"       # Arabic
+    assert server._detect_query_language("ירושלים") == "he"       # Hebrew
+    assert server._detect_query_language("北京") == "zh"           # CJK Han
+    assert server._detect_query_language("東京") == "ja" or \
+           server._detect_query_language("東京") == "zh"           # Kanji overlap; either is acceptable
+    assert server._detect_query_language("東京タワー") == "ja"      # Katakana forces Japanese
+    assert server._detect_query_language("서울") == "ko"           # Hangul
+
+
+@respx.mock
+async def test_geocode_passes_detected_language_for_cyrillic_queries():
+    # When the query is Cyrillic, the helper should request
+    # `language=ru` so Open-Meteo indexes Russian-native names instead
+    # of falling back to the Latin-only index (which returns only
+    # tiny Tajik villages named "Moskva" for the query "Москва").
+    route = respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Москва", "country": "Россия", "country_code": "RU",
+                     "latitude": 55.75, "longitude": 37.62,
+                     "timezone": "Europe/Moscow", "feature_code": "PPLC",
+                     "admin1": "Moscow", "population": 10381222},
+                ]
+            },
+        )
+    )
+    hit = await server._geocode("Москва")
+    assert hit["country_code"] == "RU"
+    assert route.calls.last.request.url.params["language"] == "ru"
