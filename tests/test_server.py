@@ -391,6 +391,34 @@ async def test_radio_stations_requires_a_filter():
         await server.list_radio_stations()
 
 
+@respx.mock
+async def test_radio_stations_iso2_country_routes_to_exact_code_endpoint():
+    # A live 2026-04-20 mcphost session called
+    # list_radio_stations(country="US") and got back Russian /
+    # Australian stations because /stations/bycountry/ does a fuzzy
+    # substring match. Routing ISO-2 tokens to
+    # /stations/bycountrycodeexact/ fixes it; this test pins the
+    # routing decision.
+    exact = respx.get(
+        f"{server.RADIO_BROWSER_MIRRORS[0]}/stations/bycountrycodeexact/US"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    byname = respx.get(
+        f"{server.RADIO_BROWSER_MIRRORS[0]}/stations/bycountry/US"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    await server.list_radio_stations(country="US")
+    assert exact.called
+    assert not byname.called
+
+
+@respx.mock
+async def test_radio_stations_full_country_name_routes_to_byname():
+    byname = respx.get(
+        f"{server.RADIO_BROWSER_MIRRORS[0]}/stations/bycountry/United%20States"
+    ).mock(return_value=httpx.Response(200, json=[]))
+    await server.list_radio_stations(country="United States")
+    assert byname.called
+
+
 # ── Fetch helper: timeouts and mirror fallback ───────────────────────────
 
 
