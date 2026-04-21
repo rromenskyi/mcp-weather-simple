@@ -9,10 +9,12 @@ import os
 import secrets
 import time
 from datetime import date, datetime, timezone as _tz
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field, create_model
 
 TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 HOST = os.getenv("MCP_HOST", "0.0.0.0")
@@ -464,6 +466,78 @@ def _detect_ambiguity(
     return None
 
 
+def _candidate_label(c: dict) -> str:
+    """Render a geocoder candidate as a human-readable disambiguation
+    label: `"<name>, <admin1>, <country_code>"` with missing parts
+    dropped. Used by both the `relay_to_user=false` envelope AND by
+    the MCP elicitation schema so the user sees identical wording
+    regardless of which disambiguation path fires.
+    """
+    parts = [c.get("name") or "?"]
+    if c.get("admin1"):
+        parts.append(c["admin1"])
+    if c.get("country_code"):
+        parts.append(c["country_code"])
+    return ", ".join(parts)
+
+
+async def _try_elicit_disambiguation(query: str, candidates: list[dict]) -> dict | None:
+    """Ask the MCP client to elicit a choice from the user (#17 via spec 2025-11-25).
+
+    Spec path: `elicitation/create` with form mode, enum-constrained
+    `choice` field. Forward-compatible with Claude Desktop + any
+    FastMCP-based host that advertises `capabilities.elicitation`.
+
+    Returns the chosen candidate dict on success, or None if:
+      * there's no active request context (running outside a tool call,
+        e.g. unit tests without an ASGI session),
+      * the client didn't advertise the elicitation capability (FastMCP
+        raises internally when the session can't route the request),
+      * the user declined / cancelled,
+      * label→candidate reverse lookup failed (shouldn't happen given
+        the schema constrains `choice` to our own labels).
+
+    Callers fall back to the `_ambiguity_response` envelope on None, so
+    clients without elicitation support still get the `relay_to_user:
+    false` signal and the LLM can do the clarification itself.
+    """
+    try:
+        ctx = mcp.get_context()
+        # `ctx.request_context` is a @property that raises ValueError
+        # when we're running outside a request (unit tests, stdio
+        # startup, etc.), so we probe via the private attribute
+        # instead of relying on truthiness.
+        if ctx is None or getattr(ctx, "_request_context", None) is None:
+            return None
+    except Exception:
+        return None
+
+    top = candidates[:5]
+    labels = [_candidate_label(c) for c in top]
+    by_label = dict(zip(labels, top))
+
+    # Dynamic enum via Literal[tuple(...)] — Pydantic turns this into a
+    # JSON-Schema `enum` which FastMCP/MCP forwards as the spec-defined
+    # `requestedSchema` for form-mode elicitation.
+    choice_type = Literal[tuple(labels)]
+    ChoiceModel = create_model(
+        "_DisambigChoice",
+        choice=(choice_type, Field(..., description="Which place did the user mean?")),
+    )
+
+    try:
+        result = await ctx.elicit(
+            message=f"Which '{query}' did you mean?",
+            schema=ChoiceModel,
+        )
+    except Exception:
+        return None
+
+    if result.action != "accept" or result.data is None:
+        return None
+    return by_label.get(getattr(result.data, "choice", None))
+
+
 def _ambiguity_response(query: str, candidates: list[dict], reason: str, country_code: str | None) -> dict:
     """Build the short-circuit envelope for an ambiguous _geocode result.
 
@@ -471,19 +545,13 @@ def _ambiguity_response(query: str, candidates: list[dict], reason: str, country
     answering. Guidance names the first few candidates so the model
     can echo them back to the user without a follow-up `search_places`
     call.
+
+    This is the FALLBACK path: `_try_elicit_disambiguation` runs first
+    and returns a resolved hit when the client supports elicitation.
     """
     # Limit to 5 so guidance stays short even for "Springfield" (36 hits).
     top = candidates[:5]
-
-    def _name(c: dict) -> str:
-        parts = [c.get("name") or "?"]
-        if c.get("admin1"):
-            parts.append(c["admin1"])
-        if c.get("country_code"):
-            parts.append(c["country_code"])
-        return ", ".join(parts)
-
-    names = "; ".join(_name(c) for c in top)
+    names = "; ".join(_candidate_label(c) for c in top)
     # Narrowing advice: if no country_code yet, the easy rewrite is to
     # add one. If country_code is already set (intra-country homonyms
     # like the 5 Bountifuls), the weather tools don't accept `admin1`
@@ -591,6 +659,14 @@ async def _resolve_place(
     """
     loc = await _geocode(city, country_code=country_code)
     if loc.get("_ambiguous"):
+        # Forward-compatible path per MCP spec 2025-11-25: ask the client
+        # to elicit a choice from the user. On success the caller gets a
+        # regular hit as if the geocoder had returned top-1. Clients
+        # that didn't advertise the elicitation capability (OWUI,
+        # mcphost today) silently fall through to the envelope below.
+        chosen = await _try_elicit_disambiguation(city, loc["_candidates"])
+        if chosen is not None:
+            return chosen, None
         return None, _ambiguity_response(
             query=city,
             candidates=loc["_candidates"],
