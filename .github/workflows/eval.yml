@@ -69,6 +69,24 @@ on:
           - '1'
           - '2'
           - '4'
+      docstrings:
+        description: >-
+          Docstring verbosity A/B. Terse = current (CPU-friendly,
+          ~3000 tokens total); verbose = pre-trim pre-2026-04-21
+          shape on find_place_coordinates, search_places,
+          resolve_address (~3500 tokens, richer edge-case
+          guidance). both = fan matrix across both modes. Worst-
+          case fanout combined with output_schema=both + chunk=4
+          is 2 × 2 × 2 × 4 = 32 rows — over the 20-concurrent-job
+          cap. Queue up gracefully; if that bites, drop chunk to
+          2 (→ 16 rows).
+        required: false
+        default: 'terse'
+        type: choice
+        options:
+          - 'terse'
+          - 'verbose'
+          - 'both'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
     # 14b) so nightly trend data covers both sizes. Schedule uses the
@@ -105,6 +123,7 @@ jobs:
       schemas: ${{ steps.pick.outputs.schemas }}
       chunks: ${{ steps.pick.outputs.chunks }}
       chunk_count: ${{ steps.pick.outputs.chunk_count }}
+      docstrings: ${{ steps.pick.outputs.docstrings }}
     steps:
       - id: pick
         run: |
@@ -120,6 +139,12 @@ jobs:
           else
             echo "schemas=[\"$schema\"]" >> "$GITHUB_OUTPUT"
           fi
+          docstrings='${{ github.event.inputs.docstrings || 'terse' }}'
+          if [ "$docstrings" = "both" ]; then
+            echo 'docstrings=["terse","verbose"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "docstrings=[\"$docstrings\"]" >> "$GITHUB_OUTPUT"
+          fi
           # Chunk count defaults to 2 (schedule default + explicit).
           # Build the indices array inline so the eval job can use it
           # straight via fromJSON with matrix expansion.
@@ -134,7 +159,7 @@ jobs:
 
   eval:
     needs: plan
-    name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }} / chunk ${{ matrix.chunk }}
+    name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }} / docs=${{ matrix.docstring }} / chunk ${{ matrix.chunk }}
     runs-on: ubuntu-latest
     # Generous but bounded. With the default chunk_count=2, 14b on
     # CPU now runs ~20 cases + warm-up + model pull ≈ 20-25 min per
@@ -151,6 +176,7 @@ jobs:
         model: ${{ fromJSON(needs.plan.outputs.models) }}
         schema: ${{ fromJSON(needs.plan.outputs.schemas) }}
         chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+        docstring: ${{ fromJSON(needs.plan.outputs.docstrings) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -204,6 +230,7 @@ jobs:
           MCP_HOST: 127.0.0.1
           MCP_PORT: "8000"
           MCP_OUTPUT_SCHEMA: ${{ matrix.schema }}
+          MCP_DOCSTRING_MODE: ${{ matrix.docstring }}
         run: |
           nohup uv run server.py > /tmp/mcp.log 2>&1 &
           for i in {1..30}; do
@@ -244,7 +271,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### Tool-calling eval — ${{ matrix.model }} · outputSchema=${{ matrix.schema }} · chunk ${{ matrix.chunk }}/${{ needs.plan.outputs.chunk_count }}"
+            echo "### Tool-calling eval — ${{ matrix.model }} · outputSchema=${{ matrix.schema }} · docs=${{ matrix.docstring }} · chunk ${{ matrix.chunk }}/${{ needs.plan.outputs.chunk_count }}"
             echo ""
             echo '```'
             tail -60 /tmp/eval.out 2>/dev/null || echo "(no output captured)"
@@ -260,7 +287,7 @@ jobs:
           # exists". All three axes (model + schema + chunk) in the
           # name so the widest fanout (2×2×4 = 16 rows) doesn't
           # collide.
-          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}-chunk-${{ matrix.chunk }}
+          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}-docs-${{ matrix.docstring }}-chunk-${{ matrix.chunk }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log

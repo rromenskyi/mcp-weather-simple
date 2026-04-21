@@ -33,6 +33,12 @@ Recipes (pass one as the first argument):
                2 chunks = 8 parallel rows. Compare per-family hit
                rate AND latency deltas between schema modes.
 
+  docstring-ab The docstring verbosity A/B: 7b + 14b × terse + verbose,
+               2 chunks = 8 parallel rows. Verbose restores pre-trim
+               descriptions on find_place_coordinates, search_places,
+               resolve_address (~540 extra tokens total). Compare
+               whether bigger catalog helps or hurts per model tier.
+
   full         Widest fanout: 7b + 14b × off + on × 4 chunks = 16
                parallel rows. Use when 14b is bumping ceilings on
                `schema-ab` (each row then owns ~10 cases).
@@ -59,6 +65,11 @@ case "${1:-help}" in
     schema-ab)
         gh workflow run "$WORKFLOW" \
             -f output_schema=both \
+            -f chunk_count=2
+        ;;
+    docstring-ab)
+        gh workflow run "$WORKFLOW" \
+            -f docstrings=both \
             -f chunk_count=2
         ;;
     full)

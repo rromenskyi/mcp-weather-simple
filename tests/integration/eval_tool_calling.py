@@ -286,24 +286,36 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"SKIP: model {args.model!r} not installed on this Ollama. Have: {installed}")
             return 0
 
-        # Warm-up: first real chat-with-tools call pulls the model into
-        # Ollama's RAM, which easily takes 30–60 s on a CPU runner. If
-        # we skip it, the first N scored cases all time out and drag
-        # the hit-rate with them — which is a measurement artifact, not
-        # a regression of the tool descriptions. Discard the result;
-        # we only care about its side-effect (a warm model).
-        print("Warming up model (first chat call loads it into RAM)...", end=" ", flush=True)
+        # Warm-up: only purpose is to pull the model weights into Ollama's
+        # RAM so the first SCORED case isn't paying the cold-load tax.
+        # The original warm-up called `run_case` with the full tool catalog
+        # attached — which on the 2-vCPU GHA runner with our ~3000-token
+        # catalog pushes prefill past 120 s and the warm-up itself times
+        # out (observed 2026-04-21 after the catalog grew to 22 tools).
+        #
+        # Fix: minimal `/api/chat` payload with NO tools. Loads the model
+        # weights just as effectively; prefill is tiny because there's
+        # no system-prompt work. Scored cases then pay just their own
+        # prefill + generation, which fits the per-request timeout.
+        print("Warming up model (no tool catalog, just weight load)...", end=" ", flush=True)
+        t0 = time.monotonic()
         try:
-            _, _, warm_latency = await run_case(
-                client, args.ollama_url, args.model,
-                "Hello, this is a warm-up request. Please reply with 'ok'.",
-                ollama_tools,
+            warm_resp = await client.post(
+                f"{args.ollama_url}/api/chat",
+                json={
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 4},
+                },
             )
-            print(f"done in {warm_latency:.1f}s.")
+            warm_resp.raise_for_status()
+            print(f"done in {time.monotonic() - t0:.1f}s.", flush=True)
         except Exception as e:
-            # Warm-up failures are informational — the scored loop below
-            # will surface real problems with its own timeout handling.
-            print(f"warm-up failed ({type(e).__name__}: {e}) — proceeding anyway.")
+            print(
+                f"warm-up failed ({type(e).__name__}: {e}) — proceeding anyway.",
+                flush=True,
+            )
 
         results: list[dict] = []
         for i, case in enumerate(cases, 1):
@@ -343,9 +355,15 @@ async def main_async(args: argparse.Namespace) -> int:
 # nightly to be `<error: ReadTimeout>` rather than real regressions.
 # Pick a generous default for the larger model; callers can override
 # with `--timeout` / `EVAL_TIMEOUT`.
+# Bumped 2026-04-21 after catalog growth (22 tools → ~3000 desc +
+# ~1400 schema tokens) pushed 2-vCPU GHA prefill past the old 120/300 s
+# ceilings. Observed as every scored case failing `<error: ReadTimeout>`
+# and warm-up itself dying on 7b. Current headroom covers worst-case
+# CPU prefill; GPU cuts it back to <5 s so the numbers are harmless
+# there.
 _DEFAULT_TIMEOUTS_BY_MODEL_SIZE = {
-    "14b": 300.0,
-    "7b":  120.0,
+    "14b": 480.0,   # was 300
+    "7b":  240.0,   # was 120
 }
 
 

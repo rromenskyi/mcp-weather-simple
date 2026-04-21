@@ -164,6 +164,27 @@ The pattern is generic — re-use it for the naming experiment
 (`verb_object` vs `domain_prefix`), per-language dataset signals,
 any future structured-content tweak.
 
+### Docstring verbosity A/B — terse vs verbose tool descriptions
+
+Same env-var + matrix pattern as `MCP_OUTPUT_SCHEMA`. Hypothesis is
+model-tier-dependent: small CPU models benefit from terser
+descriptions (less prefill work, crisper signal), bigger models may
+want the richer edge-case guidance for disambiguation. No consensus
+from the broader community either.
+
+- `MCP_DOCSTRING_MODE=terse` (default): source-level shortened
+  descriptions on `find_place_coordinates`, `search_places`,
+  `resolve_address` (top-3 chattiest tools, trimmed 2026-04-21).
+- `MCP_DOCSTRING_MODE=verbose`: restores pre-trim descriptions for
+  those three tools via post-registration override. ~540 extra
+  tokens total (~2172 chars).
+- Run `workflow_dispatch` with `docstrings=both` (or
+  `scripts/eval.sh docstring-ab`) to get a 4-row matrix (2 models ×
+  2 modes) at chunk_count=2. Compare per-family rates + latency.
+
+Same promotion rule as other A/Bs: ≥5% hit-rate lift at the 7b
+tier OR clear latency win to flip the default.
+
 ### outputSchema A/B — MCP spec 2025-06-18, no community consensus
 
 modelcontextprotocol discussion #1121 has devs reporting "notable

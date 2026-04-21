@@ -703,31 +703,20 @@ def _day_label(target: date, today: date) -> str:
 async def find_place_coordinates(city: str, country_code: str | None = None) -> dict:
     """Resolve a city name or postal code to lat/lon, country and timezone.
 
-    **Argument contract — read before calling:** `city` MUST be a
-    single canonical token. Valid shapes:
-      - a plain place name: `"Kyiv"`, `"Paris"`, `"Bountiful"`.
-      - a numeric postal code: `"90210"`, `"10001"`, `"84010"`.
-    Invalid — Open-Meteo matches the whole string literally and will
-    return no result:
-      - `"Paris, France"` — country goes into `country_code`, not the name.
-      - `"Bountiful, Utah, 84010"` — address string, never works.
-      - `"Kyiv, Ukraine"` — comma kills the match.
+    `city` MUST be a single token — `"Kyiv"`, `"Paris"`, `"Bountiful"`
+    or a postal code `"90210"`, `"84010"`. NEVER a comma-separated
+    address: `"Paris, France"`, `"Bountiful, Utah, 84010"` and
+    `"Kyiv, Ukraine"` all return empty — country goes into
+    `country_code` below, not the name. For a full address use
+    `resolve_address` instead.
 
-    Postal-code support varies: US/DE/FR zipcodes resolve cleanly;
-    UK postcodes (`"SW1A 1AA"`) are **not** indexed and return empty.
-    For a postal code always pass `country_code` too — `"10001"`
-    matches both New York, US and Troyes, FR.
+    `country_code` is an optional ISO-3166 alpha-2 hint ("US", "UA")
+    to disambiguate homonyms like "Moscow, RU" vs "Moscow, ID".
 
-    `country_code` is an optional ISO-3166-1 alpha-2 hint ("US", "UA",
-    "GB") to disambiguate homonyms like "Moscow, RU" vs "Moscow, ID".
-    The response includes `admin1` (state/region) and `postcodes` so
-    the caller can verify the right place was picked.
-
-    When multiple comparable places match (e.g. "Springfield" without a
-    country, "Moscow" without country_code, the 5 Bountifuls in different
-    US states), the response flips `relay_to_user` to `false` and lists
-    candidates in `guidance` — the LLM must ask the user which one to
-    pick instead of silently committing to top-1.
+    When multiple comparable places match (Springfield, the 5
+    Bountifuls, …) the response flips `relay_to_user` to `false` and
+    lists candidates — the LLM must ask the user which one before
+    re-calling.
     """
     hit, clarify = await _resolve_place(city, country_code=country_code)
     if clarify:
@@ -743,39 +732,24 @@ async def search_places(
     feature_types: list[str] | None = None,
     limit: int = 5,
 ) -> dict:
-    """Return every geocoding candidate for an ambiguous query.
+    """List candidates for an ambiguous place query: town, mountain,
+    lake, park, airport, etc. Each candidate carries a `feature_type`
+    label so the caller can match user intent (weather on Mt. Bountiful
+    vs weather in Bountiful are different places).
 
-    Deliberately general-purpose: the Open-Meteo geocoder returns not
-    just towns but also mountains, lakes, parks, islands, neighborhoods
-    and airports bearing the same name. Each candidate carries a
-    `feature_type` human label ("city", "mountain", "lake",
-    "neighborhood", "park", "peak", "island", "airport", …) so the
-    caller can match the user's intent ("weather on Mt. Bountiful" vs
-    "weather in Bountiful" are legitimately different places).
+    - `query`: single token — place name or postal code. NEVER a
+      comma-separated address; put country into `country_code`. For
+      a full postal address use `resolve_address`.
+    - `country_code`: ISO-3166 alpha-2 hint ("US", "UA").
+    - `feature_types`: allowlist like `["city", "village"]`
+      (populated places only) or `["mountain", "peak"]`. Empty/None
+      keeps every type.
+    - `limit`: 1-10 (default 5).
 
-    Parameters:
-    - `query`: a SINGLE canonical token — place name (`"Springfield"`,
-      `"Bountiful"`) OR postal code (`"84010"`). Do NOT pass a
-      comma-separated address (`"Bountiful, Utah, 84010"`) — Open-Meteo
-      matches the whole string literally and will return empty.
-      Put country into `country_code` below.
-    - `country_code`: ISO-3166-1 alpha-2 hint ("US", "UA"). Narrows the
-      candidate pool server-side.
-    - `feature_types`: optional allowlist of human labels
-      (e.g. `["city", "village"]` for only populated places, or
-      `["mountain", "peak", "hill"]` for only high ground). Pass
-      `None` / empty to keep every feature type in the results.
-    - `limit`: caps the list length (1-10, default 5).
-
-    Use this tool whenever the user's request is vague — either because
-    the name is ambiguous ("Springfield"), the intent isn't clear
-    (town vs mountain vs lake), or the first hit's `feature_type`
-    doesn't match what the user seems to want. The caller can then
-    surface the disambiguation choice to the user or pick one on their
-    behalf.
-
-    When the query has a comma AND no candidates are found the response
-    grows a `hint` field telling the caller how to rewrite the query.
+    Use when the name is ambiguous ("Springfield"), intent is unclear
+    (town vs mountain), or top-1's `feature_type` doesn't match what
+    the user wants. Empty result with a comma in the query grows a
+    `hint` field suggesting a rewrite.
     """
     limit = max(1, min(int(limit), 10))
     # Same fallback-chain as _geocode — try every candidate language
@@ -991,40 +965,21 @@ async def _try_photon(address: str, country_code: str | None) -> dict | None:
 @mcp.tool()
 @_loop_guarded
 async def resolve_address(address: str, country_code: str | None = None) -> dict:
-    """Normalise a free-form postal address into structured components.
+    """Parse a free-form postal address into structured components.
 
-    **When to use**: the user's text really is an address — multiple
-    comma-separated parts, a street number, a postcode, a full
-    "street, city, region, country" tail. Classic triggers:
-      - `"Bountiful, Utah, 84010"` — city + state + zip.
-      - `"221B Baker Street, London"` — street-level.
-      - `"Бульвар Лобановського, 23, Київ"` — Cyrillic full address.
-      - `"横浜市中区山下町"` — non-Latin address.
+    Use when the input is a full address — multiple comma-separated
+    parts, street number, or a postcode attached: `"Bountiful, Utah,
+    84010"`, `"221B Baker Street, London"`, `"Бульвар Лобановського,
+    23, Київ"`. For a plain city name or bare postcode use
+    `find_place_coordinates` or `get_current_weather_in_city` directly.
 
-    **When NOT to use**: a single canonical token (plain city name
-    OR bare postcode) — those belong in `find_place_coordinates` /
-    `search_places` / `get_current_weather_in_city` directly. This
-    tool is the escape hatch for the OTHER case.
+    Returns latitude, longitude, and English-normalised `city` +
+    `country_code` ready to feed into the weather / time tools.
+    For current weather on the resolved point, pass latitude/longitude
+    into `get_weather_by_coordinates` as the one-step shortcut.
 
-    **Response** carries latitude/longitude AND English-normalised
-    `city` + `country_code` you can feed straight into the weather /
-    time tools. For example:
-
-        1. `resolve_address("Bountiful, Utah, 84010")`
-           → `{"city": "Bountiful", "country_code": "US",
-                "latitude": 40.89, "longitude": -111.88, …}`
-        2. `get_current_weather_in_city(city="Bountiful",
-                                        country_code="US")`.
-
-    Alternatively for current weather only, one step:
-        `get_weather_by_coordinates(latitude, longitude)`.
-
-    `country_code` (optional, ISO-3166-1 alpha-2) narrows the
-    geocoder when the address is ambiguous across borders. Leave
-    unset if unsure.
-
-    Sources: Nominatim (OSM) primary, Photon fallback; both
-    keyless. See server.py module docstring for the fallback chain.
+    `country_code` (ISO-3166 alpha-2, optional) narrows cross-border
+    ambiguity.
     """
     if not address or not address.strip():
         raise ValueError("address must be a non-empty string")
@@ -2207,6 +2162,130 @@ def _apply_output_schema_experiment() -> None:
 
 
 _apply_output_schema_experiment()
+
+
+# ── Docstring verbosity A/B (terse vs verbose) ─────────────────────────────
+#
+# Source docstrings live in `terse` mode: short, bullet-style, no long
+# examples — optimised for small-model prefill speed on CPU (the top-3
+# offenders used to cost ~550 extra tokens per request). Bigger models
+# may benefit from the verbose versions kept below; flip the env var to
+# opt in. Same A/B pattern as MCP_OUTPUT_SCHEMA so the eval matrix can
+# measure which is better for which model tier.
+#
+# MCP_DOCSTRING_MODE="terse"   → source defaults (current behaviour).
+# MCP_DOCSTRING_MODE="verbose" → restore pre-trim descriptions for the
+#                                three tools where we cut the most.
+
+_DOCSTRING_MODE = os.getenv("MCP_DOCSTRING_MODE", "terse").strip().lower()
+
+# Pre-trim descriptions, verbatim from before the 2026-04-21 trim.
+# Keyed by tool name; absent keys fall through to the source docstring.
+_DOCSTRINGS_VERBOSE: dict[str, str] = {
+    "find_place_coordinates": (
+        "Resolve a city name or postal code to lat/lon, country and timezone.\n\n"
+        "**Argument contract — read before calling:** `city` MUST be a "
+        "single canonical token. Valid shapes:\n"
+        "  - a plain place name: `\"Kyiv\"`, `\"Paris\"`, `\"Bountiful\"`.\n"
+        "  - a numeric postal code: `\"90210\"`, `\"10001\"`, `\"84010\"`.\n"
+        "Invalid — Open-Meteo matches the whole string literally and will "
+        "return no result:\n"
+        "  - `\"Paris, France\"` — country goes into `country_code`, not the name.\n"
+        "  - `\"Bountiful, Utah, 84010\"` — address string, never works.\n"
+        "  - `\"Kyiv, Ukraine\"` — comma kills the match.\n\n"
+        "Postal-code support varies: US/DE/FR zipcodes resolve cleanly; "
+        "UK postcodes (`\"SW1A 1AA\"`) are **not** indexed and return empty. "
+        "For a postal code always pass `country_code` too — `\"10001\"` "
+        "matches both New York, US and Troyes, FR.\n\n"
+        "`country_code` is an optional ISO-3166-1 alpha-2 hint (\"US\", \"UA\", "
+        "\"GB\") to disambiguate homonyms like \"Moscow, RU\" vs \"Moscow, ID\". "
+        "The response includes `admin1` (state/region) and `postcodes` so "
+        "the caller can verify the right place was picked.\n\n"
+        "When multiple comparable places match (e.g. \"Springfield\" without a "
+        "country, \"Moscow\" without country_code, the 5 Bountifuls in different "
+        "US states), the response flips `relay_to_user` to `false` and lists "
+        "candidates in `guidance` — the LLM must ask the user which one to "
+        "pick instead of silently committing to top-1."
+    ),
+    "search_places": (
+        "Return every geocoding candidate for an ambiguous query.\n\n"
+        "Deliberately general-purpose: the Open-Meteo geocoder returns not "
+        "just towns but also mountains, lakes, parks, islands, neighborhoods "
+        "and airports bearing the same name. Each candidate carries a "
+        "`feature_type` human label (\"city\", \"mountain\", \"lake\", "
+        "\"neighborhood\", \"park\", \"peak\", \"island\", \"airport\", …) so "
+        "the caller can match the user's intent (\"weather on Mt. Bountiful\" "
+        "vs \"weather in Bountiful\" are legitimately different places).\n\n"
+        "Parameters:\n"
+        "- `query`: a SINGLE canonical token — place name (`\"Springfield\"`, "
+        "`\"Bountiful\"`) OR postal code (`\"84010\"`). Do NOT pass a "
+        "comma-separated address (`\"Bountiful, Utah, 84010\"`) — Open-Meteo "
+        "matches the whole string literally and will return empty. "
+        "Put country into `country_code` below.\n"
+        "- `country_code`: ISO-3166-1 alpha-2 hint (\"US\", \"UA\"). Narrows the "
+        "candidate pool server-side.\n"
+        "- `feature_types`: optional allowlist of human labels "
+        "(e.g. `[\"city\", \"village\"]` for only populated places, or "
+        "`[\"mountain\", \"peak\", \"hill\"]` for only high ground). Pass "
+        "`None` / empty to keep every feature type in the results.\n"
+        "- `limit`: caps the list length (1-10, default 5).\n\n"
+        "Use this tool whenever the user's request is vague — either because "
+        "the name is ambiguous (\"Springfield\"), the intent isn't clear "
+        "(town vs mountain vs lake), or the first hit's `feature_type` "
+        "doesn't match what the user seems to want. The caller can then "
+        "surface the disambiguation choice to the user or pick one on their "
+        "behalf.\n\n"
+        "When the query has a comma AND no candidates are found the response "
+        "grows a `hint` field telling the caller how to rewrite the query."
+    ),
+    "resolve_address": (
+        "Normalise a free-form postal address into structured components.\n\n"
+        "**When to use**: the user's text really is an address — multiple "
+        "comma-separated parts, a street number, a postcode, a full "
+        "\"street, city, region, country\" tail. Classic triggers:\n"
+        "  - `\"Bountiful, Utah, 84010\"` — city + state + zip.\n"
+        "  - `\"221B Baker Street, London\"` — street-level.\n"
+        "  - `\"Бульвар Лобановського, 23, Київ\"` — Cyrillic full address.\n"
+        "  - `\"横浜市中区山下町\"` — non-Latin address.\n\n"
+        "**When NOT to use**: a single canonical token (plain city name "
+        "OR bare postcode) — those belong in `find_place_coordinates` / "
+        "`search_places` / `get_current_weather_in_city` directly. This "
+        "tool is the escape hatch for the OTHER case.\n\n"
+        "**Response** carries latitude/longitude AND English-normalised "
+        "`city` + `country_code` you can feed straight into the weather / "
+        "time tools. For example:\n\n"
+        "    1. `resolve_address(\"Bountiful, Utah, 84010\")`\n"
+        "       → `{\"city\": \"Bountiful\", \"country_code\": \"US\",\n"
+        "            \"latitude\": 40.89, \"longitude\": -111.88, …}`\n"
+        "    2. `get_current_weather_in_city(city=\"Bountiful\",\n"
+        "                                    country_code=\"US\")`.\n\n"
+        "Alternatively for current weather only, one step:\n"
+        "    `get_weather_by_coordinates(latitude, longitude)`.\n\n"
+        "`country_code` (optional, ISO-3166-1 alpha-2) narrows the "
+        "geocoder when the address is ambiguous across borders. Leave "
+        "unset if unsure.\n\n"
+        "Sources: Nominatim (OSM) primary, Photon fallback; both "
+        "keyless. See server.py module docstring for the fallback chain."
+    ),
+}
+
+
+def _apply_docstring_experiment() -> None:
+    """When MCP_DOCSTRING_MODE=verbose, override the terse source
+    docstrings with the pre-trim versions for the tools in
+    `_DOCSTRINGS_VERBOSE`. Tool.description is what FastMCP forwards
+    in `tools/list` responses, so overriding it is enough to change
+    what the LLM sees.
+    """
+    if _DOCSTRING_MODE != "verbose":
+        return
+    for name, description in _DOCSTRINGS_VERBOSE.items():
+        tool = mcp._tool_manager._tools.get(name)
+        if tool is not None:
+            tool.description = description
+
+
+_apply_docstring_experiment()
 
 
 if __name__ == "__main__":
