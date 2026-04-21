@@ -113,8 +113,16 @@ async def run_case(
     model: str,
     prompt: str,
     tools: list[dict],
-) -> tuple[str | None, float]:
-    """Send one prompt to Ollama, return (picked_tool_name | None, latency_s)."""
+) -> tuple[str | None, dict | None, float]:
+    """Send one prompt to Ollama, return (tool_name | None, arguments | None, latency_s).
+
+    `arguments` is the dict the model passed to the picked tool. We
+    surface it alongside the name so the harness can diagnose the
+    "right tool + wrong args" failure mode — e.g. `search_places`
+    called with `query="Bountiful, Utah, 84010"` (correct tool, broken
+    argument that the single-token contract from #14 is designed to
+    prevent). Scoring is still name-only; arguments are informational.
+    """
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -132,8 +140,28 @@ async def run_case(
     data = r.json()
     calls = (data.get("message") or {}).get("tool_calls") or []
     if not calls:
-        return None, latency
-    return (calls[0].get("function") or {}).get("name"), latency
+        return None, None, latency
+    fn = calls[0].get("function") or {}
+    return fn.get("name"), fn.get("arguments"), latency
+
+
+def _format_arguments(arguments: dict | None) -> str:
+    """Render a tool-call's arguments as `key=value, key=value` for the log.
+
+    Stays compact — the eval log already includes the prompt and the
+    picked tool, so this is the third column, not a JSON blob. None /
+    empty renders as an empty string so the display stays tidy for the
+    "no tool_call" rows.
+    """
+    if not arguments:
+        return ""
+    parts = []
+    for k, v in arguments.items():
+        if isinstance(v, str):
+            parts.append(f'{k}="{v}"')
+        else:
+            parts.append(f"{k}={v}")
+    return "(" + ", ".join(parts) + ")"
 
 
 def summarise(results: list[dict], threshold: float) -> int:
@@ -164,7 +192,12 @@ def summarise(results: list[dict], threshold: float) -> int:
         print("Failures:")
         for f in failures:
             picked = f["picked"] or "<no tool_call>"
+            args_str = _format_arguments(f.get("arguments"))
+            # Arguments live on a continuation line so long JSON doesn't
+            # wreck the alignment of the main failures column.
             print(f"  × {f['prompt'][:60]:<62}  expected={f['expected']:<36} picked={picked}")
+            if args_str:
+                print(f"      args: {args_str}")
 
     if rate < threshold:
         print(f"\nFAIL: {rate:.1%} < threshold {threshold:.0%}")
@@ -214,7 +247,7 @@ async def main_async(args: argparse.Namespace) -> int:
         # we only care about its side-effect (a warm model).
         print("Warming up model (first chat call loads it into RAM)...", end=" ", flush=True)
         try:
-            _, warm_latency = await run_case(
+            _, _, warm_latency = await run_case(
                 client, args.ollama_url, args.model,
                 "Hello, this is a warm-up request. Please reply with 'ok'.",
                 ollama_tools,
@@ -229,14 +262,22 @@ async def main_async(args: argparse.Namespace) -> int:
         for i, case in enumerate(cases, 1):
             prompt, expected = case["prompt"], case["expected_tool"]
             try:
-                picked, latency = await run_case(
+                picked, arguments, latency = await run_case(
                     client, args.ollama_url, args.model, prompt, ollama_tools
                 )
             except Exception as e:
-                picked, latency = f"<error: {type(e).__name__}>", 0.0
+                picked, arguments, latency = f"<error: {type(e).__name__}>", None, 0.0
             mark = "✓" if picked == expected else "×"
-            print(f"  [{i:>3}/{len(cases)}] {mark} {latency:>5.1f}s  {prompt[:55]:<57} → {picked or '<no tool_call>'}")
-            results.append({"prompt": prompt, "expected": expected, "picked": picked, "latency": latency})
+            args_str = _format_arguments(arguments)
+            tail = (picked or "<no tool_call>") + args_str
+            print(f"  [{i:>3}/{len(cases)}] {mark} {latency:>5.1f}s  {prompt[:55]:<57} → {tail}")
+            results.append({
+                "prompt": prompt,
+                "expected": expected,
+                "picked": picked,
+                "arguments": arguments,
+                "latency": latency,
+            })
 
     return summarise(results, threshold)
 
