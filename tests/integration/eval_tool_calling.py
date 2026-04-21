@@ -286,27 +286,36 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"SKIP: model {args.model!r} not installed on this Ollama. Have: {installed}")
             return 0
 
-        # Warm-up: only purpose is to pull the model weights into Ollama's
-        # RAM so the first SCORED case isn't paying the cold-load tax.
-        # The original warm-up called `run_case` with the full tool catalog
-        # attached — which on the 2-vCPU GHA runner with our ~3000-token
-        # catalog pushes prefill past 120 s and the warm-up itself times
-        # out (observed 2026-04-21 after the catalog grew to 22 tools).
+        # Warm-up: two separate concerns, both need to be hot before the
+        # first SCORED case or the 1st/2nd scored calls eat their entire
+        # per-request timeout:
         #
-        # Fix: minimal `/api/chat` payload with NO tools. Loads the model
-        # weights just as effectively; prefill is tiny because there's
-        # no system-prompt work. Scored cases then pay just their own
-        # prefill + generation, which fits the per-request timeout.
-        print("Warming up model (no tool catalog, just weight load)...", end=" ", flush=True)
+        # 1. Model weights loaded into RAM / VRAM. Cheap (~5 s on CPU,
+        #    ~1 s on GPU) once the weights are on disk.
+        # 2. KV cache for the ~5 K-token tool catalog warm. Without it,
+        #    the first scored case pays a full cold-prefill tax:
+        #    ~250 s on 2-vCPU × 14b, which blew past even the 480 s
+        #    timeout on 2026-04-21 — cases 1 and 2 both <error:
+        #    ReadTimeout>, case 3 succeeded in 228 s once the prefix
+        #    cache was warm.
+        #
+        # Fix: warm-up sends the IDENTICAL payload shape the scored
+        # loop will use (`tools=[...]`, `temperature=0`, `seed=42`) so
+        # Ollama's prefix caching actually primes the catalog. We keep
+        # `num_predict=4` so generation stays short and the full call
+        # fits inside the scored per-request timeout. Discard the
+        # result — we only care about the warm KV cache side-effect.
+        print("Warming up model (weights + tool-catalog KV cache)...", end=" ", flush=True)
         t0 = time.monotonic()
         try:
             warm_resp = await client.post(
                 f"{args.ollama_url}/api/chat",
                 json={
                     "model": args.model,
-                    "messages": [{"role": "user", "content": "hi"}],
+                    "messages": [{"role": "user", "content": "warmup — answer 'ok'"}],
+                    "tools": ollama_tools,
                     "stream": False,
-                    "options": {"temperature": 0, "num_predict": 4},
+                    "options": {"temperature": 0, "seed": 42, "num_predict": 4},
                 },
             )
             warm_resp.raise_for_status()
