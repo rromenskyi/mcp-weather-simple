@@ -164,43 +164,76 @@ def _annotate(hit: dict) -> dict:
     }
 
 
-def _detect_query_language(query: str) -> str:
-    """Map a query's dominant script to an Open-Meteo `language` code.
+# Cyrillic glyphs that exist ONLY in Ukrainian (not in Russian). A single
+# occurrence of any of these forces `language=uk` on the first geocoder
+# attempt — "Київ" / "Львів" etc. return NO RESULTS with `language=ru`.
+_UKRAINIAN_UNIQUE_CYRILLIC = frozenset("іїєґІЇЄҐ")
 
-    Open-Meteo's geocoder is script-biased: when `language=en` it indexes
+
+def _detect_query_languages(query: str) -> list[str]:
+    """Return an ordered list of Open-Meteo `language` codes to try.
+
+    Open-Meteo's geocoder is script-biased: with `language=en` it indexes
     the Latin name of every place, so a Cyrillic "Москва" returns only
-    two villages in Tajikistan instead of Moscow, RU (because the Tajik
-    villages are natively written in Latin as "Moskva"). Passing
-    `language=ru` for the same query surfaces Moscow-RU at the top with
-    10 M population. Same story for Greek / CJK / Arabic — match the
-    script to the `language` parameter and Open-Meteo picks the right
-    index. Fall back to English for Latin-only queries.
+    Tajik villages named "Moskva" instead of Moscow-RU. Passing the
+    right `language=` surfaces the native-script index.
+
+    A *list* rather than a single code because some scripts are
+    ambiguous across languages that Open-Meteo indexes separately:
+      - Cyrillic shared by Russian / Ukrainian / Bulgarian / Serbian:
+        "Одеса" (Ukrainian) has no `і ї є ґ`, so we fall back from
+        `ru` → `uk` on empty results. "Київ" / "Львів" contain
+        Ukrainian-unique glyphs and go straight to `uk` first.
+      - CJK Han ideographs shared by Chinese / Japanese / Korean:
+        "横浜" returns only Chinese mis-matches under `zh`, but
+        resolves to Yokohama-JP under `ja`. Order `zh` → `ja` → `ko`.
+      - Everything else is unambiguous (kana → ja, Hangul → ko,
+        Greek → el, Arabic → ar, Hebrew → he) and needs a single-item
+        list; Latin queries fall through to `en`.
+
+    `_geocode` and `search_places` call this helper and iterate through
+    the returned list, stopping at the first language that yields a
+    non-empty result set.
     """
-    # Two-pass: Japanese-specific kana (Hiragana / Katakana) and Korean
-    # Hangul are checked BEFORE CJK Han, because every Japanese and
-    # Korean place name typically mixes Han ideographs with the
-    # language-specific script. Returning 'zh' on the first Han match
-    # would mislabel "東京タワー" (has Katakana → Japanese) or "서울특별시"
-    # (has Hangul → Korean). A single Hangul / Kana glyph wins.
+    # Unambiguous script hits short-circuit: any Kana or Hangul glyph
+    # fully specifies the language, even when the query also contains
+    # shared Han ideographs ("東京タワー" → ja, "서울특별시" → ko).
     for ch in query:
         code = ord(ch)
         if 0x3040 <= code <= 0x30FF:
-            return "ja"  # Hiragana + Katakana
+            return ["ja"]  # Hiragana + Katakana
         if 0xAC00 <= code <= 0xD7AF:
-            return "ko"  # Hangul syllables
+            return ["ko"]  # Hangul syllables
+    # Ukrainian-specific Cyrillic glyphs take priority over generic
+    # Cyrillic so "Київ" goes straight to `uk` and never wastes a round
+    # trip on `ru` (which returns zero results).
+    if any(ch in _UKRAINIAN_UNIQUE_CYRILLIC for ch in query):
+        return ["uk", "ru"]
     for ch in query:
         code = ord(ch)
         if 0x0400 <= code <= 0x052F:
-            return "ru"  # Cyrillic (Russian, Ukrainian, Bulgarian, Serbian, …)
+            # Generic Cyrillic — Russian index is largest, Ukrainian is a
+            # real fallback because city names like "Одеса" contain only
+            # shared glyphs and return empty under `ru`.
+            return ["ru", "uk"]
         if 0x0370 <= code <= 0x03FF:
-            return "el"  # Greek
+            return ["el"]  # Greek
         if 0x0600 <= code <= 0x06FF:
-            return "ar"  # Arabic
+            return ["ar"]  # Arabic
         if 0x0590 <= code <= 0x05FF:
-            return "he"  # Hebrew
+            return ["he"]  # Hebrew
         if 0x4E00 <= code <= 0x9FFF:
-            return "zh"  # CJK Unified Ideographs (Chinese-leaning default)
-    return "en"
+            # Han ideographs are shared across zh / ja / ko. `zh` first
+            # (largest index), then `ja`, then `ko` — each fallback
+            # catches a script-sharing city name the previous one missed.
+            return ["zh", "ja", "ko"]
+    return ["en"]
+
+
+# Kept as a thin alias for callers that only need the primary language
+# (e.g. tests or logging) — equivalent to `_detect_query_languages(q)[0]`.
+def _detect_query_language(query: str) -> str:
+    return _detect_query_languages(query)[0]
 
 
 async def _geocode(city: str, country_code: str | None = None) -> dict:
@@ -212,13 +245,21 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     # use `search_places(feature_types=["city"])` and pick explicitly, while
     # someone asking about weather on Mt. Everest or in the Bountiful
     # Islands should still get a useful top hit back.
-    params: dict[str, str | int] = {
-        "name": city,
-        "count": 10,
-        "language": _detect_query_language(city),
-    }
-    data = await _fetch_json(GEOCODE_URL, service="Open-Meteo geocoder", params=params)
-    results = data.get("results") or []
+    # Iterate through every candidate language for the query's script
+    # until we find one that returns something. Most queries hit on the
+    # first attempt; shared-script queries ("Одеса", "横浜") gracefully
+    # fall back to the next language without a behaviour change for the
+    # caller.
+    results: list[dict] = []
+    for lang in _detect_query_languages(city):
+        data = await _fetch_json(
+            GEOCODE_URL,
+            service="Open-Meteo geocoder",
+            params={"name": city, "count": 10, "language": lang},
+        )
+        results = data.get("results") or []
+        if results:
+            break
     if country_code:
         cc_upper = country_code.strip().upper()
         filtered = [h for h in results if (h.get("country_code") or "").upper() == cc_upper]
@@ -306,16 +347,19 @@ async def search_places(
     behalf.
     """
     limit = max(1, min(int(limit), 10))
-    data = await _fetch_json(
-        GEOCODE_URL,
-        service="Open-Meteo geocoder",
-        params={
-            "name": query,
-            "count": 10,
-            "language": _detect_query_language(query),
-        },
-    )
-    results = data.get("results") or []
+    # Same fallback-chain as _geocode — try every candidate language
+    # until one yields results. Important for shared-script inputs
+    # (Cyrillic "Одеса", Han "横浜") that have ambiguous primary language.
+    results: list[dict] = []
+    for lang in _detect_query_languages(query):
+        data = await _fetch_json(
+            GEOCODE_URL,
+            service="Open-Meteo geocoder",
+            params={"name": query, "count": 10, "language": lang},
+        )
+        results = data.get("results") or []
+        if results:
+            break
     if country_code:
         cc_upper = country_code.strip().upper()
         results = [h for h in results if (h.get("country_code") or "").upper() == cc_upper]
@@ -483,6 +527,26 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
         tz = _tz.utc
         tz_id = "UTC"
     now = datetime.now(tz)
+    # Warning depends on whether the caller supplied an explicit IP:
+    # auto-detect inherits the caller's NAT/VPN/egress uncertainty,
+    # while an explicit lookup is only as accurate as the GeoIP
+    # database for THAT address.
+    if ip:
+        warning = (
+            f"Location is an approximation based on the GeoIP lookup of the explicit "
+            f"IP address {ip!r}. Accuracy depends on the IP-to-geo database used by "
+            "ipwho.is (which itself aggregates multiple upstream sources), and on "
+            "whether the IP belongs to a mobile carrier / VPN / data-center — in any "
+            "of those cases the resolved city can be far from the user's physical "
+            "location. If the user contradicts the result, ask them to name their city."
+        )
+    else:
+        warning = (
+            "Location is an approximation based on the caller's public IP address. "
+            "It may differ from the user's actual location — especially when behind "
+            "a VPN, a data-center / cluster egress, or a carrier-grade NAT. "
+            "If the user contradicts the result, ask them to name their city."
+        )
     return {
         "ip": data.get("ip"),
         "city": data.get("city"),
@@ -497,13 +561,8 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
         "weekday": now.strftime("%A"),
         "iso_datetime": now.isoformat(timespec="seconds"),
         "utc_offset": now.strftime("%z"),
-        "location_source": "geoip",
-        "accuracy_warning": (
-            "Location is an approximation based on the caller's public IP address. "
-            "It may differ from the user's actual location — especially when behind "
-            "a VPN, a data-center / cluster egress, or a carrier-grade NAT. "
-            "If the user contradicts the result, ask them to name their city."
-        ),
+        "location_source": "geoip_explicit" if ip else "geoip_autodetected",
+        "accuracy_warning": warning,
     }
 
 

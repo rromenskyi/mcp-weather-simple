@@ -445,18 +445,38 @@ async def test_weather_by_coordinates_rejects_out_of_range_lon():
 # ── Script detection for multilingual queries ────────────────────────────
 
 
-def test_detect_query_language_maps_common_scripts():
+def test_detect_query_languages_returns_fallback_chains():
+    # Latin — single-item list, no fallback needed.
+    assert server._detect_query_languages("Paris") == ["en"]
+    # Generic Cyrillic — Russian first, Ukrainian second (catches "Одеса",
+    # which has only shared Cyrillic glyphs and returns empty under `ru`).
+    assert server._detect_query_languages("Москва") == ["ru", "uk"]
+    assert server._detect_query_languages("Одеса") == ["ru", "uk"]
+    # Ukrainian-unique glyphs short-circuit to `uk` first (Київ has `ї`,
+    # Львів has `і`) so we never waste an empty round trip on `ru`.
+    assert server._detect_query_languages("Київ") == ["uk", "ru"]
+    assert server._detect_query_languages("Львів") == ["uk", "ru"]
+    assert server._detect_query_languages("Харків") == ["uk", "ru"]
+    # Other Cyrillic-adjacent scripts stay deterministic.
+    assert server._detect_query_languages("Αθήνα") == ["el"]
+    assert server._detect_query_languages("القاهرة") == ["ar"]
+    assert server._detect_query_languages("ירושלים") == ["he"]
+    # Han alone is ambiguous — zh / ja / ko fallback catches
+    # cross-script city names (Yokohama "横浜" resolves only under `ja`).
+    assert server._detect_query_languages("北京") == ["zh", "ja", "ko"]
+    assert server._detect_query_languages("東京") == ["zh", "ja", "ko"]
+    assert server._detect_query_languages("横浜") == ["zh", "ja", "ko"]
+    # Kana / Hangul fully specify the language.
+    assert server._detect_query_languages("東京タワー") == ["ja"]
+    assert server._detect_query_languages("서울") == ["ko"]
+
+
+def test_detect_query_language_primary_is_first_of_list():
+    # Thin alias used by code that only wants the primary pick.
     assert server._detect_query_language("Paris") == "en"
-    assert server._detect_query_language("Москва") == "ru"        # Russian Cyrillic
-    assert server._detect_query_language("Київ") == "ru"          # Ukrainian Cyrillic — same script bucket
-    assert server._detect_query_language("Αθήνα") == "el"         # Greek
-    assert server._detect_query_language("القاهرة") == "ar"       # Arabic
-    assert server._detect_query_language("ירושלים") == "he"       # Hebrew
-    assert server._detect_query_language("北京") == "zh"           # CJK Han
-    assert server._detect_query_language("東京") == "ja" or \
-           server._detect_query_language("東京") == "zh"           # Kanji overlap; either is acceptable
-    assert server._detect_query_language("東京タワー") == "ja"      # Katakana forces Japanese
-    assert server._detect_query_language("서울") == "ko"           # Hangul
+    assert server._detect_query_language("Москва") == "ru"
+    assert server._detect_query_language("Київ") == "uk"
+    assert server._detect_query_language("横浜") == "zh"
 
 
 @respx.mock
@@ -481,3 +501,268 @@ async def test_geocode_passes_detected_language_for_cyrillic_queries():
     hit = await server._geocode("Москва")
     assert hit["country_code"] == "RU"
     assert route.calls.last.request.url.params["language"] == "ru"
+
+
+@respx.mock
+async def test_geocode_falls_back_from_ru_to_uk_for_ukrainian_only_cities():
+    # "Одеса" (Ukrainian spelling) contains no Ukrainian-unique glyphs,
+    # so the detector orders `ru` before `uk`. Open-Meteo actually
+    # returns nothing under `ru` for this query — the helper must retry
+    # with `uk` and succeed there. Proves the fallback loop works for
+    # mixed-script city names.
+    def respond(request: httpx.Request) -> httpx.Response:
+        lang = request.url.params.get("language")
+        if lang == "ru":
+            return httpx.Response(200, json={"results": []})
+        if lang == "uk":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"name": "Одеса", "country": "Україна",
+                         "country_code": "UA", "admin1": "Odesa",
+                         "latitude": 46.48, "longitude": 30.72,
+                         "timezone": "Europe/Kyiv",
+                         "feature_code": "PPLA", "population": 1015826},
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    respx.get(server.GEOCODE_URL).mock(side_effect=respond)
+    hit = await server._geocode("Одеса")
+    assert hit["country_code"] == "UA"
+    assert hit["population"] == 1015826
+
+
+@respx.mock
+async def test_geocode_falls_back_from_zh_to_ja_for_han_only_japanese_cities():
+    # Yokohama ("横浜") resolves to a nonsense Chinese hit under `zh`
+    # (no population, low-quality feature), and to the real Japanese
+    # city only under `ja`. Proves the Han fallback chain catches the
+    # case even when `zh` returned *something* — we take the first
+    # non-empty match though, so this test drives `zh` to empty to
+    # keep the assertion crisp and future-proof.
+    def respond(request: httpx.Request) -> httpx.Response:
+        lang = request.url.params.get("language")
+        if lang == "ja":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"name": "横浜", "country": "日本",
+                         "country_code": "JP", "admin1": "Kanagawa",
+                         "latitude": 35.44, "longitude": 139.65,
+                         "timezone": "Asia/Tokyo",
+                         "feature_code": "PPLA", "population": 4412},
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"results": []})
+
+    respx.get(server.GEOCODE_URL).mock(side_effect=respond)
+    hit = await server._geocode("横浜")
+    assert hit["country_code"] == "JP"
+
+
+@respx.mock
+async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{server.GEOIP_URL}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "203.0.113.10", "city": "Auto",
+                "country": "Nowhere", "country_code": "ZZ",
+                "latitude": 0.0, "longitude": 0.0,
+                "timezone": {"id": "UTC"},
+            },
+        )
+    )
+    respx.get(f"{server.GEOIP_URL}/198.51.100.7").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "198.51.100.7", "city": "Manual",
+                "country": "Nowhere", "country_code": "ZZ",
+                "latitude": 0.0, "longitude": 0.0,
+                "timezone": {"id": "UTC"},
+            },
+        )
+    )
+
+    auto = await server.detect_my_location_by_ip()
+    assert auto["location_source"] == "geoip_autodetected"
+    assert "caller's public IP address" in auto["accuracy_warning"]
+
+    explicit = await server.detect_my_location_by_ip(ip="198.51.100.7")
+    assert explicit["location_source"] == "geoip_explicit"
+    assert "198.51.100.7" in explicit["accuracy_warning"]
+    assert "caller's public IP address" not in explicit["accuracy_warning"]
+
+
+# ── Happy paths for the remaining tools ──────────────────────────────────
+
+
+@respx.mock
+async def test_hourly_forecast_returns_per_hour_rows():
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+                     "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "admin1": "Kyiv City"},
+                ]
+            },
+        )
+    )
+    respx.get(server.FORECAST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "hourly": {
+                    "time": ["2026-04-20T09:00", "2026-04-20T10:00", "2026-04-20T11:00"],
+                    "temperature_2m": [14.0, 15.5, 16.8],
+                    "relative_humidity_2m": [55, 50, 48],
+                    "precipitation": [0.0, 0.0, 0.3],
+                    "precipitation_probability": [0, 10, 40],
+                    "weather_code": [1, 2, 61],
+                    "cloud_cover": [20, 40, 80],
+                    "wind_speed_10m": [8.0, 10.0, 13.0],
+                    "wind_direction_10m": [200, 210, 220],
+                },
+            },
+        )
+    )
+
+    result = await server.get_hourly_forecast("Kyiv", hours=3)
+    assert result["timezone_id"] == "Europe/Kyiv"
+    assert len(result["hours"]) == 3
+    assert result["hours"][0]["temperature_c"] == 14.0
+    assert result["hours"][2]["precipitation_probability_pct"] == 40
+    assert result["hours"][2]["conditions"] == "slight rain"
+
+
+@respx.mock
+async def test_sunrise_sunset_formats_daylight_duration_as_hhmm():
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Reykjavík", "country": "Iceland", "country_code": "IS",
+                     "latitude": 64.14, "longitude": -21.90,
+                     "timezone": "Atlantic/Reykjavik",
+                     "feature_code": "PPLC", "admin1": "Höfuðborgarsvæðið"},
+                ]
+            },
+        )
+    )
+    respx.get(server.FORECAST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "daily": {
+                    "time": ["2026-04-20", "2026-04-21"],
+                    "sunrise": ["2026-04-20T06:04", "2026-04-21T06:00"],
+                    "sunset": ["2026-04-20T20:48", "2026-04-21T20:52"],
+                    # 14 h 44 min in seconds — proves the hh:mm formatting.
+                    "daylight_duration": [53040, 53520],
+                    "sunshine_duration": [32400, 0],
+                },
+            },
+        )
+    )
+
+    r = await server.get_sunrise_sunset("Reykjavík", days=2)
+    assert r["timezone_id"] == "Atlantic/Reykjavik"
+    assert r["days"][0]["daylight_duration_hhmm"] == "14:44"
+    assert r["days"][1]["sunshine_duration_hhmm"] == "00:00"
+
+
+@respx.mock
+async def test_country_info_flattens_rest_countries_shape():
+    respx.get(server.RESTCOUNTRIES_ALPHA_URL.format(code="UA")).mock(
+        return_value=httpx.Response(
+            200,
+            json=[{
+                "name": {"common": "Ukraine", "official": "Ukraine"},
+                "cca2": "UA",
+                "capital": ["Kyiv"],
+                "region": "Europe", "subregion": "Eastern Europe",
+                "population": 44134693, "area": 603500,
+                "currencies": {"UAH": {"name": "Ukrainian hryvnia", "symbol": "₴"}},
+                "languages": {"ukr": "Ukrainian"},
+                "idd": {"root": "+3", "suffixes": ["80"]},
+                "borders": ["BLR", "HUN", "MDA", "POL", "ROU", "RUS", "SVK"],
+                "timezones": ["UTC+02:00"],
+                "flag": "🇺🇦",
+            }],
+        )
+    )
+
+    r = await server.get_country_info("UA")
+    assert r["name"] == "Ukraine"
+    assert r["capital"] == "Kyiv"
+    assert r["calling_code"] == "+380"
+    assert r["currencies"] == [{"code": "UAH", "name": "Ukrainian hryvnia", "symbol": "₴"}]
+    assert r["languages"] == ["Ukrainian"]
+    assert r["flag_emoji"] == "🇺🇦"
+
+
+@respx.mock
+async def test_public_holidays_maps_nager_payload():
+    respx.get(server.HOLIDAYS_URL.format(year=2026, country_code="UA")).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"date": "2026-01-01", "localName": "Новий рік",
+                 "name": "New Year's Day", "fixed": True, "global": True,
+                 "types": ["Public"]},
+                {"date": "2026-08-24", "localName": "День Незалежності",
+                 "name": "Independence Day", "fixed": True, "global": True,
+                 "types": ["Public"]},
+            ],
+        )
+    )
+
+    r = await server.get_public_holidays("ua", year=2026)
+    assert r["country_code"] == "UA"
+    assert r["year"] == 2026
+    assert [h["date"] for h in r["holidays"]] == ["2026-01-01", "2026-08-24"]
+    assert r["holidays"][1]["local_name"] == "День Незалежності"
+
+
+@respx.mock
+async def test_list_radio_stations_sorts_by_clickcount_and_trims_to_limit():
+    # radio-browser returns 4 stations; we request limit=2 and expect
+    # the two with the highest `clickcount` in that order.
+    respx.get(f"{server.RADIO_BROWSER_MIRRORS[0]}/stations/bycountry/Ukraine").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"name": "Radio A", "country": "Ukraine", "language": "ukrainian",
+                 "tags": "news,talk", "url_resolved": "https://a", "homepage": "https://a.home",
+                 "bitrate": 128, "codec": "MP3", "clickcount": 5000},
+                {"name": "Radio B", "country": "Ukraine", "language": "ukrainian",
+                 "tags": "music", "url_resolved": "https://b", "homepage": "https://b.home",
+                 "bitrate": 192, "codec": "MP3", "clickcount": 20000},
+                {"name": "Radio C", "country": "Ukraine", "language": "ukrainian",
+                 "tags": "jazz", "url_resolved": "https://c", "homepage": "https://c.home",
+                 "bitrate": 128, "codec": "AAC", "clickcount": 12000},
+                {"name": "Radio D", "country": "Ukraine", "language": "ukrainian",
+                 "tags": "rock", "url_resolved": "https://d", "homepage": "https://d.home",
+                 "bitrate": 128, "codec": "MP3", "clickcount": 800},
+            ],
+        )
+    )
+
+    r = await server.list_radio_stations(country="Ukraine", limit=2)
+    assert r["count"] == 2
+    assert [s["name"] for s in r["stations"]] == ["Radio B", "Radio C"]
+    # User-Agent header is a radio-browser ToS requirement — make sure
+    # we always send it with the repo-identifying string.
+    last_req = respx.calls.last.request
+    assert "mcp-weather-simple" in last_req.headers.get("user-agent", "")
