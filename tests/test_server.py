@@ -1545,13 +1545,12 @@ async def test_geocode_falls_back_from_zh_to_ja_for_han_only_japanese_cities():
 
 
 @respx.mock
-async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
-    # Addresses below come from RFC 5737 reserved "documentation" ranges
-    # (TEST-NET-2 and TEST-NET-3) — the IETF-sanctioned placeholders for
-    # test / docs / examples. They never route on the public internet,
-    # so accidentally sending a live request would still fail safely
-    # instead of hitting a real host.
-    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={}))
+async def test_detect_my_location_by_ip_takes_no_args_and_uses_autodetect_guidance():
+    # After the split, `detect_my_location_by_ip` has no `ip` param —
+    # the intent is strictly "where am I?". Guidance is the autodetect
+    # caveat (IP may be wrong behind VPN / NAT / cluster egress).
+    # Addresses come from RFC 5737 reserved "documentation" ranges
+    # (TEST-NET-2 / TEST-NET-3) — never routed on the public internet.
     respx.get(f"{server.GEOIP_URL}/").mock(
         return_value=httpx.Response(
             200,
@@ -1563,6 +1562,16 @@ async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
             },
         )
     )
+    r = await server.detect_my_location_by_ip()
+    assert r["location_source"] == "geoip_autodetected"
+    assert r["guidance"] == server._GUIDANCE_GEOIP_AUTODETECT
+    assert r["city"] == "Auto"
+
+
+@respx.mock
+async def test_lookup_ip_geolocation_requires_explicit_ip_and_uses_explicit_guidance():
+    # New sibling tool — ip is REQUIRED. Guidance is the explicit-IP
+    # caveat (IP-to-geo DB depends on which network the IP belongs to).
     respx.get(f"{server.GEOIP_URL}/198.51.100.7").mock(
         return_value=httpx.Response(
             200,
@@ -1574,19 +1583,17 @@ async def test_detect_my_location_by_ip_warning_differs_for_explicit_ip():
             },
         )
     )
+    r = await server.lookup_ip_geolocation(ip="198.51.100.7")
+    assert r["location_source"] == "geoip_explicit"
+    assert r["guidance"] == server._GUIDANCE_GEOIP_EXPLICIT
+    assert r["city"] == "Manual"
 
-    auto = await server.detect_my_location_by_ip()
-    assert auto["location_source"] == "geoip_autodetected"
-    # Guidance strings differ between auto-detect and explicit-IP paths
-    # (subsumed `accuracy_warning` field under #18): auto-detect warns
-    # about the caller's IP being wrong behind NAT/VPN; explicit-IP
-    # warns the IP-to-geo resolution may be off.
-    assert auto["guidance"] == server._GUIDANCE_GEOIP_AUTODETECT
 
-    explicit = await server.detect_my_location_by_ip(ip="198.51.100.7")
-    assert explicit["location_source"] == "geoip_explicit"
-    assert explicit["guidance"] == server._GUIDANCE_GEOIP_EXPLICIT
-    assert auto["guidance"] != explicit["guidance"]
+async def test_lookup_ip_geolocation_rejects_empty_ip():
+    with pytest.raises(ValueError, match="ip argument is required"):
+        await server.lookup_ip_geolocation(ip="")
+    with pytest.raises(ValueError, match="ip argument is required"):
+        await server.lookup_ip_geolocation(ip="   ")
 
 
 # ── Happy paths for the remaining tools ──────────────────────────────────
