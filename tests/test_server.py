@@ -882,26 +882,75 @@ async def _probe(app, path: str, *, headers: dict | None = None) -> httpx.Respon
         return await client.get(path, headers=headers or {})
 
 
-async def test_healthz_returns_200_without_auth():
-    # Build the app with NO token configured — bearer middleware isn't
-    # attached at all. /healthz still works.
+async def test_liveness_paths_return_200_without_io():
+    # /healthz and /livez are the LIVENESS probes — no I/O at all,
+    # always 200. If we ever start doing upstream work in this path
+    # a hung dependency could flip liveness and cause a pod restart
+    # loop.
     with patch.object(server, "AUTH_TOKEN", ""):
         app = server._build_http_app()
-    for path in ("/healthz", "/livez", "/readyz"):
+    for path in ("/healthz", "/livez"):
         r = await _probe(app, path)
         assert r.status_code == 200, f"{path} should be 200, got {r.status_code}"
-        assert r.json() == {"status": "ok", "service": "mcp-weather"}
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["service"] == "mcp-weather"
+        assert body["probe"] == "liveness"
 
 
-async def test_healthz_bypasses_bearer_auth_when_token_is_set():
-    # With a token configured, the MCP paths require bearer; /healthz
-    # does not — k8s probes never carry a secret and must still reach
-    # the endpoint.
+@respx.mock
+async def test_readiness_probe_returns_200_when_upstream_is_reachable():
+    # /readyz actively probes Open-Meteo's geocoder. On success the
+    # response names the dependency so operators can tell at a glance
+    # WHICH check passed.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    with patch.object(server, "AUTH_TOKEN", ""):
+        app = server._build_http_app()
+    r = await _probe(app, "/readyz")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["probe"] == "readiness"
+    assert body["checks"] == {"open_meteo": "ok"}
+
+
+@respx.mock
+async def test_readiness_probe_returns_503_when_upstream_times_out():
+    # When Open-Meteo is unreachable every real tool call will fail
+    # the same way — /readyz must surface that to k8s instead of
+    # pretending to be ready. 503 + status=not_ready + the exception
+    # class name so operators can grep `ReadTimeout` in pod logs.
+    respx.get(server.GEOCODE_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+    with patch.object(server, "AUTH_TOKEN", ""):
+        app = server._build_http_app()
+    r = await _probe(app, "/readyz")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "not_ready"
+    assert body["probe"] == "readiness"
+    assert "open_meteo" in body["checks"]
+    assert "ReadTimeout" in body["checks"]["open_meteo"]
+
+
+@respx.mock
+async def test_probes_bypass_bearer_auth_when_token_is_set():
+    # With a token configured, the MCP paths require bearer; probes
+    # do not — k8s probes never carry a secret and must still reach
+    # both liveness AND readiness endpoints.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
     with patch.object(server, "AUTH_TOKEN", "secret-sentinel"):
         app = server._build_http_app()
-    r = await _probe(app, "/healthz")
-    assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+
+    live = await _probe(app, "/livez")
+    assert live.status_code == 200
+
+    ready = await _probe(app, "/readyz")
+    assert ready.status_code == 200
+
     # And that the bearer middleware is actually armed: a GET to an
     # unknown path without the header returns 401, not 200.
     r_unauth = await _probe(app, "/mcp")
