@@ -211,13 +211,20 @@ harness before promoting any of these to issues.
   US (free, bulk CSV, cached); for non-US punt to a "not available"
   response rather than guess. Useful companion to the overnight-stop
   decision.
-- **`web_search(query, max_results=5)`** — DuckDuckGo Instant Answer
-  / HTML endpoint (no key, rate-limited but generous). General-purpose
-  escape hatch for "I don't have a dedicated tool for this intent".
-  Risk: small models over-use it and stop picking the right specific
-  tool — must be evaluated with the harness before shipping, and
-  docstring needs an explicit "prefer a specific tool when one
-  exists" line.
+- **`last_resort_web_search(query, max_results=5)`** — DuckDuckGo
+  Instant Answer / HTML endpoint (no key, rate-limited but generous).
+  General-purpose escape hatch for "I don't have a dedicated tool for
+  this intent". Risk: small models over-use a generic `web_search`
+  name and stop picking specific tools — so the name itself is part
+  of the contract. Naming options to A/B on the eval harness before
+  shipping: `web_search` (baseline, risks over-use), `fallback_web_search`
+  (clear secondary signal), `last_resort_web_search` (strongest nudge
+  but risks *under*-use — model refuses it even when it's the right
+  call), `web_search_when_no_specific_tool_fits` (explicit but long,
+  may hurt selection on other tools via token pressure). Docstring
+  still spells out "prefer a specific tool when one exists" in every
+  case; the naming experiment is about how much work the name itself
+  does *before* the docstring even gets read.
 
 Promotion rule: pick one, sketch the docstring, add 2–3 cases to
 `cases.yaml`, run the eval matrix, file an issue only if the
