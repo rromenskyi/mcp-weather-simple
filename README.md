@@ -79,22 +79,30 @@ indexed by Open-Meteo. Pair a postal code with `country_code=` to
 avoid cross-country collisions (`10001` matches both New York, US
 and Troyes, FR).
 
-## Location source transparency
+## Response envelope
 
-Every tool that returns a location derived from GeoIP rather than an
-explicit user input annotates the response with:
+Every successful tool response carries two top-level fields:
 
-- `location_source`: `"geoip_autodetected"` when the caller's public
-  IP was used (the default path) and `"geoip_explicit"` when an IP
-  was supplied as a parameter.
-- `accuracy_warning`: human-readable disclaimer that tells the model
-  to surface the uncertainty to the user — VPN, corporate NAT, cluster
-  egress and mobile carriers all shift the resolved city.
+- `relay_to_user` (bool): `true` = the model can answer directly from
+  this data; `false` = the model MUST clarify with the user before
+  answering (ambiguous input, multiple candidates, duplicate call).
+- `guidance` (str): plain-English one-liner telling the model what to
+  do with the body — e.g. `"Relay directly."`, or `"Relay with a
+  caveat: city was auto-detected from the caller's IP and may be
+  wrong (VPN / NAT). If the user disagrees, ask for the city."` for
+  GeoIP-backed shortcuts.
 
-The four no-arg shortcuts (`get_weather_outside_right_now` et al.)
-carry these fields automatically. Explicit-city tools
-(`get_current_weather_in_city(city="Kyiv")`) do not — the caller
-owns the location and no disclaimer is needed.
+Small models follow short prose instructions better than they
+interpret a controlled vocabulary (`confidence: enum`), so guidance
+strings are kept under one sentence.
+
+Tools that use GeoIP (`detect_my_location_by_ip`,
+`get_weather_outside_right_now`, etc.) use a GeoIP-specific
+`guidance` string that replaces the old `accuracy_warning` body
+field — the uncertainty is now an instruction the LLM can't miss,
+not an optional body hint. The `location_source` body field
+(`"geoip_autodetected"` / `"geoip_explicit"`) is kept for
+programmatic consumers.
 
 ## What is `uv`?
 
