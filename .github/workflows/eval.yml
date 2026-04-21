@@ -56,19 +56,28 @@ on:
           - 'both'
       chunk_count:
         description: >-
-          Shard the 40-prompt suite across N parallel runners. 1 = one
-          row runs every case (the 2-vCPU 14b path bumps the 45-min
-          ceiling). 2 = default; 14b finishes ~25 min per row. 4 =
-          aggressive split for when other axes (output_schema=both)
-          also fan out — e.g. 2 models × 2 schemas × 4 chunks = 16
-          rows, still under the 20-concurrent-job free-tier cap.
+          Shard the ~44-prompt suite across N parallel runners.
+          Case counts per chunk and approximate 14b wall-clock on
+          the 2-vCPU GHA runner (with the bumped 480 s per-request
+          timeout allowing worst-case prefill tails):
+            1 — ~44 cases / row, > 45 min ceiling, does NOT fit.
+            2 — ~22 cases / row, ~30-40 min, tight on 14b.
+            4 — ~11 cases / row, ~18-25 min, comfortable.
+            6 — ~8  cases / row, ~13-18 min, comfortable.
+            8 — ~6  cases / row, ~10-15 min, safest.
+          Fanout with output_schema=both + docstrings=both stays
+          under the 20-concurrent-job free-tier cap up to 4 chunks
+          (2×2×2×4 = 32 → queues partially). At 8 chunks keep
+          schema/docstring axes at a single value.
         required: false
-        default: '2'
+        default: '4'
         type: choice
         options:
           - '1'
           - '2'
           - '4'
+          - '6'
+          - '8'
       docstrings:
         description: >-
           Docstring verbosity A/B. Terse = current (CPU-friendly,
@@ -148,11 +157,13 @@ jobs:
           # Chunk count defaults to 2 (schedule default + explicit).
           # Build the indices array inline so the eval job can use it
           # straight via fromJSON with matrix expansion.
-          count='${{ github.event.inputs.chunk_count || '2' }}'
+          count='${{ github.event.inputs.chunk_count || '4' }}'
           case "$count" in
             1) echo 'chunks=["0"]' >> "$GITHUB_OUTPUT" ;;
             2) echo 'chunks=["0","1"]' >> "$GITHUB_OUTPUT" ;;
             4) echo 'chunks=["0","1","2","3"]' >> "$GITHUB_OUTPUT" ;;
+            6) echo 'chunks=["0","1","2","3","4","5"]' >> "$GITHUB_OUTPUT" ;;
+            8) echo 'chunks=["0","1","2","3","4","5","6","7"]' >> "$GITHUB_OUTPUT" ;;
             *) echo "Unsupported chunk_count=$count" >&2 ; exit 1 ;;
           esac
           echo "chunk_count=$count" >> "$GITHUB_OUTPUT"
@@ -161,12 +172,13 @@ jobs:
     needs: plan
     name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }} / docs=${{ matrix.docstring }} / chunk ${{ matrix.chunk }}
     runs-on: ubuntu-latest
-    # Generous but bounded. With the default chunk_count=2, 14b on
-    # CPU now runs ~20 cases + warm-up + model pull ≈ 20-25 min per
-    # row, comfortably under the ceiling. chunk_count=1 puts full
-    # 40 cases back on one row and needs the headroom the 45-min cap
-    # provides; anything above 4 chunks won't fit the 20-job
-    # free-tier concurrent cap when combined with `output_schema=both`.
+    # Generous but bounded. With the default chunk_count=4 each row
+    # runs ~11 cases; worst-case 14b × 480 s timeout × 11 = 88 min
+    # ceiling in theory, but typical case is ~60-90 s so real
+    # wall-clock is ~20 min. chunk_count=8 safely covers even 14b
+    # pathological outliers. chunk_count=1 no longer fits the 45-min
+    # per-row cap after the catalog grew and the per-request timeout
+    # was bumped — use 2+.
     timeout-minutes: 45
     strategy:
       # A single row failure shouldn't cancel its siblings — we want
