@@ -1,0 +1,156 @@
+name: eval tool-calling
+
+# Integration test: pull a real Ollama model, attach the MCP tool
+# catalog, walk `tests/integration/cases.yaml`, score tool-selection
+# accuracy. Lives separately from the main `build` workflow because:
+#
+#   - It takes ~10-15 min per run (7B inference on the 2-vCPU runner is
+#     2-4 tok/s, amortised over 40 prompts and a ~5 GB initial pull).
+#   - It's not on the hot path: a failing tool-selection score is a
+#     signal to re-tune tool docstrings / descriptions, not a blocker
+#     for shipping code changes.
+#
+# Triggers:
+#   - `workflow_dispatch`: manual button in the Actions tab. Use this
+#     when iterating on tool descriptions.
+#   - `schedule`: one nightly run at 03:00 UTC to spot regressions
+#     without the operator thinking about it.
+#
+# Usage guard: GitHub's Additional Product Terms allow Actions for
+# "testing of the software project", which this clearly is. We stay
+# well inside proportionality by capping at ~15 min/day.
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Ollama model tag to evaluate
+        required: true
+        default: qwen2.5:7b
+        type: choice
+        options:
+          - qwen2.5:7b
+          - qwen2.5-coder:7b
+          - qwen2.5:14b
+          - llama3.1:8b
+          - llama3.2:3b
+  schedule:
+    # 03:00 UTC every day. Scheduled runs always use qwen2.5:7b —
+    # matches what the platform chat.yaml ships with.
+    - cron: "0 3 * * *"
+
+# Never run two eval jobs at once — the runner can barely hold one 7B
+# model in RAM alongside Ollama, MCP server and the script itself.
+concurrency:
+  group: eval-tool-calling
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: eval / ${{ inputs.model || 'qwen2.5:7b' }}
+    runs-on: ubuntu-latest
+    # Generous but bounded — a cold run with first-time model pull
+    # (~5 GB) + 40 prompts @ ~20 s each lands around 25 min. 40 min
+    # leaves headroom for a slower runner without hanging forever.
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync server + eval dependencies
+        run: uv sync --frozen --extra test --extra eval
+
+      - name: Install Ollama
+        # Upstream installer script — touches /usr/local/bin and
+        # /etc/systemd. On ephemeral GHA runners that's fine; on a
+        # self-hosted runner pin the version.
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Cache Ollama models
+        # Model blobs live under ~/.ollama/models/blobs; each 7B weighs
+        # ~4.7 GB. Without caching every run re-downloads (~2 min).
+        # Key includes the model name so a matrix across 7b / coder-7b
+        # keeps separate caches.
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-${{ inputs.model || 'qwen2.5:7b' }}-v1
+
+      - name: Start Ollama in the background
+        run: |
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in {1..30}; do
+            if curl -sf http://127.0.0.1:11434/api/version > /dev/null; then
+              echo "Ollama up."
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Pull model
+        env:
+          MODEL: ${{ inputs.model || 'qwen2.5:7b' }}
+        run: ollama pull "$MODEL"
+
+      - name: Start mcp-weather over streamable HTTP
+        # Same entrypoint as the Docker image — uv + server.py with
+        # the streamable-http transport bound to loopback. No auth
+        # because nothing else on the runner has network access to it.
+        env:
+          MCP_TRANSPORT: streamable-http
+          MCP_HOST: 127.0.0.1
+          MCP_PORT: "8000"
+        run: |
+          nohup uv run server.py > /tmp/mcp.log 2>&1 &
+          for i in {1..30}; do
+            if curl -sf -X POST http://127.0.0.1:8000/mcp \
+                 -H "Content-Type: application/json" \
+                 -H "Accept: application/json, text/event-stream" \
+                 -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"eval","version":"0"}}}' \
+                 > /dev/null; then
+              echo "MCP up."
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run eval
+        id: eval
+        env:
+          OLLAMA_URL: http://127.0.0.1:11434
+          MCP_URL: http://127.0.0.1:8000/mcp
+          OLLAMA_MODEL: ${{ inputs.model || 'qwen2.5:7b' }}
+        # Tee'ing so the raw table lives in the log AND gets captured
+        # for the step summary below.
+        run: |
+          set -o pipefail
+          uv run python tests/integration/eval_tool_calling.py 2>&1 | tee /tmp/eval.out
+
+      - name: Publish results to the job summary
+        if: always()
+        run: |
+          {
+            echo "### Tool-calling eval — ${{ inputs.model || 'qwen2.5:7b' }}"
+            echo ""
+            echo '```'
+            tail -60 /tmp/eval.out 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-logs
+          path: |
+            /tmp/eval.out
+            /tmp/ollama.log
+            /tmp/mcp.log
