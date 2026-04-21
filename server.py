@@ -86,8 +86,21 @@ async def _fetch_json(
             f"{service} did not respond within {timeout:.0f} s{tail} — try again in a moment."
         ) from last_exc
     if isinstance(last_exc, httpx.HTTPStatusError):
+        status = last_exc.response.status_code
+        # Client-side errors (4xx) usually mean the caller passed a bad
+        # argument — a Wikipedia title that doesn't exist, a postal code
+        # the geocoder rejects, an ISO country code that's not in the
+        # database. Labelling that as "service issues" points the model
+        # at the wrong root cause; the real fix is to adjust inputs and
+        # retry. Server-side errors (5xx) are the genuine upstream
+        # problem that the model should pass on to the user.
+        if 400 <= status < 500:
+            raise RuntimeError(
+                f"{service} rejected the request with HTTP {status}{tail} — check the "
+                "tool arguments (e.g. the city/title/code may not exist upstream)."
+            ) from last_exc
         raise RuntimeError(
-            f"{service} returned HTTP {last_exc.response.status_code}{tail} — the service may be having issues."
+            f"{service} returned HTTP {status}{tail} — the service may be having issues."
         ) from last_exc
     if isinstance(last_exc, httpx.RequestError):
         raise RuntimeError(
@@ -237,7 +250,7 @@ def _detect_query_language(query: str) -> str:
 
 
 async def _geocode(city: str, country_code: str | None = None) -> dict:
-    # Pull a few candidates so we can filter by `country_code` client-side —
+    # Pull candidates so we can filter by `country_code` client-side —
     # Open-Meteo's geocoding endpoint does not accept a country filter and
     # returns towns mixed with mountains, lakes, neighborhoods and islands
     # bearing the same name. We intentionally do NOT silently exclude
@@ -245,17 +258,27 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     # use `search_places(feature_types=["city"])` and pick explicitly, while
     # someone asking about weather on Mt. Everest or in the Bountiful
     # Islands should still get a useful top hit back.
+    #
+    # `count=10` is enough when the caller did not ask to disambiguate by
+    # country — Open-Meteo ranks by relevance/population and the user
+    # gets "the" match. With an explicit `country_code` filter we pull
+    # the API maximum (100) because the desired country may sit far
+    # below the top 10 for common homonyms ("London" → UK dominates, so
+    # London-CA / London-US sit outside the first page and a client-side
+    # filter on count=10 would wrongly raise "City not found").
+    #
     # Iterate through every candidate language for the query's script
     # until we find one that returns something. Most queries hit on the
     # first attempt; shared-script queries ("Одеса", "横浜") gracefully
     # fall back to the next language without a behaviour change for the
     # caller.
+    geocode_count = 100 if country_code else 10
     results: list[dict] = []
     for lang in _detect_query_languages(city):
         data = await _fetch_json(
             GEOCODE_URL,
             service="Open-Meteo geocoder",
-            params={"name": city, "count": 10, "language": lang},
+            params={"name": city, "count": geocode_count, "language": lang},
         )
         results = data.get("results") or []
         if results:
@@ -350,12 +373,18 @@ async def search_places(
     # Same fallback-chain as _geocode — try every candidate language
     # until one yields results. Important for shared-script inputs
     # (Cyrillic "Одеса", Han "横浜") that have ambiguous primary language.
+    # Bump `count` to the API maximum (100) when the caller narrows by
+    # `country_code` or `feature_types` — the target entries may be
+    # outside the default top-10 for common homonyms (London-UK drowns
+    # London-CA in the global ranking), and a too-small page size would
+    # produce empty filtered results that look like false negatives.
+    geocode_count = 100 if (country_code or feature_types) else 10
     results: list[dict] = []
     for lang in _detect_query_languages(query):
         data = await _fetch_json(
             GEOCODE_URL,
             service="Open-Meteo geocoder",
-            params={"name": query, "count": 10, "language": lang},
+            params={"name": query, "count": geocode_count, "language": lang},
         )
         results = data.get("results") or []
         if results:
