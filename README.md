@@ -168,6 +168,16 @@ env var:
 - `stdio` — default, used when an MCP client spawns the server as a
   subprocess on the same host (Option B).
 
+The HTTP transport exposes three unauthenticated liveness / readiness
+paths (`/healthz`, `/livez`, `/readyz`) that return
+`{"status": "ok", "service": "mcp-weather"}`. They bypass the MCP
+initialize handshake and the bearer-auth middleware entirely, so
+Kubernetes probes stay cheap and don't need a token:
+
+```
+curl -sf http://127.0.0.1:8000/healthz
+```
+
 ### Option A — everything in k3s (production path)
 
 #### 1. Build and push the image

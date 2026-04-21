@@ -1346,8 +1346,18 @@ async def list_radio_stations(
     })
 
 
-def _run_http_with_auth() -> None:
-    import uvicorn
+HEALTH_PATHS = frozenset({"/healthz", "/livez", "/readyz"})
+
+
+def _build_http_app():
+    """Build the Starlette app with /healthz + optional bearer auth.
+
+    Extracted from `_run_http_with_auth` so unit tests can drive the
+    full middleware stack through an ASGI transport without binding a
+    port. Middleware layering is load-bearing: healthz MUST run BEFORE
+    bearer auth so probes never need a token (Starlette stacks
+    middleware LIFO on the incoming side — last added = outermost).
+    """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
 
@@ -1370,7 +1380,32 @@ def _run_http_with_auth() -> None:
 
         app.add_middleware(BearerAuthMiddleware)
 
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    class HealthzMiddleware(BaseHTTPMiddleware):
+        """Cheap liveness / readiness probe paths for Kubernetes.
+
+        Probes need a tiny unauthenticated 200-OK. Going through `/mcp`
+        would force every probe to do the full MCP `initialize`
+        handshake, which is wasteful and noisy in k8s logs. Intercept
+        the three conventional paths (`/healthz`, `/livez`, `/readyz`)
+        — anything else falls through to the MCP app (and bearer
+        middleware if configured).
+        """
+        async def dispatch(self, request, call_next):
+            if request.url.path in HEALTH_PATHS:
+                return JSONResponse({"status": "ok", "service": "mcp-weather"})
+            return await call_next(request)
+
+    # Added LAST so it wraps bearer auth — incoming request hits
+    # HealthzMiddleware first, short-circuits probe paths before auth
+    # ever runs.
+    app.add_middleware(HealthzMiddleware)
+    return app
+
+
+def _run_http_with_auth() -> None:
+    import uvicorn
+
+    uvicorn.run(_build_http_app(), host=HOST, port=PORT, log_level="info")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ tool's contract (input handling + shape of the response).
 from __future__ import annotations
 
 from datetime import date
+from importlib import reload
 from unittest.mock import patch
 
 import httpx
@@ -476,6 +477,40 @@ async def test_currency_rejects_unknown_target():
     )
     with pytest.raises(ValueError, match="Unknown target currency"):
         await server.convert_currency(1.0, "USD", "XYZ")
+
+
+async def _probe(app, path: str, *, headers: dict | None = None) -> httpx.Response:
+    # Drive the Starlette/FastMCP app through an in-memory ASGI
+    # transport — no port, no uvicorn, works in parallel pytest.
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://mcp.test") as client:
+        return await client.get(path, headers=headers or {})
+
+
+async def test_healthz_returns_200_without_auth():
+    # Build the app with NO token configured — bearer middleware isn't
+    # attached at all. /healthz still works.
+    with patch.object(server, "AUTH_TOKEN", ""):
+        app = server._build_http_app()
+    for path in ("/healthz", "/livez", "/readyz"):
+        r = await _probe(app, path)
+        assert r.status_code == 200, f"{path} should be 200, got {r.status_code}"
+        assert r.json() == {"status": "ok", "service": "mcp-weather"}
+
+
+async def test_healthz_bypasses_bearer_auth_when_token_is_set():
+    # With a token configured, the MCP paths require bearer; /healthz
+    # does not — k8s probes never carry a secret and must still reach
+    # the endpoint.
+    with patch.object(server, "AUTH_TOKEN", "secret-sentinel"):
+        app = server._build_http_app()
+    r = await _probe(app, "/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+    # And that the bearer middleware is actually armed: a GET to an
+    # unknown path without the header returns 401, not 200.
+    r_unauth = await _probe(app, "/mcp")
+    assert r_unauth.status_code == 401
 
 
 async def test_radio_stations_requires_a_filter():
