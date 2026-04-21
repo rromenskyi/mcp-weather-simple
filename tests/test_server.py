@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from datetime import date
 from importlib import reload
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -454,6 +455,121 @@ async def test_geocode_postal_code_spanning_countries_fires_rule_3():
     # but rule 1 (cross-country, no country_code) does — either reason
     # is acceptable so the test asserts only on the sentinel.
     assert result.get("_ambiguous") is True
+
+
+# ── MCP elicitation (spec 2025-11-25) ────────────────────────────────────
+
+
+def _fake_context_with_elicit(elicit_result) -> MagicMock:
+    """Build a Context stand-in whose `.elicit` awaitable returns the
+    given ElicitationResult. `_request_context` is set truthy so our
+    server's "am I inside a request?" probe lets elicitation proceed.
+    """
+    ctx = MagicMock()
+    ctx._request_context = MagicMock()  # truthy → we're "in a request"
+    ctx.elicit = AsyncMock(return_value=elicit_result)
+    return ctx
+
+
+@respx.mock
+async def test_elicitation_accept_resolves_to_chosen_candidate():
+    # When the client supports elicitation AND the user picks a
+    # candidate, _resolve_place returns that candidate as a regular
+    # hit (no envelope) — the weather tool then proceeds normally
+    # against the chosen place, as if the geocoder had returned
+    # top-1 all along.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "country": "United States",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "timezone": "America/Chicago", "population": 114_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "country": "United States",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "timezone": "America/New_York", "population": 155_000},
+                ]
+            },
+        )
+    )
+    # User picks the Massachusetts variant. Label format matches
+    # `_candidate_label`: "<name>, <admin1>, <country_code>".
+    fake_result = SimpleNamespace(
+        action="accept",
+        data=SimpleNamespace(choice="Springfield, Massachusetts, US"),
+    )
+    with patch.object(server.mcp, "get_context", return_value=_fake_context_with_elicit(fake_result)):
+        hit, clarify = await server._resolve_place("Springfield", country_code="US")
+    assert clarify is None
+    assert hit is not None
+    assert hit["admin1"] == "Massachusetts"
+    assert hit["latitude"] == 42.10
+
+
+@respx.mock
+async def test_elicitation_decline_falls_back_to_envelope():
+    # When the user declines / cancels (or returns no data), we fall
+    # through to the `relay_to_user=False` envelope so the LLM still
+    # gets a chance to ask the user in its own turn. Same behaviour
+    # as when the client doesn't support elicitation at all — the
+    # envelope is the forward-compatible safety net.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "population": 114_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "population": 155_000},
+                ]
+            },
+        )
+    )
+    declined = SimpleNamespace(action="decline", data=None)
+    with patch.object(server.mcp, "get_context", return_value=_fake_context_with_elicit(declined)):
+        hit, clarify = await server._resolve_place("Springfield", country_code="US")
+    assert hit is None
+    assert clarify is not None
+    assert clarify["relay_to_user"] is False
+    assert "Springfield" in clarify["guidance"]
+
+
+@respx.mock
+async def test_elicitation_raised_exception_falls_back_to_envelope():
+    # If the client did NOT advertise elicitation capability,
+    # FastMCP raises internally when the server tries to elicit.
+    # Verify we swallow it and route to the envelope — otherwise
+    # OWUI / mcphost (which don't yet speak elicitation) would see
+    # a crashing tool call instead of a disambiguation request.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "population": 114_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "population": 155_000},
+                ]
+            },
+        )
+    )
+    ctx = MagicMock()
+    ctx._request_context = MagicMock()
+    ctx.elicit = AsyncMock(side_effect=RuntimeError("client does not support elicitation"))
+    with patch.object(server.mcp, "get_context", return_value=ctx):
+        hit, clarify = await server._resolve_place("Springfield", country_code="US")
+    assert hit is None
+    assert clarify is not None
+    assert clarify["relay_to_user"] is False
 
 
 @respx.mock
