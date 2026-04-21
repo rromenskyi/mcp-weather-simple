@@ -211,6 +211,18 @@ harness before promoting any of these to issues.
   US (free, bulk CSV, cached); for non-US punt to a "not available"
   response rather than guess. Useful companion to the overnight-stop
   decision.
+- **`get_regional_news(region=None, category=None, limit=5)`** —
+  headlines for a region. When `region` is omitted, default to the
+  caller's country / state from `detect_my_location_by_ip` (same
+  "defaults to 'here'" pattern as the weather shortcuts). Candidate
+  free sources: GDELT Project (global events, no key), Google News
+  RSS (per-country feeds, no key, rate-limited), mediastack /
+  newsdata.io free tiers (keyed, stricter limits). Prefer GDELT +
+  Google News RSS to stay key-free. Accuracy caveat in response
+  guidance when the region came from GeoIP — same pattern as the
+  weather "outside right now" shortcut. Response shape mirrors the
+  radio-stations tool: `{"filters": {...}, "count": N, "articles":
+  [{"title", "url", "source", "published_at", "snippet"}]}`.
 - **`last_resort_web_search(query, max_results=5)`** — DuckDuckGo
   Instant Answer / HTML endpoint (no key, rate-limited but generous).
   General-purpose escape hatch for "I don't have a dedicated tool for
