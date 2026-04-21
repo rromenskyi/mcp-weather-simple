@@ -121,7 +121,11 @@ cases:
   # ── Wikipedia ──────────────────────────────────────────────────────────
   - prompt: "Tell me about Yokohama"
     expected_tool: get_wikipedia_summary
-  - prompt: "Расскажи про Баунтифул"
+  - prompt: "What does Wikipedia say about Beverly Hills?"
+    expected_tool: get_wikipedia_summary
+  - prompt: "Что википедия говорит про Баунтифул?"
+    expected_tool: get_wikipedia_summary
+  - prompt: "Хто такий Тарас Шевченко?"
     expected_tool: get_wikipedia_summary
 
   # ── Places disambiguation ──────────────────────────────────────────────

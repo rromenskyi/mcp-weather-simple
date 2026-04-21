@@ -206,6 +206,25 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"SKIP: model {args.model!r} not installed on this Ollama. Have: {installed}")
             return 0
 
+        # Warm-up: first real chat-with-tools call pulls the model into
+        # Ollama's RAM, which easily takes 30–60 s on a CPU runner. If
+        # we skip it, the first N scored cases all time out and drag
+        # the hit-rate with them — which is a measurement artifact, not
+        # a regression of the tool descriptions. Discard the result;
+        # we only care about its side-effect (a warm model).
+        print("Warming up model (first chat call loads it into RAM)...", end=" ", flush=True)
+        try:
+            _, warm_latency = await run_case(
+                client, args.ollama_url, args.model,
+                "Hello, this is a warm-up request. Please reply with 'ok'.",
+                ollama_tools,
+            )
+            print(f"done in {warm_latency:.1f}s.")
+        except Exception as e:
+            # Warm-up failures are informational — the scored loop below
+            # will surface real problems with its own timeout handling.
+            print(f"warm-up failed ({type(e).__name__}: {e}) — proceeding anyway.")
+
         results: list[dict] = []
         for i, case in enumerate(cases, 1):
             prompt, expected = case["prompt"], case["expected_tool"]

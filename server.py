@@ -999,9 +999,20 @@ async def get_historical_weather(
 async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
     """Short Wikipedia summary (~300 chars) + page URL for a topic.
 
-    Answers "tell me about X". `lang` is a Wikipedia language code
-    ("en", "uk", "de"...). Title can be a name or a URL-slug
-    ("Kyiv", "Beverly_Hills").
+    Call this whenever the user wants encyclopedic information about
+    a place, person, concept or event. English trigger phrases
+    include "tell me about X", "who / what is X", "give me background
+    on X", "what does Wikipedia say about X". Russian trigger phrases
+    include "что википедия говорит про X", "расскажи про X",
+    "кто такой X", "что такое X", "расскажи о X".
+
+    `lang` is a Wikipedia language code ("en", "uk", "de", "ru"…);
+    pick it based on the language the user wrote the query in, not
+    the subject — Wikipedia has an article in each language, the
+    English one is the biggest. Title can be a name or a URL-slug
+    ("Kyiv", "Beverly_Hills"); pass the literal phrase the user said
+    and Wikipedia's redirect machinery will usually find the right
+    page.
     """
     safe_title = title.replace(" ", "_")
     url = WIKIPEDIA_SUMMARY_URL.format(lang=lang, title=safe_title)
