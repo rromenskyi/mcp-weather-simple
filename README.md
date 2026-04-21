@@ -290,16 +290,93 @@ uv run mcp dev server.py
 This launches the MCP Inspector in a browser so you can call tools by
 hand and inspect the traffic.
 
+## Testing
+
+Two layers, each answering a different question.
+
+### Unit tests — does the server behave?
+
+`tests/test_server.py` (35+ cases, ~1 s total, respx-mocked — no
+network). Proves every tool returns the correct response shape for
+a known input: correct geocoding fallback across scripts, correct
+`day_label` anchoring to the city's timezone, correct per-hour /
+per-day row structure, Open-Meteo parameters wired right, friendly
+error messages for 4xx vs 5xx, lat/lon validation, mirror fallback
+for radio-browser, etc.
+
+Run: `uv sync --extra test && uv run pytest -q`
+
+Every PR runs these automatically via `.github/workflows/build.yml`.
+Think of it as "the plumbing works, input X produces output Y".
+
+### Tool-calling eval — do LLMs actually pick the right tool?
+
+Separate problem: even a perfectly-implemented tool is useless if
+the model ignores it. Small open-source LLMs (qwen2.5:7b,
+qwen2.5:14b, llama3.1:8b, …) read the tool's **description** and
+name, and decide on the fly whether to invoke it. A docstring that
+reads clearly to a human but overlaps semantically with a sibling
+tool will cause the model to fumble the choice.
+
+`tests/integration/eval_tool_calling.py` + `tests/integration/cases.yaml`
+measure this as a **top-1 tool-selection hit rate**:
+
+- 40+ `(prompt, expected_tool)` pairs grouped by intent family —
+  weather-here, forecast-tomorrow, hourly, air quality, sunrise,
+  historical, time-in-city, time-here, currency, country-info,
+  public holidays, radio stations, Wikipedia, places-disambiguation.
+- Russian + English mixed on purpose: the geocoder has a
+  script-fallback chain, and the model has to trigger tools the
+  same way regardless of query language.
+- For every case the harness sends `{prompt, tools, temperature=0,
+  seed=42}` to Ollama's `/api/chat`, reads `tool_calls[0].function.name`,
+  scores it against the expected tool.
+- Reports a **per-family** and **overall** hit rate, lists the
+  failing prompts. `pass_threshold` lives in `cases.yaml`; current
+  baseline on qwen2.5:7b is **~97 %** (86.8 % on the first run
+  before a warm-up call was added to neutralise the cold-start
+  ReadTimeout on the first 4 scored cases).
+
+Run (GitHub Actions): `.github/workflows/eval.yml` kicks this off
+via `workflow_dispatch` (manual button in the Actions tab — leave
+`model` empty to fan out across **qwen2.5:7b + qwen2.5:14b** in
+parallel, or pick a single model for quick iteration) and a nightly
+`cron` at 03:00 UTC. Each model gets its own runner (16 GB RAM /
+4 vCPU), its own Ollama model cache (`ollama-<model>-v1`), its own
+job summary with the scored table.
+
+Run (locally, against your own Ollama): point the script at a
+running Ollama and MCP server:
+
+```bash
+OLLAMA_URL=http://127.0.0.1:11434 \
+MCP_URL=http://127.0.0.1:8000/mcp \
+OLLAMA_MODEL=qwen2.5:7b \
+uv run python tests/integration/eval_tool_calling.py
+```
+
+**Why two layers:** the unit suite tells you *the weather endpoint
+works*, the eval tells you *the chatbot would actually call it when
+the user says «какая погода»*. A failing eval hit rate on a single
+family (say `get_wikipedia_summary` drops from 2/2 to 0/2) is the
+clearest signal that that tool's docstring needs tuning — there's
+no other place to point when "it worked in curl but the model won't
+use it" bites.
+
 ## Project files
 
 - `server.py` — the MCP server (FastMCP). Transport is controlled by
   `MCP_TRANSPORT` (`stdio` | `streamable-http`), port by `MCP_PORT`.
 - `pyproject.toml` / `uv.lock` — dependencies (`mcp[cli]`, `httpx`).
 - `mcphost.config.json` — `mcphost` config for Option B.
+- `tests/` — unit tests (`test_server.py`, mocked) and integration
+  eval harness (`integration/`, hits real Ollama + MCP).
 - `Dockerfile` / `.dockerignore` — multi-stage image built with `uv`,
   runs as non-root with a read-only root filesystem.
 - `k8s/` — Kustomize manifests: Deployment, Service, NetworkPolicy,
   Secret template, and an optional Traefik IngressRoute.
+- `.github/workflows/` — `build.yml` (image + python import on every
+  PR), `eval.yml` (tool-calling eval, manual + nightly).
 
 ## License
 
