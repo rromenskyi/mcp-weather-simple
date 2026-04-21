@@ -307,10 +307,14 @@ jobs:
         with:
           # Artifact name must be unique across all matrix rows,
           # otherwise GHA refuses the upload with "artifact already
-          # exists". All three axes (model + schema + chunk) in the
-          # name so the widest fanout (2×2×4 = 16 rows) doesn't
-          # collide.
-          name: eval-logs-${{ matrix.model }}-schema-${{ matrix.schema }}-docs-${{ matrix.docstring }}-chunk-${{ matrix.chunk }}
+          # exists". All four axes (model + schema + docstring +
+          # chunk) in the name so the widest fanout doesn't collide.
+          #
+          # `replace(matrix.model, ':', '-')` sanitises Ollama's tag
+          # format (`qwen2.5:14b`) — GHA artifact names reject colon,
+          # slash, and several other characters. Replacement to `-`
+          # keeps the name readable.
+          name: eval-logs-${{ replace(matrix.model, ':', '-') }}-schema-${{ matrix.schema }}-docs-${{ matrix.docstring }}-chunk-${{ matrix.chunk }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log
