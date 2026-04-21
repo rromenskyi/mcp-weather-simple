@@ -34,12 +34,64 @@ WEATHER_CODES = {
 }
 
 
+# GeoNames feature_code → human label. Exposed to the caller so the
+# model (or a client) can reason about what kind of place a candidate
+# is — a town, a neighborhood, a mountain, a lake — and decide whether
+# that matches the user's intent. A few codes are grouped under one
+# bucket (e.g. every `PPL*` except `PPLX`/`PPLH`/`PPLQ`/`PPLW` is just
+# "city") because the distinction rarely matters to weather queries.
+_FEATURE_TYPE_BY_CODE = {
+    "PPL": "city", "PPLA": "city", "PPLA2": "city", "PPLA3": "city",
+    "PPLA4": "city", "PPLA5": "city", "PPLC": "city",
+    "PPLCH": "historical place", "PPLH": "historical place",
+    "PPLQ": "abandoned place", "PPLW": "destroyed place",
+    "PPLL": "village", "PPLF": "farm", "PPLR": "religious place",
+    "PPLS": "populated places", "PPLX": "neighborhood",
+    "MT": "mountain", "MTS": "mountains", "PK": "peak", "PKS": "peaks",
+    "HLL": "hill", "HLLS": "hills", "RDGE": "ridge", "CLF": "cliff",
+    "LK": "lake", "LKS": "lakes", "RSV": "reservoir",
+    "STM": "stream", "STMS": "streams", "RVN": "ravine",
+    "ISL": "island", "ISLS": "islands", "ISLET": "islet",
+    "PRK": "park", "RES": "reserve", "FRST": "forest",
+    "BCH": "beach", "CAPE": "cape", "BAY": "bay", "COVE": "cove",
+    "AIRP": "airport", "AIRF": "airfield",
+    "RSTN": "train station", "BUSSTN": "bus station",
+}
+
+
+def _feature_type(code: str | None) -> str | None:
+    if not code:
+        return None
+    return _FEATURE_TYPE_BY_CODE.get(code.upper(), code)  # fall back to the raw code
+
+
+def _annotate(hit: dict) -> dict:
+    """Normalize a geocoding hit into a caller-facing dict with human labels."""
+    fc = hit.get("feature_code")
+    return {
+        "name": hit["name"],
+        "country": hit.get("country"),
+        "country_code": hit.get("country_code"),
+        "admin1": hit.get("admin1"),
+        "latitude": hit["latitude"],
+        "longitude": hit["longitude"],
+        "timezone": hit.get("timezone"),
+        "population": hit.get("population"),
+        "postcodes": hit.get("postcodes"),
+        "feature_code": fc,
+        "feature_type": _feature_type(fc),
+    }
+
+
 async def _geocode(city: str, country_code: str | None = None) -> dict:
     # Pull a few candidates so we can filter by `country_code` client-side —
-    # Open-Meteo's geocoding endpoint does not accept a country filter, it
-    # just matches `name` across the whole globe. `count=10` is cheap and
-    # covers the vast majority of ambiguous city names (Moscow, Paris,
-    # Springfield, etc.).
+    # Open-Meteo's geocoding endpoint does not accept a country filter and
+    # returns towns mixed with mountains, lakes, neighborhoods and islands
+    # bearing the same name. We intentionally do NOT silently exclude
+    # non-city hits here — a caller that wants only populated places can
+    # use `list_places(feature_types=["city"])` and pick explicitly, while
+    # someone asking about weather on Mt. Everest or in the Bountiful
+    # Islands should still get a useful top hit back.
     params: dict[str, str | int] = {"name": city, "count": 10, "language": "en"}
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(GEOCODE_URL, params=params)
@@ -55,20 +107,7 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
         raise ValueError(
             f"City not found: {city}" + (f" in {country_code}" if country_code else "")
         )
-    hit = results[0]
-    return {
-        "name": hit["name"],
-        "country": hit.get("country"),
-        "country_code": hit.get("country_code"),
-        "admin1": hit.get("admin1"),  # state / region, helps disambiguate "Springfield, IL" vs "Springfield, MA"
-        "latitude": hit["latitude"],
-        "longitude": hit["longitude"],
-        "timezone": hit.get("timezone"),
-        # List of postal codes tied to this hit. Useful to confirm a
-        # zipcode-driven lookup actually resolved the expected area —
-        # e.g. "90210" → name "Beverly Hills", postcodes contains 90210.
-        "postcodes": hit.get("postcodes"),
-    }
+    return _annotate(results[0])
 
 
 def _day_label(target: date, today: date) -> str:
@@ -102,30 +141,48 @@ async def geocode_city(city: str, country_code: str | None = None) -> dict:
     `postcodes` (list of zip codes tied to the hit) so the caller can
     verify the right place was picked.
 
-    Ambiguous queries (e.g. "Springfield" without a country) still
-    return a single top-ranked hit here — call `list_cities(...)` first
-    if you want to see every candidate and pick one explicitly.
+    Ambiguous queries (e.g. "Springfield" without a country, or a
+    query that could resolve to a town OR a mountain of the same name)
+    still return a single top-ranked hit here — call `list_places(...)`
+    first if you want to see every candidate, filter by feature type,
+    and pick one explicitly.
     """
     return await _geocode(city, country_code=country_code)
 
 
 @mcp.tool()
-async def list_cities(
+async def list_places(
     query: str,
     country_code: str | None = None,
+    feature_types: list[str] | None = None,
     limit: int = 5,
 ) -> dict:
-    """Return every geocoding candidate for an ambiguous city or postal code.
+    """Return every geocoding candidate for an ambiguous query.
 
-    Use this tool **before** the weather tools whenever the user's
-    request is vague ("what's the weather in Springfield?" —
-    Springfield exists in dozens of US states, plus MO, IL, etc.). The
-    response contains a `candidates` list with country, admin1 (state
-    or region), lat/lon, timezone and population; the caller should
-    either pick one on the user's behalf or ask the user to clarify.
+    Deliberately general-purpose: the Open-Meteo geocoder returns not
+    just towns but also mountains, lakes, parks, islands, neighborhoods
+    and airports bearing the same name. Each candidate carries a
+    `feature_type` human label ("city", "mountain", "lake",
+    "neighborhood", "park", "peak", "island", "airport", …) so the
+    caller can match the user's intent ("weather on Mt. Bountiful" vs
+    "weather in Bountiful" are legitimately different places).
 
-    `country_code` narrows the candidate pool server-side. `limit`
-    caps the list length (1-10, default 5).
+    Parameters:
+    - `query`: name or postal code. Same semantics as `geocode_city`.
+    - `country_code`: ISO-3166-1 alpha-2 hint ("US", "UA"). Narrows the
+      candidate pool server-side.
+    - `feature_types`: optional allowlist of human labels
+      (e.g. `["city", "village"]` for only populated places, or
+      `["mountain", "peak", "hill"]` for only high ground). Pass
+      `None` / empty to keep every feature type in the results.
+    - `limit`: caps the list length (1-10, default 5).
+
+    Use this tool whenever the user's request is vague — either because
+    the name is ambiguous ("Springfield"), the intent isn't clear
+    (town vs mountain vs lake), or the first hit's `feature_type`
+    doesn't match what the user seems to want. The caller can then
+    surface the disambiguation choice to the user or pick one on their
+    behalf.
     """
     limit = max(1, min(int(limit), 10))
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -139,25 +196,45 @@ async def list_cities(
     if country_code:
         cc_upper = country_code.strip().upper()
         results = [h for h in results if (h.get("country_code") or "").upper() == cc_upper]
-    candidates = [
-        {
-            "name": h["name"],
-            "country": h.get("country"),
-            "country_code": h.get("country_code"),
-            "admin1": h.get("admin1"),
-            "latitude": h["latitude"],
-            "longitude": h["longitude"],
-            "timezone": h.get("timezone"),
-            "population": h.get("population"),
-            "postcodes": h.get("postcodes"),
-        }
-        for h in results[:limit]
-    ]
+    if feature_types:
+        allowed = {ft.strip().lower() for ft in feature_types if ft}
+        results = [h for h in results if (_feature_type(h.get("feature_code")) or "").lower() in allowed]
+    candidates = [_annotate(h) for h in results[:limit]]
     return {
         "query": query,
         "country_code": country_code,
+        "feature_types": feature_types,
         "candidates": candidates,
         "ambiguous": len(candidates) > 1,
+    }
+
+
+@mcp.tool()
+async def get_local_time(city: str, country_code: str | None = None) -> dict:
+    """Return the current local date, time and timezone of a city or zipcode.
+
+    Answers "what time is it in Kyiv?" without the model having to know
+    the city's offset. Internally calls the same geocoder the weather
+    tools use — so `country_code` is an optional ISO-3166-1 alpha-2
+    hint and the response's `name` / `country` / `admin1` confirm which
+    place was picked.
+    """
+    loc = await _geocode(city, country_code=country_code)
+    try:
+        tz = ZoneInfo(loc.get("timezone") or "UTC")
+    except Exception:
+        tz = _tz.utc
+    now = datetime.now(tz)
+    return {
+        "location": f"{loc['name']}, {loc.get('country', '')}".rstrip(", "),
+        "admin1": loc.get("admin1"),
+        "country_code": loc.get("country_code"),
+        "timezone": loc.get("timezone"),
+        "date": now.date().isoformat(),
+        "time": now.strftime("%H:%M:%S"),
+        "weekday": now.strftime("%A"),
+        "iso_datetime": now.isoformat(timespec="seconds"),
+        "utc_offset": now.strftime("%z"),
     }
 
 
