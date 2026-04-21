@@ -1778,7 +1778,12 @@ async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
         url,
         service="Wikipedia",
         timeout=5.0,
-        headers={"Accept": "application/json"},
+        # Wikipedia's REST API enforces its User-Agent ToS — a request
+        # without a descriptive UA returns HTTP 403 ("please provide a
+        # unique User-Agent with contact info"). Share the same repo-
+        # identifying string with radio-browser / OSM for simplicity;
+        # Wikipedia only cares that it's descriptive, not exclusive.
+        headers={"Accept": "application/json", "User-Agent": RADIO_BROWSER_UA},
     )
     return _respond({
         "title": data.get("title"),
