@@ -19,6 +19,22 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+    # IMPORTANT — if you enable the optional IngressRoute (Option A
+    # step 2 of README.md: uncomment `ingressroute.yaml` under
+    # `kustomization.yaml`), Traefik itself usually lives in a *different*
+    # namespace (`traefik-system`, `ingress-controller`, `kube-system`,
+    # depending on chart). The podSelector above only lets the `ai`
+    # namespace in, so the IngressRoute would get its traffic dropped at
+    # the CNI layer. Uncomment and adjust the block below to match your
+    # Traefik setup:
+    #
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: ingress-controller  # ← your Traefik ns
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8000
   egress:
     # DNS resolution for Open-Meteo endpoints.
     - to:

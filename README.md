@@ -199,7 +199,13 @@ Inside the cluster the server becomes reachable at
 If your MCP client (Open WebUI / mcphost) also runs in the cluster you
 don't need external ingress. To expose the server outside the cluster,
 uncomment `ingressroute.yaml` in `kustomization.yaml` and set your
-hostname.
+hostname. **When you do, also relax the NetworkPolicy** — the default
+`k8s/networkpolicy.yaml` only lets the `ai` namespace in, so Traefik
+running in its own namespace (`traefik-system`, `ingress-controller`,
+…) will get its traffic dropped at the CNI layer. A ready-to-use
+cross-namespace rule is commented out at the bottom of the
+NetworkPolicy; uncomment it and point the `namespaceSelector` at your
+Traefik install.
 
 The manifests are compatible with the PodSecurity `restricted` profile:
 `runAsNonRoot`, `readOnlyRootFilesystem`, `capabilities.drop: [ALL]`,

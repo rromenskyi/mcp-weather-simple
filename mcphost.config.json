@@ -1,10 +1,22 @@
 {
   "mcpServers": {
     "weather": {
-      "command": "/home/roman220/.local/bin/uv",
+      "comment": [
+        "Option B (stdio) config for `mcphost`. Copy or point at this file;",
+        "mcphost spawns `uv run server.py` as a subprocess.",
+        "",
+        "`command` resolves against $PATH — install uv user-wide",
+        "(`curl -LsSf https://astral.sh/uv/install.sh | sh` lands it in",
+        "~/.local/bin which most shells already have on PATH).",
+        "",
+        "`--directory .` works when `mcphost` is invoked from the repo root.",
+        "From anywhere else, replace `.` with the absolute path to your clone",
+        "of mcp-weather-simple, e.g. `/home/you/src/mcp-weather-simple`."
+      ],
+      "command": "uv",
       "args": [
         "--directory",
-        "/home/roman220/gh/mcp-weather-simple",
+        ".",
         "run",
         "server.py"
       ]

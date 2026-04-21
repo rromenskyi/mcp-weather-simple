@@ -736,6 +736,65 @@ async def test_public_holidays_maps_nager_payload():
 
 
 @respx.mock
+async def test_fetch_json_4xx_is_labelled_as_caller_error_not_service_outage():
+    # 404 from Wikipedia (title doesn't exist) should tell the model
+    # to fix its argument, not "service may be having issues". 500 is
+    # the opposite — upstream problem, retry/report to user.
+    respx.get("https://example.test/missing").mock(
+        return_value=httpx.Response(404, json={"detail": "not found"})
+    )
+    respx.get("https://example.test/broken").mock(
+        return_value=httpx.Response(502, json={})
+    )
+    with pytest.raises(RuntimeError, match="rejected the request with HTTP 404"):
+        await server._fetch_json("https://example.test/missing", service="TestSvc", timeout=1.0)
+    with pytest.raises(RuntimeError, match="service may be having issues"):
+        await server._fetch_json("https://example.test/broken", service="TestSvc", timeout=1.0)
+
+
+@respx.mock
+async def test_geocode_uses_count_100_when_country_code_is_set():
+    # London, CA has lower population than London, UK → sits outside
+    # the default count=10 Open-Meteo page. country_code="CA" must
+    # bump the page size so the filter can still find it.
+    route = respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "London", "country_code": "CA", "admin1": "Ontario",
+                     "latitude": 42.98, "longitude": -81.25,
+                     "timezone": "America/Toronto",
+                     "feature_code": "PPLA2", "population": 383822},
+                ]
+            },
+        )
+    )
+    hit = await server._geocode("London", country_code="CA")
+    assert hit["country_code"] == "CA"
+    assert route.calls.last.request.url.params["count"] == "100"
+
+
+@respx.mock
+async def test_geocode_uses_count_10_when_no_country_code_filter():
+    route = respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "London", "country_code": "GB", "admin1": "England",
+                     "latitude": 51.51, "longitude": -0.13,
+                     "timezone": "Europe/London",
+                     "feature_code": "PPLC", "population": 8900000},
+                ]
+            },
+        )
+    )
+    await server._geocode("London")
+    assert route.calls.last.request.url.params["count"] == "10"
+
+
+@respx.mock
 async def test_list_radio_stations_sorts_by_clickcount_and_trims_to_limit():
     # radio-browser returns 4 stations; we request limit=2 and expect
     # the two with the highest `clickcount` in that order.
