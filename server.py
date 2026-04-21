@@ -164,6 +164,45 @@ def _annotate(hit: dict) -> dict:
     }
 
 
+def _detect_query_language(query: str) -> str:
+    """Map a query's dominant script to an Open-Meteo `language` code.
+
+    Open-Meteo's geocoder is script-biased: when `language=en` it indexes
+    the Latin name of every place, so a Cyrillic "Москва" returns only
+    two villages in Tajikistan instead of Moscow, RU (because the Tajik
+    villages are natively written in Latin as "Moskva"). Passing
+    `language=ru` for the same query surfaces Moscow-RU at the top with
+    10 M population. Same story for Greek / CJK / Arabic — match the
+    script to the `language` parameter and Open-Meteo picks the right
+    index. Fall back to English for Latin-only queries.
+    """
+    # Two-pass: Japanese-specific kana (Hiragana / Katakana) and Korean
+    # Hangul are checked BEFORE CJK Han, because every Japanese and
+    # Korean place name typically mixes Han ideographs with the
+    # language-specific script. Returning 'zh' on the first Han match
+    # would mislabel "東京タワー" (has Katakana → Japanese) or "서울특별시"
+    # (has Hangul → Korean). A single Hangul / Kana glyph wins.
+    for ch in query:
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF:
+            return "ja"  # Hiragana + Katakana
+        if 0xAC00 <= code <= 0xD7AF:
+            return "ko"  # Hangul syllables
+    for ch in query:
+        code = ord(ch)
+        if 0x0400 <= code <= 0x052F:
+            return "ru"  # Cyrillic (Russian, Ukrainian, Bulgarian, Serbian, …)
+        if 0x0370 <= code <= 0x03FF:
+            return "el"  # Greek
+        if 0x0600 <= code <= 0x06FF:
+            return "ar"  # Arabic
+        if 0x0590 <= code <= 0x05FF:
+            return "he"  # Hebrew
+        if 0x4E00 <= code <= 0x9FFF:
+            return "zh"  # CJK Unified Ideographs (Chinese-leaning default)
+    return "en"
+
+
 async def _geocode(city: str, country_code: str | None = None) -> dict:
     # Pull a few candidates so we can filter by `country_code` client-side —
     # Open-Meteo's geocoding endpoint does not accept a country filter and
@@ -173,7 +212,11 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     # use `search_places(feature_types=["city"])` and pick explicitly, while
     # someone asking about weather on Mt. Everest or in the Bountiful
     # Islands should still get a useful top hit back.
-    params: dict[str, str | int] = {"name": city, "count": 10, "language": "en"}
+    params: dict[str, str | int] = {
+        "name": city,
+        "count": 10,
+        "language": _detect_query_language(city),
+    }
     data = await _fetch_json(GEOCODE_URL, service="Open-Meteo geocoder", params=params)
     results = data.get("results") or []
     if country_code:
@@ -266,7 +309,11 @@ async def search_places(
     data = await _fetch_json(
         GEOCODE_URL,
         service="Open-Meteo geocoder",
-        params={"name": query, "count": 10, "language": "en"},
+        params={
+            "name": query,
+            "count": 10,
+            "language": _detect_query_language(query),
+        },
     )
     results = data.get("results") or []
     if country_code:
@@ -307,6 +354,15 @@ async def _here_city() -> tuple[str, str | None]:
     return city, cc
 
 
+# Same warning attached to every GeoIP-backed response so the model never
+# forgets to surface the uncertainty to the user.
+_GEOIP_WARNING = (
+    "Location was auto-detected from the caller's public IP — it may be "
+    "wrong when the user is behind a VPN, a corporate NAT or a data-center "
+    "egress. If the user contradicts the result, ask them to name their city."
+)
+
+
 @mcp.tool()
 async def get_weather_outside_right_now() -> dict:
     """What's the weather outside right now, where the user is.
@@ -319,8 +375,11 @@ async def get_weather_outside_right_now() -> dict:
     """
     city, cc = await _here_city()
     weather = await get_current_weather_in_city(city, country_code=cc)
-    weather["_note"] = "location auto-detected from caller IP"
-    return weather
+    return {
+        **weather,
+        "location_source": "geoip_autodetected",
+        "accuracy_warning": _GEOIP_WARNING,
+    }
 
 
 @mcp.tool()
@@ -333,8 +392,11 @@ async def get_weather_forecast_for_today() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=1, country_code=cc)
-    result["_note"] = "location auto-detected from caller IP"
-    return result
+    return {
+        **result,
+        "location_source": "geoip_autodetected",
+        "accuracy_warning": _GEOIP_WARNING,
+    }
 
 
 @mcp.tool()
@@ -353,13 +415,14 @@ async def get_current_time_where_i_am() -> dict:
         "city": loc.get("city"),
         "country": loc.get("country"),
         "country_code": loc.get("country_code"),
-        "timezone_id": loc.get("timezone"),
+        "timezone_id": loc.get("timezone_id"),
         "local_date": loc.get("local_date"),
         "local_time": loc.get("local_time"),
         "weekday": loc.get("weekday"),
         "utc_offset": loc.get("utc_offset"),
         "iso_datetime": loc.get("iso_datetime"),
-        "_note": "location and timezone auto-detected from caller IP",
+        "location_source": "geoip_autodetected",
+        "accuracy_warning": _GEOIP_WARNING,
     }
 
 
@@ -374,34 +437,40 @@ async def get_weather_forecast_for_tomorrow() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=2, country_code=cc)
-    result["_note"] = "location auto-detected from caller IP; includes today and tomorrow"
-    return result
+    return {
+        **result,
+        "location_source": "geoip_autodetected",
+        "accuracy_warning": _GEOIP_WARNING,
+    }
 
 
 @mcp.tool()
 async def detect_my_location_by_ip(ip: str | None = None) -> dict:
-    """Detect the caller's approximate location from its public IP.
+    """Auto-detect the caller's approximate location. Takes NO arguments in normal use.
 
     Call this tool when the user asks "where am I?", "what's the
     weather here?", "what time is it here?" — i.e. wants a
     location-aware answer without naming a city. Backed by the public
     HTTPS service ipwho.is (no API key, no local GeoIP database).
 
-    Parameters:
-    - `ip`: an explicit IPv4/IPv6 to look up. When `None` (default)
-      the service auto-detects the IP the HTTP request arrives from.
+    **You do NOT need to know the caller's IP address.** Call this
+    tool with no arguments and the server auto-detects the IP from
+    the incoming HTTP request. The `ip` parameter is only for the
+    rare case where the caller has an explicit IPv4/IPv6 to look up
+    (e.g. debugging a specific endpoint); leave it unset in 99 % of
+    situations.
 
     Returns `city`, `region`, `country`, `country_code`, `latitude`,
-    `longitude`, `timezone` (IANA id), `local_time`, `weekday` and
+    `longitude`, `timezone_id` (IANA id), `local_time`, `weekday` and
     `utc_offset`. Feed `city` (plus `country_code` for disambiguation)
-    straight into `get_current_weather_in_city` / `get_weather_forecast` to answer
-    "weather here".
+    straight into `get_current_weather_in_city` / `get_weather_forecast`
+    to answer "weather here".
 
     Limitation: when the MCP server runs inside a Kubernetes cluster
     or behind any NAT/VPN, the auto-detected IP is the cluster / NAT
     gateway's egress IP, not the end user's browser IP — the reported
     city is where the server's uplink terminates, which may be far
-    from the user. Pass `ip` explicitly when that matters.
+    from the user.
     """
     target = f"{GEOIP_URL}/{ip}" if ip else f"{GEOIP_URL}/"
     data = await _fetch_json(target, service="ipwho.is GeoIP", timeout=5.0)
@@ -428,6 +497,13 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
         "weekday": now.strftime("%A"),
         "iso_datetime": now.isoformat(timespec="seconds"),
         "utc_offset": now.strftime("%z"),
+        "location_source": "geoip",
+        "accuracy_warning": (
+            "Location is an approximation based on the caller's public IP address. "
+            "It may differ from the user's actual location — especially when behind "
+            "a VPN, a data-center / cluster egress, or a carrier-grade NAT. "
+            "If the user contradicts the result, ask them to name their city."
+        ),
     }
 
 
