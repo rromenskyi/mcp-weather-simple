@@ -21,24 +21,31 @@ usage() {
     cat <<'EOF'
 Recipes (pass one as the first argument):
 
-  quick        One 7b row, full suite (chunk_count=1), no schema.
-               Fastest path — ~15 min wall-clock. Use for iterating
-               on docstring tweaks when you only need the 7b signal.
+  quick        One 7b row, 4 chunks, no schema. ~6 parallel rows
+               after shard fanout. Fastest 7b-only signal. ~15 min
+               wall-clock.
 
-  matrix       Default matrix: 7b + 14b, 2 chunks, schema=off.
-               Matches nightly scheduled runs. ~25 min wall-clock
-               (bounded by slowest row).
+  matrix       Default: 7b + 14b × 4 chunks, schema=off. Nightly
+               shape. 8 parallel rows, ~20-25 min wall-clock.
 
-  schema-ab    The outputSchema A/B experiment: 7b + 14b × off + on,
-               2 chunks = 8 parallel rows. Compare per-family hit
-               rate AND latency deltas between schema modes.
+  schema-ab    outputSchema A/B: 7b + 14b × off + on × 4 chunks =
+               16 parallel rows. Under the 20-concurrent-job cap.
+               Compares per-family hit rate AND latency deltas.
 
-  full         Widest fanout: 7b + 14b × off + on × 4 chunks = 16
-               parallel rows. Use when 14b is bumping ceilings on
-               `schema-ab` (each row then owns ~10 cases).
+  docstring-ab Docstring verbosity A/B: 7b + 14b × terse + verbose
+               × 4 chunks = 16 rows. Same shape as schema-ab.
 
-  14b-only     Single 14b row, 2 chunks, schema=off. Useful when 7b
-               is green and you only want the slower row's numbers.
+  full         Widest safe: 7b + 14b × schema=both × chunks=4 =
+               16 rows. Adding docstrings=both pushes to 32 rows
+               which queues — use `full-wide` if you need it.
+
+  full-wide    Every axis both, 8 chunks: 2 × 2 × 2 × 8 = 64 rows.
+               Will partially queue on the 20-job cap, but each
+               row runs fast and the whole thing completes in
+               ~2-3x the slowest row's wall-clock. Use rarely.
+
+  14b-only     Single 14b row, 4 chunks, schema=off. Useful when
+               7b is green and only the slower row needs numbers.
 
   help         Print this message.
 
@@ -50,26 +57,37 @@ case "${1:-help}" in
     quick)
         gh workflow run "$WORKFLOW" \
             -f model=qwen2.5:7b \
-            -f chunk_count=1
+            -f chunk_count=4
         ;;
     matrix)
         gh workflow run "$WORKFLOW" \
-            -f chunk_count=2
+            -f chunk_count=4
         ;;
     schema-ab)
         gh workflow run "$WORKFLOW" \
             -f output_schema=both \
-            -f chunk_count=2
+            -f chunk_count=4
+        ;;
+    docstring-ab)
+        gh workflow run "$WORKFLOW" \
+            -f docstrings=both \
+            -f chunk_count=4
         ;;
     full)
         gh workflow run "$WORKFLOW" \
             -f output_schema=both \
             -f chunk_count=4
         ;;
+    full-wide)
+        gh workflow run "$WORKFLOW" \
+            -f output_schema=both \
+            -f docstrings=both \
+            -f chunk_count=8
+        ;;
     14b-only)
         gh workflow run "$WORKFLOW" \
             -f model=qwen2.5:14b \
-            -f chunk_count=2
+            -f chunk_count=4
         ;;
     help|-h|--help)
         usage

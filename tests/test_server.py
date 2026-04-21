@@ -250,6 +250,47 @@ async def test_shortcut_does_not_leak_inner_call_into_loop_detector():
     assert direct["location"] == "Kyiv, Ukraine"
 
 
+async def test_docstring_mode_terse_by_default():
+    # Source-level docstrings are the terse versions (trimmed on
+    # 2026-04-21 for CPU/mcphost prefill budget). Pin the default
+    # so a mode flip elsewhere doesn't silently change wire content.
+    assert server._DOCSTRING_MODE == "terse"
+    tools = await server.mcp.list_tools()
+    by_name = {t.name: t for t in tools}
+    # Specific signal from the terse variant of resolve_address —
+    # "Parse a" is in terse, "Normalise a" is in the verbose dict.
+    assert by_name["resolve_address"].description.startswith("Parse a")
+    # Verbose variant of find_place_coordinates has the phrase
+    # "Argument contract"; terse doesn't.
+    assert "Argument contract" not in by_name["find_place_coordinates"].description
+
+
+async def test_docstring_mode_verbose_overrides_the_trimmed_defaults(monkeypatch):
+    # Flipping the env var and re-applying should restore the pre-trim
+    # descriptions on exactly the tools in `_DOCSTRINGS_VERBOSE`.
+    monkeypatch.setattr(server, "_DOCSTRING_MODE", "verbose")
+    original_terse = {
+        name: server.mcp._tool_manager._tools[name].description
+        for name in server._DOCSTRINGS_VERBOSE
+    }
+    server._apply_docstring_experiment()
+    try:
+        tools = await server.mcp.list_tools()
+        by_name = {t.name: t for t in tools}
+        for name, verbose_text in server._DOCSTRINGS_VERBOSE.items():
+            assert by_name[name].description == verbose_text, (
+                f"{name}: verbose override did not propagate to wire"
+            )
+        # Unrelated tools keep their source descriptions.
+        assert "detect_my_location_by_ip" not in server._DOCSTRINGS_VERBOSE
+    finally:
+        # Restore terse on every covered tool so later tests in the
+        # session see the default (autouse fixtures wipe state, but
+        # description is not one of those).
+        for name, terse_text in original_terse.items():
+            server.mcp._tool_manager._tools[name].description = terse_text
+
+
 async def test_output_schema_experiment_off_by_default():
     # Baseline: no tool declares an outputSchema — matches our
     # pre-experiment behaviour and the MCP ecosystem's plain-text
