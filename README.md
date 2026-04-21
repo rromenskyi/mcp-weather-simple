@@ -158,6 +158,42 @@ Three moving parts:
 Ollama running in k3s is just the right side of the diagram. The host
 can live anywhere.
 
+## Ollama context window — silent-truncation gotcha
+
+If your MCP client drives Ollama (mcphost, OWUI, custom), bump
+`OLLAMA_CONTEXT_LENGTH` to **8192** on the Ollama server.
+
+- **Why**: this server's tool catalog is ~3000 tokens of
+  descriptions + ~1400 of input schemas + ~110 of the
+  `InitializeResult.instructions` preamble = **~4500 tokens**,
+  already past Ollama's default 4096.
+- **Failure mode**: Ollama silently truncates from the tail, the
+  last-defined tools drop out of the model's view, chat
+  completions return 200 OK with `tool_calls: []`, model replies
+  look coherent-but-vague. No error anywhere. Discovered live on
+  2026-04-21 when an mcphost session showed "и тишина" despite a
+  successful 200 response. Ollama logs carry the one-line tell:
+
+      truncating input prompt limit=4096 prompt=4459 keep=4 new=4096
+
+- **Fix (systemd)**:
+
+      sudo mkdir -p /etc/systemd/system/ollama.service.d
+      echo -e '[Service]\nEnvironment="OLLAMA_CONTEXT_LENGTH=8192"' | \
+        sudo tee /etc/systemd/system/ollama.service.d/context.conf
+      sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+- **Fix (env)**: just export `OLLAMA_CONTEXT_LENGTH=8192` before
+  `ollama serve`. Our eval workflow
+  (`.github/workflows/eval.yml`) sets it inline on the Ollama
+  start step; the sibling
+  [terraform-gcp-eval-runner](https://github.com/rromenskyi/terraform-gcp-eval-runner)
+  bakes the systemd drop-in into `startup.sh.tpl`.
+
+qwen2.5 supports 128K natively; 8K is well within spec and gives
+headroom for the catalog + user messages + a few conversation
+turns. Bump further only if the catalog grows past ~6K tokens.
+
 ## Deployment options
 
 The server supports two transports, switchable via the `MCP_TRANSPORT`
