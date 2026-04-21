@@ -1200,6 +1200,34 @@ async def test_wikipedia_summary_shape():
 
 
 @respx.mock
+async def test_wikipedia_summary_sends_descriptive_user_agent():
+    # Wikipedia REST API enforces its User-Agent ToS — a request
+    # without a descriptive UA gets HTTP 403. Discovered live on
+    # 2026-04-21 when a mcphost session tried `get_wikipedia_summary`
+    # and hit 403 from real Wikipedia. Pin the contract here so a
+    # refactor doesn't silently drop the header again.
+    captured = {}
+
+    def handler(request):
+        captured["ua"] = request.headers.get("User-Agent", "")
+        return httpx.Response(
+            200,
+            json={
+                "title": "Bountiful",
+                "extract": "…",
+                "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Bountiful"}},
+            },
+        )
+
+    respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="en", title="Bountiful")
+    ).mock(side_effect=handler)
+    await server.get_wikipedia_summary("Bountiful")
+    assert "mcp-weather-simple" in captured["ua"]
+    assert "github.com" in captured["ua"]
+
+
+@respx.mock
 async def test_currency_conversion_multiplies_rate():
     respx.get(server.CURRENCY_URL.format(base="USD")).mock(
         return_value=httpx.Response(
