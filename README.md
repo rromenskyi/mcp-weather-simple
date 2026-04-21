@@ -14,11 +14,13 @@ Two transports in a single codebase:
 
 ## Tools
 
-| Tool                         | Description                                      |
-|------------------------------|--------------------------------------------------|
-| `geocode_city(city)`         | Resolve a city name to lat/lon and timezone.     |
-| `get_current_weather(city)`  | Current temperature, humidity, wind, conditions. |
-| `get_forecast(city, days=7)` | Daily forecast, 1–16 days ahead.                 |
+| Tool                                               | Description                                                                                                                                           |
+|----------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `get_today(timezone="UTC")`                        | Today's date, weekday and the timezone used as anchor. Call this first when the user asks about "today" / "tomorrow" / a weekday.                    |
+| `geocode_city(city, country_code=None)`            | Resolve a city name or postal code to lat/lon and timezone. `country_code` (ISO-3166-1 alpha-2) disambiguates homonyms and zip-code collisions.      |
+| `list_cities(query, country_code=None, limit=5)`   | Return every geocoding candidate for an ambiguous query (e.g. "Springfield"). Lets the caller pick one on the user's behalf or ask for clarification. |
+| `get_current_weather(city, country_code=None)`     | Current temperature, humidity, wind, conditions.                                                                                                      |
+| `get_forecast(city, days=7, country_code=None)`    | Daily forecast, 1–16 days ahead. Each entry carries `day_label` ("today", "tomorrow", "in N days") anchored to the city's local timezone.            |
 
 ## What is `uv`?
 
