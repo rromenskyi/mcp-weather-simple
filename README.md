@@ -28,6 +28,11 @@ Two transports in a single codebase:
 | `get_air_quality(city, country_code=None)`               | Current PM2.5 / PM10 / ozone / NO2 / SO2 / CO plus European and US AQI indices. |
 | `get_weather_by_coordinates(latitude, longitude)`        | Current weather at raw lat/lon — skips the geocoder entirely. Useful with coordinates from `detect_my_location_by_ip` or pasted from a map app. |
 | `get_historical_weather(city, start_date_iso, end_date_iso=None, country_code=None)` | Daily archive (1940–present). Up to 31 days per request. |
+| `get_wikipedia_summary(title, lang="en")`                | ~300-char Wikipedia summary + page URL. Answers "tell me about X". |
+| `get_country_info(country)`                              | Country facts: capital, population, currencies, languages, calling code, borders, timezones. Accepts ISO code or plain name. |
+| `get_public_holidays(country_code, year=None)`           | Public / bank holidays for a country in a given year. Backed by `date.nager.at`. |
+| `convert_currency(amount, from_currency, to_currency)`   | Fiat currency conversion at today's rate. ISO-4217 codes. |
+| `list_radio_stations(country=None, tag=None, language=None, limit=10)` | Browse internet-radio stations by country, tag or language. Volunteer catalogue (radio-browser.info) with mirror fallback. |
 
 ### No-arg shortcuts for common questions
 

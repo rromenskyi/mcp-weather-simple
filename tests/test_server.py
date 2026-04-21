@@ -187,7 +187,7 @@ async def test_weather_forecast_labels_today_and_tomorrow_in_city_tz():
 
     labels = [d["day_label"] for d in result["days"]]
     assert labels == ["yesterday", "today", "tomorrow"]
-    assert result["timezone"] == "Europe/Kyiv"
+    assert result["timezone_id"] == "Europe/Kyiv"
 
 
 # ── Historical: date validation ──────────────────────────────────────────
@@ -231,7 +231,7 @@ async def test_geoip_detect_returns_clock_fields():
 
     loc = await server.detect_my_location_by_ip()
     assert loc["city"] == "Kyiv"
-    assert loc["timezone"] == "Europe/Kyiv"
+    assert loc["timezone_id"] == "Europe/Kyiv"
     # Every clock field populated — not just whatever ipwho returned.
     for key in ("local_time", "local_date", "weekday", "iso_datetime", "utc_offset"):
         assert key in loc and loc[key], f"{key} missing from response"
@@ -332,3 +332,110 @@ async def test_air_quality_returns_both_aqi_scales():
     assert aq["european_aqi"] == 95
     assert aq["us_aqi"] == 110
     assert aq["pm2_5_ugm3"] == 38.0
+
+
+# ── Places / knowledge tools ─────────────────────────────────────────────
+
+
+@respx.mock
+async def test_wikipedia_summary_shape():
+    respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="en", title="Kyiv")
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "title": "Kyiv",
+                "description": "Capital of Ukraine",
+                "extract": "Kyiv is the capital and most populous city of Ukraine.",
+                "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Kyiv"}},
+            },
+        )
+    )
+    r = await server.get_wikipedia_summary("Kyiv")
+    assert r["title"] == "Kyiv"
+    assert r["url"].endswith("/Kyiv")
+    assert r["lang"] == "en"
+
+
+@respx.mock
+async def test_currency_conversion_multiplies_rate():
+    respx.get(server.CURRENCY_URL.format(base="USD")).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "result": "success",
+                "rates": {"EUR": 0.93, "UAH": 41.5},
+                "time_last_update_utc": "Sat, 19 Apr 2026 00:00:00 +0000",
+            },
+        )
+    )
+    r = await server.convert_currency(50.0, "usd", "eur")
+    assert r["from"] == "USD" and r["to"] == "EUR"
+    assert r["rate"] == 0.93
+    assert r["converted"] == round(50.0 * 0.93, 4)
+
+
+@respx.mock
+async def test_currency_rejects_unknown_target():
+    respx.get(server.CURRENCY_URL.format(base="USD")).mock(
+        return_value=httpx.Response(200, json={"result": "success", "rates": {"EUR": 0.93}})
+    )
+    with pytest.raises(ValueError, match="Unknown target currency"):
+        await server.convert_currency(1.0, "USD", "XYZ")
+
+
+async def test_radio_stations_requires_a_filter():
+    with pytest.raises(ValueError, match="filter"):
+        await server.list_radio_stations()
+
+
+# ── Fetch helper: timeouts and mirror fallback ───────────────────────────
+
+
+@respx.mock
+async def test_fetch_json_friendly_timeout_error():
+    respx.get("https://example.test/slow").mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(RuntimeError, match="did not respond within"):
+        await server._fetch_json("https://example.test/slow", service="TestService", timeout=1.0)
+
+
+@respx.mock
+async def test_fetch_json_falls_back_to_second_mirror():
+    respx.get("https://a.example.test/").mock(side_effect=httpx.ConnectError("down"))
+    respx.get("https://b.example.test/").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    out = await server._fetch_json(
+        ["https://a.example.test/", "https://b.example.test/"],
+        service="TestService",
+        timeout=2.0,
+    )
+    assert out == {"ok": True}
+
+
+@respx.mock
+async def test_fetch_json_raises_after_all_mirrors_fail():
+    respx.get("https://a.example.test/").mock(side_effect=httpx.ConnectError("down"))
+    respx.get("https://b.example.test/").mock(
+        return_value=httpx.Response(503, json={})
+    )
+    with pytest.raises(RuntimeError, match="tried 2 mirror"):
+        await server._fetch_json(
+            ["https://a.example.test/", "https://b.example.test/"],
+            service="TestService",
+            timeout=2.0,
+        )
+
+
+# ── Coordinate validation ────────────────────────────────────────────────
+
+
+async def test_weather_by_coordinates_rejects_out_of_range_lat():
+    with pytest.raises(ValueError, match="latitude"):
+        await server.get_weather_by_coordinates(latitude=100.0, longitude=0.0)
+
+
+async def test_weather_by_coordinates_rejects_out_of_range_lon():
+    with pytest.raises(ValueError, match="longitude"):
+        await server.get_weather_by_coordinates(latitude=0.0, longitude=-200.0)

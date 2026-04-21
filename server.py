@@ -24,6 +24,76 @@ ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 # nitrogen-dioxide / sulphur-dioxide / carbon-monoxide + European and
 # US AQI indices.
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+WIKIPEDIA_SUMMARY_URL = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}"
+RESTCOUNTRIES_ALPHA_URL = "https://restcountries.com/v3.1/alpha/{code}"
+RESTCOUNTRIES_NAME_URL = "https://restcountries.com/v3.1/name/{name}"
+HOLIDAYS_URL = "https://date.nager.at/api/v3/PublicHolidays/{year}/{country_code}"
+CURRENCY_URL = "https://open.er-api.com/v6/latest/{base}"
+# radio-browser is a volunteer pool of geographically distributed
+# mirrors. Querying any one works; the official docs recommend a DNS
+# SRV lookup + round-robin, but for our low-volume tool a static
+# fallback chain with explicit mirrors is simpler and more predictable.
+# If the first mirror is down, we try the next — covers ~95 % of
+# single-node outages without retry code on the caller side.
+RADIO_BROWSER_MIRRORS = (
+    "https://de1.api.radio-browser.info/json",
+    "https://de2.api.radio-browser.info/json",
+    "https://at1.api.radio-browser.info/json",
+    "https://nl1.api.radio-browser.info/json",
+    "https://fi1.api.radio-browser.info/json",
+)
+# The radio-browser ToS asks clients to identify themselves so abusive
+# integrations can be banned without collateral damage.
+RADIO_BROWSER_UA = "mcp-weather-simple/0.2 (https://github.com/rromenskyi/mcp-weather-simple)"
+
+
+async def _fetch_json(
+    url: str | list[str] | tuple[str, ...],
+    *,
+    service: str,
+    timeout: float = 5.0,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> dict | list:
+    """GET+JSON with a tight timeout, friendly errors and mirror fallback.
+
+    `url` is either a single URL or a sequence of equivalent mirrors —
+    in the latter case the helper tries each in order and returns the
+    first successful response, bubbling the last error if all fail.
+    `service` is the human name used verbatim in error strings so the
+    model can pass an actionable message to the user instead of a
+    Python traceback.
+    """
+    urls = [url] if isinstance(url, str) else list(url)
+    last_exc: Exception | None = None
+    for candidate in urls:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(candidate, params=params, headers=headers)
+                r.raise_for_status()
+                return r.json()
+        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RequestError) as e:
+            last_exc = e
+            # Try the next mirror on transient-looking failures (timeout,
+            # 5xx, connect error). For a genuine 4xx the next mirror will
+            # return the same 4xx, so we still bail after exhausting the
+            # list but with a clear message.
+            continue
+    # All mirrors failed — translate the last exception into a human message.
+    tail = f" (tried {len(urls)} mirror(s))" if len(urls) > 1 else ""
+    if isinstance(last_exc, httpx.TimeoutException):
+        raise RuntimeError(
+            f"{service} did not respond within {timeout:.0f} s{tail} — try again in a moment."
+        ) from last_exc
+    if isinstance(last_exc, httpx.HTTPStatusError):
+        raise RuntimeError(
+            f"{service} returned HTTP {last_exc.response.status_code}{tail} — the service may be having issues."
+        ) from last_exc
+    if isinstance(last_exc, httpx.RequestError):
+        raise RuntimeError(
+            f"{service} is unreachable ({type(last_exc).__name__}){tail}. Network or DNS failure."
+        ) from last_exc
+    raise RuntimeError(f"{service} is unreachable{tail}.")  # pragma: no cover
 # Free, no-auth, HTTPS GeoIP. Accepts an IP in the path or `/` for
 # auto-detection based on the caller. Returns ip, city, region,
 # country_code, latitude, longitude and timezone.id (IANA name). We
@@ -104,10 +174,7 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     # someone asking about weather on Mt. Everest or in the Bountiful
     # Islands should still get a useful top hit back.
     params: dict[str, str | int] = {"name": city, "count": 10, "language": "en"}
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(GEOCODE_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(GEOCODE_URL, service="Open-Meteo geocoder", params=params)
     results = data.get("results") or []
     if country_code:
         cc_upper = country_code.strip().upper()
@@ -196,13 +263,11 @@ async def search_places(
     behalf.
     """
     limit = max(1, min(int(limit), 10))
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            GEOCODE_URL,
-            params={"name": query, "count": 10, "language": "en"},
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        GEOCODE_URL,
+        service="Open-Meteo geocoder",
+        params={"name": query, "count": 10, "language": "en"},
+    )
     results = data.get("results") or []
     if country_code:
         cc_upper = country_code.strip().upper()
@@ -288,7 +353,7 @@ async def get_current_time_where_i_am() -> dict:
         "city": loc.get("city"),
         "country": loc.get("country"),
         "country_code": loc.get("country_code"),
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "local_date": loc.get("local_date"),
         "local_time": loc.get("local_time"),
         "weekday": loc.get("weekday"),
@@ -339,10 +404,7 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
     from the user. Pass `ip` explicitly when that matters.
     """
     target = f"{GEOIP_URL}/{ip}" if ip else f"{GEOIP_URL}/"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(target)
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(target, service="ipwho.is GeoIP", timeout=5.0)
     if not data.get("success", True):
         raise ValueError(f"GeoIP lookup failed: {data.get('message', 'unknown reason')}")
     tz_id = (data.get("timezone") or {}).get("id") or "UTC"
@@ -360,7 +422,7 @@ async def detect_my_location_by_ip(ip: str | None = None) -> dict:
         "country_code": data.get("country_code"),
         "latitude": data.get("latitude"),
         "longitude": data.get("longitude"),
-        "timezone": tz_id,
+        "timezone_id": tz_id,
         "local_time": now.strftime("%H:%M:%S"),
         "local_date": now.date().isoformat(),
         "weekday": now.strftime("%A"),
@@ -389,7 +451,7 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
         "location": f"{loc['name']}, {loc.get('country', '')}".rstrip(", "),
         "admin1": loc.get("admin1"),
         "country_code": loc.get("country_code"),
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "date": now.date().isoformat(),
         "time": now.strftime("%H:%M:%S"),
         "weekday": now.strftime("%A"),
@@ -429,19 +491,18 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
     homonyms (e.g. `Moscow, RU` vs `Moscow, ID`).
     """
     loc = await _geocode(city, country_code=country_code)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": loc["latitude"],
-                "longitude": loc["longitude"],
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                           "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                       "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
+            "timezone": "auto",
+        },
+    )
     cur = data.get("current", {})
     return {
         "location": f"{loc['name']}, {loc['country']}",
@@ -472,20 +533,19 @@ async def get_weather_forecast(
     """
     days = max(1, min(int(days), 16))
     loc = await _geocode(city, country_code=country_code)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": loc["latitude"],
-                "longitude": loc["longitude"],
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
-                         "precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
-                "forecast_days": days,
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
+            "forecast_days": days,
+            "timezone": "auto",
+        },
+    )
     d = data.get("daily", {})
     dates = d.get("time", [])
     # Anchor "today" to the city's own timezone, not the server's —
@@ -510,7 +570,7 @@ async def get_weather_forecast(
         })
     return {
         "location": f"{loc['name']}, {loc['country']}",
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "days": out,
     }
 
@@ -533,21 +593,20 @@ async def get_hourly_forecast(
     # round up from the requested hours so we always have enough rows.
     days = max(1, min((hours + 23) // 24, 7))
     loc = await _geocode(city, country_code=country_code)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": loc["latitude"],
-                "longitude": loc["longitude"],
-                "hourly": "temperature_2m,relative_humidity_2m,precipitation,"
-                          "precipitation_probability,weather_code,cloud_cover,"
-                          "wind_speed_10m,wind_direction_10m",
-                "forecast_days": days,
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "hourly": "temperature_2m,relative_humidity_2m,precipitation,"
+                      "precipitation_probability,weather_code,cloud_cover,"
+                      "wind_speed_10m,wind_direction_10m",
+            "forecast_days": days,
+            "timezone": "auto",
+        },
+    )
     h = data.get("hourly", {})
     times = h.get("time", [])
     out = []
@@ -565,7 +624,7 @@ async def get_hourly_forecast(
         })
     return {
         "location": f"{loc['name']}, {loc['country']}",
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "hours": out,
     }
 
@@ -602,10 +661,12 @@ async def get_sunrise_sunset(
         params["end_date"] = end.isoformat()
     else:
         params["forecast_days"] = days
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(FORECAST_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params=params,
+    )
     d = data.get("daily", {})
     out = []
     for i, day_iso in enumerate(d.get("time", [])):
@@ -621,7 +682,7 @@ async def get_sunrise_sunset(
         })
     return {
         "location": f"{loc['name']}, {loc['country']}",
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "days": out,
     }
 
@@ -636,23 +697,22 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
     Delhi today?", "should I wear a mask outside?".
     """
     loc = await _geocode(city, country_code=country_code)
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            AIR_QUALITY_URL,
-            params={
-                "latitude": loc["latitude"],
-                "longitude": loc["longitude"],
-                "current": "european_aqi,us_aqi,pm10,pm2_5,carbon_monoxide,"
-                           "nitrogen_dioxide,sulphur_dioxide,ozone",
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        AIR_QUALITY_URL,
+        service="Open-Meteo air quality",
+        timeout=8.0,
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "current": "european_aqi,us_aqi,pm10,pm2_5,carbon_monoxide,"
+                       "nitrogen_dioxide,sulphur_dioxide,ozone",
+            "timezone": "auto",
+        },
+    )
     cur = data.get("current", {})
     return {
         "location": f"{loc['name']}, {loc['country']}",
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "time": cur.get("time"),
         "european_aqi": cur.get("european_aqi"),
         "us_aqi": cur.get("us_aqi"),
@@ -674,24 +734,27 @@ async def get_weather_by_coordinates(latitude: float, longitude: float) -> dict:
     location isn't a named place (lake, trailhead, offshore). No city
     lookup, no homonym disambiguation — just the weather at that point.
     """
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            FORECAST_URL,
-            params={
-                "latitude": latitude,
-                "longitude": longitude,
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                           "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    if not (-90.0 <= latitude <= 90.0):
+        raise ValueError(f"latitude must be in [-90, 90], got {latitude}")
+    if not (-180.0 <= longitude <= 180.0):
+        raise ValueError(f"longitude must be in [-180, 180], got {longitude}")
+    data = await _fetch_json(
+        FORECAST_URL,
+        service="Open-Meteo forecast",
+        timeout=8.0,
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                       "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
+            "timezone": "auto",
+        },
+    )
     cur = data.get("current", {})
     return {
         "latitude": latitude,
         "longitude": longitude,
-        "timezone": data.get("timezone"),
+        "timezone_id": data.get("timezone"),
         "time": cur.get("time"),
         "temperature_c": cur.get("temperature_2m"),
         "apparent_temperature_c": cur.get("apparent_temperature"),
@@ -727,22 +790,21 @@ async def get_historical_weather(
             f"Date span too large ({span_days} days). Split into chunks of 31 days or fewer."
         )
     loc = await _geocode(city, country_code=country_code)
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(
-            ARCHIVE_URL,
-            params={
-                "latitude": loc["latitude"],
-                "longitude": loc["longitude"],
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
-                         "temperature_2m_mean,precipitation_sum,"
-                         "wind_speed_10m_max",
-                "timezone": "auto",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
+    data = await _fetch_json(
+        ARCHIVE_URL,
+        service="Open-Meteo archive",
+        timeout=10.0,  # archive endpoint is measurably slower than /forecast
+        params={
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                     "temperature_2m_mean,precipitation_sum,"
+                     "wind_speed_10m_max",
+            "timezone": "auto",
+        },
+    )
     d = data.get("daily", {})
     out = []
     for i, day_iso in enumerate(d.get("time", [])):
@@ -757,8 +819,210 @@ async def get_historical_weather(
         })
     return {
         "location": f"{loc['name']}, {loc['country']}",
-        "timezone": loc.get("timezone"),
+        "timezone_id": loc.get("timezone"),
         "days": out,
+    }
+
+
+# ── Non-weather knowledge tools ────────────────────────────────────────────
+#
+# Co-located in the same server because the operator prefers one sidecar
+# over two; each docstring is deliberately terse to keep the combined
+# tool catalog compact in the model's system prompt.
+
+
+@mcp.tool()
+async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
+    """Short Wikipedia summary (~300 chars) + page URL for a topic.
+
+    Answers "tell me about X". `lang` is a Wikipedia language code
+    ("en", "uk", "de"...). Title can be a name or a URL-slug
+    ("Kyiv", "Beverly_Hills").
+    """
+    safe_title = title.replace(" ", "_")
+    url = WIKIPEDIA_SUMMARY_URL.format(lang=lang, title=safe_title)
+    data = await _fetch_json(
+        url,
+        service="Wikipedia",
+        timeout=5.0,
+        headers={"Accept": "application/json"},
+    )
+    return {
+        "title": data.get("title"),
+        "description": data.get("description"),
+        "extract": data.get("extract"),
+        "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
+        "lang": lang,
+    }
+
+
+@mcp.tool()
+async def get_country_info(country: str) -> dict:
+    """Country facts: capital, population, currencies, languages, calling code, neighbours.
+
+    Accepts an ISO-3166-1 alpha-2 or alpha-3 code ("UA", "USA") or a
+    plain name ("Ukraine", "United States").
+    """
+    # Alpha codes hit the /alpha endpoint (exact); free-form names hit /name
+    # (may return multiple hits — take the first).
+    code = country.strip()
+    use_alpha = len(code) in (2, 3) and code.isalpha()
+    url = (RESTCOUNTRIES_ALPHA_URL if use_alpha else RESTCOUNTRIES_NAME_URL).format(
+        code=code.upper(), name=code,
+    )
+    data = await _fetch_json(url, service="REST Countries", timeout=5.0)
+    hit = data[0] if isinstance(data, list) else data
+    currencies = hit.get("currencies") or {}
+    languages = hit.get("languages") or {}
+    idd = hit.get("idd") or {}
+    suffixes = idd.get("suffixes") or [""]
+    return {
+        "name": (hit.get("name") or {}).get("common"),
+        "official_name": (hit.get("name") or {}).get("official"),
+        "country_code": hit.get("cca2"),
+        "capital": (hit.get("capital") or [None])[0],
+        "region": hit.get("region"),
+        "subregion": hit.get("subregion"),
+        "population": hit.get("population"),
+        "area_km2": hit.get("area"),
+        "currencies": [
+            {"code": k, "name": v.get("name"), "symbol": v.get("symbol")}
+            for k, v in currencies.items()
+        ],
+        "languages": list(languages.values()),
+        "calling_code": (idd.get("root") or "") + suffixes[0],
+        "borders": hit.get("borders") or [],
+        "timezones": hit.get("timezones") or [],
+        "flag_emoji": hit.get("flag"),
+    }
+
+
+@mcp.tool()
+async def get_public_holidays(country_code: str, year: int | None = None) -> dict:
+    """Public / bank holidays for a country in a given year.
+
+    `country_code` is ISO-3166-1 alpha-2 ("UA", "US", "JP"). `year`
+    defaults to the current calendar year in UTC.
+    """
+    if year is None:
+        year = datetime.now(_tz.utc).year
+    url = HOLIDAYS_URL.format(year=year, country_code=country_code.upper())
+    data = await _fetch_json(url, service="Nager public-holidays", timeout=5.0)
+    holidays = [
+        {
+            "date": h.get("date"),
+            "local_name": h.get("localName"),
+            "name": h.get("name"),
+            "is_fixed": h.get("fixed"),
+            "is_global": h.get("global"),
+            "types": h.get("types") or [],
+        }
+        for h in data or []
+    ]
+    return {
+        "country_code": country_code.upper(),
+        "year": year,
+        "holidays": holidays,
+    }
+
+
+@mcp.tool()
+async def convert_currency(
+    amount: float,
+    from_currency: str,
+    to_currency: str,
+) -> dict:
+    """Convert an amount between two fiat currencies at today's rate.
+
+    `from_currency` / `to_currency` are ISO-4217 codes ("USD", "EUR",
+    "UAH"). Uses open.er-api.com (no key, daily rates). Answers
+    "how much is 50 USD in EUR?".
+    """
+    base = from_currency.strip().upper()
+    target = to_currency.strip().upper()
+    data = await _fetch_json(
+        CURRENCY_URL.format(base=base), service="ExchangeRate-API", timeout=5.0
+    )
+    if data.get("result") != "success":
+        raise ValueError(f"Currency API error: {data.get('error-type') or 'unknown'}")
+    rates = data.get("rates") or {}
+    if target not in rates:
+        raise ValueError(f"Unknown target currency: {target}")
+    rate = rates[target]
+    return {
+        "amount": amount,
+        "from": base,
+        "to": target,
+        "rate": rate,
+        "converted": round(amount * rate, 4),
+        "rate_date": data.get("time_last_update_utc"),
+    }
+
+
+@mcp.tool()
+async def list_radio_stations(
+    country: str | None = None,
+    tag: str | None = None,
+    language: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Find internet-radio stations by country / tag / language.
+
+    Answers "radio stations in Ukraine", "Ukrainian-language radio",
+    "jazz stations". Pass at least one filter; `limit` caps the
+    result count (1-50). Data from radio-browser.info (volunteer
+    community catalogue).
+    """
+    limit = max(1, min(int(limit), 50))
+    if not any([country, tag, language]):
+        raise ValueError(
+            "At least one filter (country, tag, or language) is required to "
+            "avoid dumping the full catalogue."
+        )
+    # radio-browser has dedicated /bycountry, /bytag, /bylanguage endpoints;
+    # combine filters by intersecting client-side — the API accepts only one
+    # selector per call. Start with the most specific filter.
+    if country:
+        path = f"/stations/bycountry/{httpx.QueryParams({'q': country})['q']}"
+    elif tag:
+        path = f"/stations/bytag/{httpx.QueryParams({'q': tag})['q']}"
+    else:
+        path = f"/stations/bylanguage/{httpx.QueryParams({'q': language})['q']}"
+    headers = {"User-Agent": RADIO_BROWSER_UA, "Accept": "application/json"}
+    # Iterate through every mirror — if one is down, fall through. Each
+    # mirror serves the same data pool so the result shape is identical.
+    data = await _fetch_json(
+        [f"{base}{path}" for base in RADIO_BROWSER_MIRRORS],
+        service="radio-browser",
+        timeout=6.0,
+        headers=headers,
+    )
+    filtered = data
+    if tag:
+        tag_low = tag.lower()
+        filtered = [s for s in filtered if tag_low in (s.get("tags") or "").lower()]
+    if language:
+        lang_low = language.lower()
+        filtered = [s for s in filtered if lang_low in (s.get("language") or "").lower()]
+    # Sort by click count desc so the most-listened-to stations are first.
+    filtered.sort(key=lambda s: s.get("clickcount") or 0, reverse=True)
+    stations = [
+        {
+            "name": s.get("name"),
+            "country": s.get("country"),
+            "language": s.get("language"),
+            "tags": s.get("tags"),
+            "url": s.get("url_resolved") or s.get("url"),
+            "homepage": s.get("homepage"),
+            "bitrate_kbps": s.get("bitrate"),
+            "codec": s.get("codec"),
+        }
+        for s in filtered[:limit]
+    ]
+    return {
+        "filters": {"country": country, "tag": tag, "language": language},
+        "count": len(stations),
+        "stations": stations,
     }
 
 
