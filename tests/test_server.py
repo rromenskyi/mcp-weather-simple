@@ -183,6 +183,72 @@ async def test_loop_guard_allows_different_arguments_to_same_tool():
     assert b["relay_to_user"] is True
 
 
+@respx.mock
+async def test_shortcut_does_not_leak_inner_call_into_loop_detector():
+    # Regression guard for #3 / #19 interaction. When
+    # `get_weather_outside_right_now` was calling
+    # `get_current_weather_in_city(city, cc)` as an @mcp.tool-decorated
+    # function, BOTH calls went through @_loop_guarded. A follow-up
+    # direct call to `get_current_weather_in_city("Kyiv", "UA")` with
+    # the SAME resolved city would then false-positive as a duplicate.
+    # After decoupling into `_get_current_weather_in_city_impl`, the
+    # inner call bypasses the guard and a direct call afterwards runs
+    # cleanly.
+    respx.get(f"{server.GEOIP_URL}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "203.0.113.10", "city": "Kyiv",
+                "country": "Ukraine", "country_code": "UA",
+                "latitude": 50.45, "longitude": 30.52,
+                "timezone": {"id": "Europe/Kyiv"},
+            },
+        )
+    )
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+                     "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "admin1": "Kyiv City",
+                     "population": 3_000_000},
+                ]
+            },
+        )
+    )
+    respx.get(server.FORECAST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": "2026-04-21T10:00",
+                    "temperature_2m": 12.3, "relative_humidity_2m": 60,
+                    "apparent_temperature": 11.0, "precipitation": 0.0,
+                    "weather_code": 2, "wind_speed_10m": 10.0,
+                    "wind_direction_10m": 180,
+                },
+            },
+        )
+    )
+
+    # Step 1: shortcut call. Internally resolves to Kyiv via GeoIP and
+    # calls the current-weather IMPL (not the @mcp.tool).
+    shortcut = await server.get_weather_outside_right_now()
+    assert shortcut["relay_to_user"] is True
+    assert shortcut["location_source"] == "geoip_autodetected"
+
+    # Step 2: direct call to get_current_weather_in_city with the same
+    # city the shortcut resolved to. If the inner call from step 1
+    # had gone through the @_loop_guarded wrapper, this second call
+    # would short-circuit as a duplicate. After #3 it runs cleanly.
+    direct = await server.get_current_weather_in_city("Kyiv", country_code="UA")
+    assert direct.get("duplicate_of_recent_call") is None
+    assert direct["relay_to_user"] is True
+    assert direct["location"] == "Kyiv, Ukraine"
+
+
 def test_instructions_are_wired_into_fastmcp():
     # FastMCP surfaces `instructions` verbatim in InitializeResult.
     # The preamble text is part of the contract — pin the three rules.
