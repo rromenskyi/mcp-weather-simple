@@ -94,9 +94,13 @@ def test_feature_type_maps_known_codes_and_falls_back():
 
 @respx.mock
 async def test_geocode_country_code_filter_prefers_matching_country():
-    # Two "Moscow" candidates — one in Russia, one in the US state of Idaho.
-    # Without `country_code` the first wins; with `country_code="US"` the
-    # filter picks the US hit.
+    # Two "Moscow" candidates — one in Russia (12.5 M), one in Idaho
+    # (25 k). Without `country_code` the 500× population gap means
+    # Moscow-RU is the obvious intent → silent top-1. With
+    # `country_code="US"` the filter narrows to the Idaho hit.
+    # (#17's ambiguity detector intentionally does NOT fire here: users
+    # asking for "weather in Moscow" 99% mean the Russian capital, and
+    # the safety net is the `country_code` knob for the other 1%.)
     respx.get(server.GEOCODE_URL).mock(
         return_value=httpx.Response(
             200,
@@ -104,16 +108,17 @@ async def test_geocode_country_code_filter_prefers_matching_country():
                 "results": [
                     {"name": "Moscow", "country": "Russia", "country_code": "RU",
                      "latitude": 55.75, "longitude": 37.62, "timezone": "Europe/Moscow",
-                     "feature_code": "PPLC", "admin1": "Moscow"},
+                     "feature_code": "PPLC", "admin1": "Moscow", "population": 12_500_000},
                     {"name": "Moscow", "country": "United States", "country_code": "US",
                      "latitude": 46.73, "longitude": -117.00, "timezone": "America/Los_Angeles",
-                     "feature_code": "PPLA2", "admin1": "Idaho"},
+                     "feature_code": "PPLA2", "admin1": "Idaho", "population": 25_000},
                 ]
             },
         )
     )
 
     hit_default = await server._geocode("Moscow")
+    assert hit_default.get("_ambiguous") is None  # population-dominated, no short-circuit
     assert hit_default["country_code"] == "RU"
 
     hit_us = await server._geocode("Moscow", country_code="us")  # case-insensitive
@@ -126,6 +131,155 @@ async def test_geocode_raises_when_empty():
     respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="City not found"):
         await server._geocode("Nowhereville", country_code="XX")
+
+
+# ── Ambiguity detection (#17) ────────────────────────────────────────────
+
+
+@respx.mock
+async def test_geocode_intra_country_ambiguity_fires_on_comparable_populations():
+    # Springfield, IL (~114k) and Springfield, MA (~155k) have
+    # populations within 10× of each other — top-1 is a toss-up.
+    # country_code="US" is passed but the detector still fires because
+    # intra-country homonyms are exactly the "5 Bountifuls" case.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "population": 155_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "population": 114_000},
+                ]
+            },
+        )
+    )
+    result = await server._geocode("Springfield", country_code="US")
+    assert result.get("_ambiguous") is True
+    assert "comparable populations" in result["_ambiguity_reason"]
+
+
+@respx.mock
+async def test_geocode_does_not_fire_ambiguity_when_top_dominates_by_10x():
+    # Kyiv (3 M) vs a random Tajik hamlet "Kyiv" (1.3 k) → 2300× gap.
+    # Rule 2's 10× threshold comfortably ignores this noise and the
+    # top hit wins silently.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country_code": "UA", "admin1": "Kyiv City",
+                     "country": "Ukraine", "latitude": 50.45, "longitude": 30.52,
+                     "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "population": 3_000_000},
+                    {"name": "Kyiv", "country_code": "TJ", "admin1": "Sughd",
+                     "country": "Tajikistan", "latitude": 40.0, "longitude": 69.0,
+                     "feature_code": "PPL", "population": 1_300},
+                ]
+            },
+        )
+    )
+    hit = await server._geocode("Kyiv")
+    # Single resolved hit, no ambiguity sentinel.
+    assert hit.get("_ambiguous") is None
+    assert hit["country_code"] == "UA"
+
+
+@respx.mock
+async def test_geocode_postal_code_spanning_countries_fires_rule_3():
+    # 10001 resolves to both New York-US and Troyes-FR.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "New York", "country_code": "US", "admin1": "NY",
+                     "latitude": 40.7, "longitude": -74.0, "feature_code": "PPL",
+                     "population": 8_300_000, "postcodes": ["10001"]},
+                    {"name": "Troyes", "country_code": "FR", "admin1": "Grand Est",
+                     "latitude": 48.3, "longitude": 4.1, "feature_code": "PPL",
+                     "population": 60_000, "postcodes": ["10001"]},
+                ]
+            },
+        )
+    )
+    result = await server._geocode("10001")
+    # Population ratio 8_300_000 / 60_000 = 138× so rule 2 does NOT fire;
+    # but rule 1 (cross-country, no country_code) does — either reason
+    # is acceptable so the test asserts only on the sentinel.
+    assert result.get("_ambiguous") is True
+
+
+@respx.mock
+async def test_weather_tool_short_circuits_ambiguity_with_relay_to_user_false():
+    # End-to-end: a @mcp.tool that uses _resolve_place must return
+    # relay_to_user=False + guidance naming candidates WITHOUT hitting
+    # the forecast API — short-circuit happens inside _geocode.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "population": 114_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "population": 155_000},
+                ]
+            },
+        )
+    )
+    # FORECAST_URL deliberately NOT mocked — if short-circuit leaks, test
+    # will blow up with an unexpected outbound request.
+    result = await server.get_current_weather_in_city("Springfield", country_code="US")
+    assert result["relay_to_user"] is False
+    assert "Springfield" in result["guidance"]
+    assert "ask" in result["guidance"].lower() or "pick" in result["guidance"].lower()
+    assert len(result["candidates"]) == 2
+
+
+@respx.mock
+async def test_geoip_shortcut_propagates_inner_ambiguity_without_geoip_override():
+    # get_weather_outside_right_now calls get_current_weather_in_city
+    # internally. If the inner call returns relay_to_user=False (#17),
+    # the shortcut must pass it through verbatim instead of re-wrapping
+    # with the GeoIP guidance and silently losing the ambiguity flag.
+    respx.get(f"{server.GEOIP_URL}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "203.0.113.10", "city": "Springfield",
+                "country": "United States", "country_code": "US",
+                "latitude": 0.0, "longitude": 0.0,
+                "timezone": {"id": "America/Chicago"},
+            },
+        )
+    )
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Springfield", "country_code": "US", "admin1": "Illinois",
+                     "latitude": 39.78, "longitude": -89.65, "feature_code": "PPLA",
+                     "population": 114_000},
+                    {"name": "Springfield", "country_code": "US", "admin1": "Massachusetts",
+                     "latitude": 42.10, "longitude": -72.59, "feature_code": "PPL",
+                     "population": 155_000},
+                ]
+            },
+        )
+    )
+    result = await server.get_weather_outside_right_now()
+    assert result["relay_to_user"] is False
+    # Guidance is the ambiguity one, NOT the GeoIP caveat.
+    assert "Springfield" in result["guidance"]
+    assert "GeoIP" not in result["guidance"] and "caveat" not in result["guidance"].lower()
 
 
 @respx.mock

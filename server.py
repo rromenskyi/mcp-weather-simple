@@ -272,6 +272,131 @@ def _city_not_found_error(query: str, country_code: str | None) -> str:
     return f"City not found: {query}{tail}"
 
 
+# Populated-place GeoNames codes; used by the ambiguity detector to
+# decide whether two candidates are "homonyms that would fool a user"
+# (both towns/villages/cities) vs "same name different kinds of place"
+# (city + mountain + lake — the weather tool can still pick top-1
+# because the user almost certainly meant the populated one).
+_POPULATED_PLACE_CODES = frozenset({
+    "PPL", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPLA5", "PPLC",
+    "PPLL", "PPLS",
+})
+
+
+def _detect_ambiguity(
+    candidates: list[dict],
+    country_code: str | None,
+    query: str,
+) -> str | None:
+    """Decide whether _geocode's hits are ambiguous enough to short-circuit.
+
+    Returns a short reason string when we should ask the user to clarify,
+    or None when picking `candidates[0]` is safe.
+
+    The primary gate is the **10× population ratio** among the top-2
+    populated candidates (ROADMAP rule 2). This is the key insight:
+    Moscow-RU (12.5 M) vs Moscow-ID (25 k) = 500× — top-1 is the
+    obvious intent and silent commit is fine. Kyiv (3 M) vs a Tajik
+    hamlet (1.3 k) = 2300× — same, keep silent. Springfield-IL
+    (114 k) vs Springfield-MA (155 k) = 1.4× — genuinely ambiguous,
+    ask. The same gate catches intra-country homonyms ("Bountifuls
+    in UT and CO") so country_code does NOT have to be unset.
+
+    Cross-country without population data (pop fields missing from
+    both candidates) falls back to "cross-country, can't verify" —
+    the safety net exists because some Open-Meteo responses omit
+    `population`.
+
+    Postal codes bypass the population gate: "10001" matching NYC-US
+    and Troyes-FR legitimately needs disambiguation, population
+    ratio is not meaningful for "which country's postal code".
+    """
+    if len(candidates) < 2:
+        return None
+    populated = [c for c in candidates if c.get("feature_code") in _POPULATED_PLACE_CODES]
+    if len(populated) < 2:
+        return None
+
+    top, second = populated[0], populated[1]
+    cc_top = (top.get("country_code") or "").upper()
+    cc_second = (second.get("country_code") or "").upper()
+    is_cross_country = bool(cc_top and cc_second and cc_top != cc_second)
+    pop_top = top.get("population") or 0
+    pop_second = second.get("population") or 0
+
+    # Postal-code rule: numeric query with cross-country matches fires
+    # regardless of population, because postal codes are namespaced
+    # per-country and a cross-country spread is the "10001 NYC / Troyes"
+    # collision. Matching digits is a pragmatic proxy for "looks like
+    # a postal code" — the geocoder wouldn't surface non-matching
+    # candidates at this point anyway.
+    if is_cross_country and query.replace(" ", "").replace("-", "").isdigit():
+        return f"postal code matches multiple countries ({sorted({cc_top, cc_second})})"
+
+    # Population-ratio rule: if both populations are known AND the gap
+    # is under 10×, top-1's "obvious" win is unsafe.
+    if pop_top > 0 and pop_second > 0 and pop_top / pop_second < 10.0:
+        if is_cross_country:
+            return f"top two places have comparable populations across countries ({cc_top} and {cc_second})"
+        return f"top two places have comparable populations ({pop_top:,} vs {pop_second:,})"
+
+    # Fallback: cross-country with missing population data. Being
+    # conservative — if the geocoder omits populations for the top-2
+    # we can't do the ratio check, so err toward asking when there's
+    # any cross-country signal.
+    if is_cross_country and (pop_top == 0 or pop_second == 0):
+        return f"populated places across countries ({cc_top} and {cc_second}) with missing population data"
+
+    return None
+
+
+def _ambiguity_response(query: str, candidates: list[dict], reason: str, country_code: str | None) -> dict:
+    """Build the short-circuit envelope for an ambiguous _geocode result.
+
+    `relay_to_user=False` is the contract: the LLM MUST clarify before
+    answering. Guidance names the first few candidates so the model
+    can echo them back to the user without a follow-up `search_places`
+    call.
+    """
+    # Limit to 5 so guidance stays short even for "Springfield" (36 hits).
+    top = candidates[:5]
+
+    def _name(c: dict) -> str:
+        parts = [c.get("name") or "?"]
+        if c.get("admin1"):
+            parts.append(c["admin1"])
+        if c.get("country_code"):
+            parts.append(c["country_code"])
+        return ", ".join(parts)
+
+    names = "; ".join(_name(c) for c in top)
+    # Narrowing advice: if no country_code yet, the easy rewrite is to
+    # add one. If country_code is already set (intra-country homonyms
+    # like the 5 Bountifuls), the weather tools don't accept `admin1`
+    # today — the escape hatch is `get_weather_by_coordinates` which
+    # takes lat/lon straight from the chosen candidate.
+    if country_code:
+        narrow = (
+            "Take the chosen candidate's `latitude` and `longitude` "
+            "and call `get_weather_by_coordinates` directly."
+        )
+    else:
+        narrow = (
+            "Then re-call with `country_code` set (ISO-3166 alpha-2) "
+            "to narrow the geocoder."
+        )
+    guidance = f"Ambiguous: {reason}. Ask the user to pick one: {names}. {narrow}"
+    return _respond(
+        {
+            "query": query,
+            "candidates": top,
+            "ambiguity_reason": reason,
+        },
+        relay_to_user=False,
+        guidance=guidance,
+    )
+
+
 async def _geocode(city: str, country_code: str | None = None) -> dict:
     # Pull candidates so we can filter by `country_code` client-side —
     # Open-Meteo's geocoding endpoint does not accept a country filter and
@@ -313,10 +438,52 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
             results = filtered
     if not results:
         raise ValueError(_city_not_found_error(city, country_code))
+    # Ambiguity detection uses the RAW hits (not _annotate'd yet) so the
+    # detector can read `feature_code` / `population` directly. When a
+    # rule fires we bail with a tagged dict that tool wrappers recognise
+    # — see `_resolve_place` for the unpacking pattern.
+    reason = _detect_ambiguity(results[:5], country_code, query=city)
+    if reason:
+        annotated = [_annotate(h) for h in results[:5]]
+        return {
+            "_ambiguous": True,
+            "_ambiguity_reason": reason,
+            "_candidates": annotated,
+        }
     # Internal helper — returns a bare annotated dict, callers wrap it
     # with _respond() when they're exposed as a tool. _geocode itself
     # is not a @mcp.tool.
     return _annotate(results[0])
+
+
+async def _resolve_place(
+    city: str,
+    country_code: str | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Geocode and short-circuit on ambiguity.
+
+    Returns `(hit, None)` on success or `(None, envelope)` when the
+    result was ambiguous. Every @mcp.tool that needs a single location
+    uses this pattern:
+
+        hit, clarify = await _resolve_place(city, country_code)
+        if clarify:
+            return clarify
+        # ... use hit["latitude"] etc.
+
+    This keeps each tool's happy path unchanged while making the
+    short-circuit one line of boilerplate instead of every tool
+    reinventing the `relay_to_user=False` response.
+    """
+    loc = await _geocode(city, country_code=country_code)
+    if loc.get("_ambiguous"):
+        return None, _ambiguity_response(
+            query=city,
+            candidates=loc["_candidates"],
+            reason=loc["_ambiguity_reason"],
+            country_code=country_code,
+        )
+    return loc, None
 
 
 def _day_label(target: date, today: date) -> str:
@@ -357,13 +524,16 @@ async def find_place_coordinates(city: str, country_code: str | None = None) -> 
     The response includes `admin1` (state/region) and `postcodes` so
     the caller can verify the right place was picked.
 
-    Ambiguous queries (e.g. "Springfield" without a country, or a query
-    that could resolve to a town OR a mountain of the same name) still
-    return a single top-ranked hit here — call `search_places(...)`
-    first if you want to see every candidate, filter by feature type,
-    and pick one explicitly.
+    When multiple comparable places match (e.g. "Springfield" without a
+    country, "Moscow" without country_code, the 5 Bountifuls in different
+    US states), the response flips `relay_to_user` to `false` and lists
+    candidates in `guidance` — the LLM must ask the user which one to
+    pick instead of silently committing to top-1.
     """
-    return _respond(await _geocode(city, country_code=country_code))
+    hit, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
+    return _respond(hit)
 
 
 @mcp.tool()
@@ -548,6 +718,11 @@ async def get_weather_outside_right_now() -> dict:
     """
     city, cc = await _here_city()
     weather = await get_current_weather_in_city(city, country_code=cc)
+    # Pass through a `relay_to_user=False` response verbatim — the inner
+    # call flagged geocoder ambiguity (#17) and re-wrapping with the
+    # GeoIP guidance below would silently override that contract.
+    if not weather.get("relay_to_user", True):
+        return weather
     return _respond(
         {**weather, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
@@ -564,6 +739,8 @@ async def get_weather_forecast_for_today() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=1, country_code=cc)
+    if not result.get("relay_to_user", True):
+        return result
     return _respond(
         {**result, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
@@ -610,6 +787,8 @@ async def get_weather_forecast_for_tomorrow() -> dict:
     """
     city, cc = await _here_city()
     result = await get_weather_forecast(city, days=2, country_code=cc)
+    if not result.get("relay_to_user", True):
+        return result
     return _respond(
         {**result, "location_source": "geoip_autodetected"},
         guidance=_GUIDANCE_GEOIP_AUTODETECT,
@@ -698,7 +877,9 @@ async def get_current_time_in_city(city: str, country_code: str | None = None) -
     ("10001"), NEVER a comma-separated address. Put country into
     `country_code` (ISO-3166 alpha-2 like "US", "UA").
     """
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     try:
         tz = ZoneInfo(loc.get("timezone") or "UTC")
     except Exception:
@@ -750,9 +931,14 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
     (ISO-3166 alpha-2 like "US", "UA").
 
     `country_code` is an optional ISO-3166-1 alpha-2 hint to disambiguate
-    homonyms (e.g. `Moscow, RU` vs `Moscow, ID`).
+    homonyms (e.g. `Moscow, RU` vs `Moscow, ID`). When the geocoder
+    returns multiple strong matches the response short-circuits with
+    `relay_to_user: false` and the LLM is expected to ask the user
+    which place before re-calling.
     """
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     data = await _fetch_json(
         FORECAST_URL,
         service="Open-Meteo forecast",
@@ -798,7 +984,9 @@ async def get_weather_forecast(
     `country_code` (ISO-3166 alpha-2).
     """
     days = max(1, min(int(days), 16))
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     data = await _fetch_json(
         FORECAST_URL,
         service="Open-Meteo forecast",
@@ -862,7 +1050,9 @@ async def get_hourly_forecast(
     # `forecast_days` controls how many days Open-Meteo computes;
     # round up from the requested hours so we always have enough rows.
     days = max(1, min((hours + 23) // 24, 7))
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     data = await _fetch_json(
         FORECAST_URL,
         service="Open-Meteo forecast",
@@ -919,7 +1109,9 @@ async def get_sunrise_sunset(
     - `days`: number of consecutive days to return (1-16).
     """
     days = max(1, min(int(days), 16))
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     params: dict[str, str | int | float] = {
         "latitude": loc["latitude"],
         "longitude": loc["longitude"],
@@ -972,7 +1164,9 @@ async def get_air_quality(city: str, country_code: str | None = None) -> dict:
     code, NEVER a comma-separated address. Put country into
     `country_code` (ISO-3166 alpha-2).
     """
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     data = await _fetch_json(
         AIR_QUALITY_URL,
         service="Open-Meteo air quality",
@@ -1069,7 +1263,9 @@ async def get_historical_weather(
         raise ValueError(
             f"Date span too large ({span_days} days). Split into chunks of 31 days or fewer."
         )
-    loc = await _geocode(city, country_code=country_code)
+    loc, clarify = await _resolve_place(city, country_code=country_code)
+    if clarify:
+        return clarify
     data = await _fetch_json(
         ARCHIVE_URL,
         service="Open-Meteo archive",
