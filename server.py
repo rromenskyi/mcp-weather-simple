@@ -50,9 +50,7 @@ WEATHER_CODES = {
 # GeoNames feature_code → human label. Exposed to the caller so the
 # model (or a client) can reason about what kind of place a candidate
 # is — a town, a neighborhood, a mountain, a lake — and decide whether
-# that matches the user's intent. A few codes are grouped under one
-# bucket (e.g. every `PPL*` except `PPLX`/`PPLH`/`PPLQ`/`PPLW` is just
-# "city") because the distinction rarely matters to weather queries.
+# that matches the user's intent.
 _FEATURE_TYPE_BY_CODE = {
     "PPL": "city", "PPLA": "city", "PPLA2": "city", "PPLA3": "city",
     "PPLA4": "city", "PPLA5": "city", "PPLC": "city",
