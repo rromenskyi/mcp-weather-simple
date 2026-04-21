@@ -1,0 +1,135 @@
+# Tool-calling eval dataset.
+#
+# Each case = (natural-language prompt, expected tool name). The eval
+# harness sends `prompt` + the full MCP tool catalog to the model's
+# native function-calling endpoint and asserts the top-1 `tool_calls[0]`
+# picks `expected_tool`. Multi-tool plans are not judged here — we
+# score "did the model pick the right FIRST tool for this intent".
+#
+# Grouped by intent family so regressions are easy to localise: if
+# "weather-forecast-implicit-location" drops from 4/4 to 1/4, you know
+# the shortcut descriptions changed behaviour without going through
+# every single case.
+#
+# Russian + English mixed on purpose — qwen2.5 is multilingual and we
+# want to catch cases where Russian prompts slip through the
+# English-biased description matching.
+
+cases:
+  # ── Weather: explicit city ─────────────────────────────────────────────
+  - prompt: "What's the current weather in Kyiv?"
+    expected_tool: get_current_weather_in_city
+  - prompt: "Какая сейчас погода в Москве?"
+    expected_tool: get_current_weather_in_city
+  - prompt: "погода в Берлине сейчас"
+    expected_tool: get_current_weather_in_city
+  - prompt: "Temperature right now in Tokyo"
+    expected_tool: get_current_weather_in_city
+
+  # ── Weather: implicit location ("here") ────────────────────────────────
+  - prompt: "What's the weather outside right now?"
+    expected_tool: get_weather_outside_right_now
+  - prompt: "какая погода на улице?"
+    expected_tool: get_weather_outside_right_now
+  - prompt: "Is it raining outside?"
+    expected_tool: get_weather_outside_right_now
+
+  # ── Forecast: explicit city + horizon ──────────────────────────────────
+  - prompt: "7-day forecast for Paris"
+    expected_tool: get_weather_forecast
+  - prompt: "Прогноз погоды в Лондоне на неделю"
+    expected_tool: get_weather_forecast
+
+  # ── Forecast: implicit "tomorrow here" ─────────────────────────────────
+  - prompt: "What's the forecast for tomorrow?"
+    expected_tool: get_weather_forecast_for_tomorrow
+  - prompt: "Какая погода завтра?"
+    expected_tool: get_weather_forecast_for_tomorrow
+  - prompt: "прогноз на завтра"
+    expected_tool: get_weather_forecast_for_tomorrow
+
+  # ── Forecast: today ─────────────────────────────────────────────────────
+  - prompt: "What's the weather today?"
+    expected_tool: get_weather_forecast_for_today
+
+  # ── Hourly forecast ─────────────────────────────────────────────────────
+  - prompt: "Will it rain this afternoon in Rome?"
+    expected_tool: get_hourly_forecast
+  - prompt: "Hour by hour forecast for New York for the next 12 hours"
+    expected_tool: get_hourly_forecast
+
+  # ── Air quality ────────────────────────────────────────────────────────
+  - prompt: "Is the air quality safe in Delhi today?"
+    expected_tool: get_air_quality
+  - prompt: "Уровень PM2.5 в Пекине"
+    expected_tool: get_air_quality
+
+  # ── Sunrise / sunset ───────────────────────────────────────────────────
+  - prompt: "When does the sun set in Reykjavik tomorrow?"
+    expected_tool: get_sunrise_sunset
+  - prompt: "восход солнца в Киеве"
+    expected_tool: get_sunrise_sunset
+
+  # ── Historical weather ─────────────────────────────────────────────────
+  - prompt: "What was the weather in Kyiv on 1998-07-15?"
+    expected_tool: get_historical_weather
+  - prompt: "Какая была погода в Москве 1 января 2000?"
+    expected_tool: get_historical_weather
+
+  # ── Location (GeoIP) ───────────────────────────────────────────────────
+  - prompt: "Where am I?"
+    expected_tool: detect_my_location_by_ip
+  - prompt: "Где я сейчас?"
+    expected_tool: detect_my_location_by_ip
+
+  # ── Time in a city ─────────────────────────────────────────────────────
+  - prompt: "What time is it in Tokyo?"
+    expected_tool: get_current_time_in_city
+  - prompt: "Сколько сейчас времени в Лондоне?"
+    expected_tool: get_current_time_in_city
+
+  # ── Time here (GeoIP) ──────────────────────────────────────────────────
+  - prompt: "What time is it?"
+    expected_tool: get_current_time_where_i_am
+  - prompt: "Который сейчас час?"
+    expected_tool: get_current_time_where_i_am
+
+  # ── Currency ───────────────────────────────────────────────────────────
+  - prompt: "Convert 50 USD to EUR"
+    expected_tool: convert_currency
+  - prompt: "100 долларов в гривнах сколько?"
+    expected_tool: convert_currency
+
+  # ── Country info ───────────────────────────────────────────────────────
+  - prompt: "What's the capital of Ukraine?"
+    expected_tool: get_country_info
+  - prompt: "Какая столица Нидерландов?"
+    expected_tool: get_country_info
+
+  # ── Public holidays ────────────────────────────────────────────────────
+  - prompt: "List public holidays in Japan for 2026"
+    expected_tool: get_public_holidays
+  - prompt: "Праздники в Германии в этом году"
+    expected_tool: get_public_holidays
+
+  # ── Radio stations ─────────────────────────────────────────────────────
+  - prompt: "Recommend a jazz radio station"
+    expected_tool: list_radio_stations
+  - prompt: "Ukrainian radio stations"
+    expected_tool: list_radio_stations
+
+  # ── Wikipedia ──────────────────────────────────────────────────────────
+  - prompt: "Tell me about Yokohama"
+    expected_tool: get_wikipedia_summary
+  - prompt: "Расскажи про Баунтифул"
+    expected_tool: get_wikipedia_summary
+
+  # ── Places disambiguation ──────────────────────────────────────────────
+  - prompt: "Which Springfield is the user asking about? List all options."
+    expected_tool: search_places
+
+# Minimum hit-rate to consider the model "dialed in" for this surface.
+# Set below 1.0 because LLMs are not deterministic even at T=0 — a
+# single spurious tool pick is not a regression. Tightened over time
+# as the dataset grows.
+pass_threshold: 0.70
