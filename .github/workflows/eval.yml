@@ -301,20 +301,32 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Pre-compute the artifact name in bash — GHA's expression
+      # language has NO `replace()` function (a previous attempt broke
+      # the entire workflow: YAML was valid but GHA refused to parse
+      # the expression, dropped all jobs, fell back to showing the
+      # file path as the workflow "name"). `tr` does what we need
+      # and runs always so the downstream step can reference the
+      # output unconditionally via steps.artifact-name.outputs.value.
+      - name: Compute sanitised artifact name
+        id: artifact-name
+        if: always()
+        run: |
+          safe_model="$(echo '${{ matrix.model }}' | tr ':' '-')"
+          echo "value=eval-logs-${safe_model}-schema-${{ matrix.schema }}-docs-${{ matrix.docstring }}-chunk-${{ matrix.chunk }}" \
+            >> "$GITHUB_OUTPUT"
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          # Artifact name must be unique across all matrix rows,
-          # otherwise GHA refuses the upload with "artifact already
-          # exists". All four axes (model + schema + docstring +
-          # chunk) in the name so the widest fanout doesn't collide.
-          #
-          # `replace(matrix.model, ':', '-')` sanitises Ollama's tag
-          # format (`qwen2.5:14b`) — GHA artifact names reject colon,
-          # slash, and several other characters. Replacement to `-`
-          # keeps the name readable.
-          name: eval-logs-${{ replace(matrix.model, ':', '-') }}-schema-${{ matrix.schema }}-docs-${{ matrix.docstring }}-chunk-${{ matrix.chunk }}
+          # All four axes (model + schema + docstring + chunk) in the
+          # name so the widest fanout doesn't collide on upload.
+          # Colons from Ollama tag format (`qwen2.5:14b`) are
+          # substituted to `-` by the compute step above; GHA's
+          # artifact naming rules reject colon, slash, and several
+          # other chars.
+          name: ${{ steps.artifact-name.outputs.value }}
           path: |
             /tmp/eval.out
             /tmp/ollama.log
