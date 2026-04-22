@@ -1200,6 +1200,83 @@ async def test_wikipedia_summary_shape():
 
 
 @respx.mock
+async def test_wikipedia_summary_falls_back_from_en_to_ru_for_cyrillic_title():
+    # Live mcphost session on 2026-04-21: 14b called
+    # `get_wikipedia_summary(title="соль")` with default lang="en".
+    # en.wiki → 404 (no article titled «соль» in English). Without a
+    # lang fallback the tool errored out; with the script-based chain
+    # we silently retry on ru.wiki and get the real article.
+    respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="en", title="соль")
+    ).mock(return_value=httpx.Response(404, json={"type": "not-found"}))
+    respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="ru", title="соль")
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "title": "Соль",
+                "description": "химическое соединение",
+                "extract": "Соль (хлорид натрия) — вещество с формулой NaCl.",
+                "content_urls": {"desktop": {"page": "https://ru.wikipedia.org/wiki/Соль"}},
+            },
+        )
+    )
+
+    r = await server.get_wikipedia_summary("соль")
+    assert r["lang"] == "ru"
+    assert r["title"] == "Соль"
+    # chain reports ALL languages tried (even if only ru succeeded) —
+    # useful debug signal for operators.
+    assert "en" in r["lang_chain_tried"]
+    assert "ru" in r["lang_chain_tried"]
+
+
+@respx.mock
+async def test_wikipedia_summary_explicit_lang_wins_over_script_fallback():
+    # When the caller explicitly passes lang="de", Wikipedia should
+    # hit de.wiki FIRST — the script-detected chain only kicks in if
+    # the primary fails. Here de.wiki returns a hit immediately, so
+    # we never fall back.
+    de_hit = httpx.Response(
+        200,
+        json={
+            "title": "Berlin",
+            "extract": "Berlin ist die Hauptstadt Deutschlands.",
+            "content_urls": {"desktop": {"page": "https://de.wikipedia.org/wiki/Berlin"}},
+        },
+    )
+    de_mock = respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="de", title="Berlin")
+    ).mock(return_value=de_hit)
+    # If the fallback was incorrectly triggered, en.wiki would be
+    # hit too — this mock stays unused on a clean run.
+    respx.get(
+        server.WIKIPEDIA_SUMMARY_URL.format(lang="en", title="Berlin")
+    ).mock(return_value=httpx.Response(200, json={"title": "UnusedEnglishHit"}))
+
+    r = await server.get_wikipedia_summary("Berlin", lang="de")
+    assert r["lang"] == "de"
+    assert r["title"] == "Berlin"
+    # First-tried language is the caller's explicit choice.
+    assert r["lang_chain_tried"][0] == "de"
+    assert de_mock.called
+
+
+@respx.mock
+async def test_wikipedia_summary_raises_when_every_lang_misses():
+    # All candidate langs return 404 → we re-raise the last upstream
+    # error so the LLM sees "Wikipedia rejected HTTP 404" and can
+    # surface it to the user, not a silent empty response.
+    for lang in ("en", "ru", "uk"):
+        respx.get(
+            server.WIKIPEDIA_SUMMARY_URL.format(lang=lang, title="несуществующаястатья42")
+        ).mock(return_value=httpx.Response(404, json={"type": "not-found"}))
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        await server.get_wikipedia_summary("несуществующаястатья42")
+
+
+@respx.mock
 async def test_wikipedia_summary_sends_descriptive_user_agent():
     # Wikipedia REST API enforces its User-Agent ToS — a request
     # without a descriptive UA gets HTTP 403. Discovered live on
