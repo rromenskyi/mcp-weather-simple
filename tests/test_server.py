@@ -1964,3 +1964,75 @@ def test_router_mode_off_leaves_full_monolith(monkeypatch):
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert "select_domain" not in names
     assert len(names) == 23
+
+
+@pytest.mark.asyncio
+async def test_router_mode_fat_tools_exposes_four_domain_tools(monkeypatch):
+    """`MCP_ROUTER_MODE=fat_tools` registers weather/geo/knowledge/radio
+    and hides every narrow @mcp.tool from `tools/list`.
+
+    The 4 fat tools are the *only* surface the client sees; the 23
+    narrow tools remain in the manager but are filtered out so the
+    model's catalog drops from ~5300 to ~1900 tokens.
+    """
+    import importlib
+
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools")
+    srv = importlib.reload(srv)
+    try:
+        assert srv.ROUTER_MODE == "fat_tools"
+
+        # Manager holds both 23 narrow + 4 fat — filtering is done at
+        # list_tools time, not at registration.
+        all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert {"weather", "geo", "knowledge", "radio"}.issubset(all_names)
+        assert "get_current_weather_in_city" in all_names  # still registered
+        assert len(all_names) == 27
+
+        from mcp.types import ListToolsRequest
+
+        handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
+        req = ListToolsRequest(method="tools/list")
+        visible = sorted(t.name for t in (await handler(req)).root.tools)
+        assert visible == ["geo", "knowledge", "radio", "weather"]
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)
+
+
+@pytest.mark.asyncio
+async def test_fat_weather_dispatches_to_underlying_impl(monkeypatch):
+    """Smoke-test the dispatcher in `fat_tools.weather` — confirms the
+    `action` enum flows to the correct narrow implementation."""
+    import importlib
+
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools")
+    srv = importlib.reload(srv)
+    try:
+        import fat_tools
+
+        # Patch out the narrow impl to verify the dispatcher reaches it.
+        sentinel = {"ok": "delegated"}
+
+        async def fake_impl(city, country_code=None):
+            assert city == "Kyiv"
+            return sentinel
+
+        monkeypatch.setattr(srv, "get_current_weather_in_city", fake_impl)
+        result = await fat_tools.weather(action="current_in_city", city="Kyiv")
+        assert result is sentinel
+
+        # Missing required args raise a clear ValueError.
+        with pytest.raises(ValueError, match="missing required"):
+            await fat_tools.weather(action="current_in_city")  # no city
+
+        # Unknown action fails closed.
+        with pytest.raises(ValueError, match="unknown action"):
+            await fat_tools.weather(action="does_not_exist")  # type: ignore[arg-type]
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)

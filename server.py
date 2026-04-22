@@ -2428,13 +2428,31 @@ _ROUTER_STATE: dict[str, str | None] = {"active": None}
 
 
 def _install_router() -> None:
-    """Wire `select_domain` tool + filtered `list_tools` handler.
+    """Wire the chosen router variant onto the FastMCP instance.
 
-    Idempotent — only runs when `MCP_ROUTER_MODE=list_changed`. Leaves
-    the default (monolith) path untouched.
+    Idempotent — dispatches on ``MCP_ROUTER_MODE``:
+      - ``off`` (default): no-op, monolith as advertised.
+      - ``list_changed``: single ``select_domain`` entry point + filtered
+        ``list_tools`` that flips on `send_tool_list_changed`. See
+        `docs/tool-catalog-scaling.md` for the theory and known client
+        limitations (mcphost / Open WebUI don't honour the notification).
+      - ``fat_tools``: four fat domain-tools (`weather` / `geo` /
+        `knowledge` / `radio`) dispatching via `action` enum.
+        Works with static-catalog clients — no protocol magic.
+        Tradeoff: model picks from 4 tools instead of 23 (prefill win),
+        but must route internally via the `action` enum (may hurt
+        small-model reliability; that's what the experiment measures).
     """
-    if ROUTER_MODE != "list_changed":
+    if ROUTER_MODE == "off":
         return
+    if ROUTER_MODE == "fat_tools":
+        _install_fat_tools_mode()
+        return
+    if ROUTER_MODE != "list_changed":
+        raise RuntimeError(
+            f"MCP_ROUTER_MODE={ROUTER_MODE!r} unrecognised; expected "
+            "one of: off, list_changed, fat_tools."
+        )
 
     # Sanity-check the domain map against the registered tool names so
     # a rename in one place + forgotten update here fails loudly at
@@ -2509,6 +2527,51 @@ def _install_router() -> None:
         return [t for t in all_tools if t.name in visible]
 
     mcp._mcp_server.list_tools()(_router_list_tools)
+
+
+# Names of the fat domain-tools registered by `install_fat_tools` in
+# fat_tools.py. Kept at module scope so the `_install_fat_tools_mode`
+# filter knows which of the registered tools to keep visible.
+_FAT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"weather", "geo", "knowledge", "radio"}
+)
+
+
+def _install_fat_tools_mode() -> None:
+    """Register the 4 fat domain-tools and hide the 23 narrow ones.
+
+    Works with static-catalog clients (mcphost, Open WebUI) — no
+    `notifications/tools/list_changed` involved. Clients see a stable,
+    short tool list the entire session; the routing logic lives inside
+    each fat tool, dispatched by its `action` argument.
+    """
+    import fat_tools  # local import — only loaded when this mode is on.
+
+    fat_tools.install_fat_tools(mcp)
+
+    # Enforce that each narrow tool in _ROUTER_DOMAINS has a fat-tool
+    # action that covers it. The map is already validated in the
+    # list_changed path; reusing it here gives us the same "renamed a
+    # narrow tool but forgot to update the router" guard for free.
+    all_registered = {t.name for t in mcp._tool_manager.list_tools()}
+    required = _FAT_TOOL_NAMES | {
+        name for names in _ROUTER_DOMAINS.values() for name in names
+    }
+    missing = required - all_registered
+    if missing:
+        raise RuntimeError(
+            f"fat-tools mode missing expected registrations: {sorted(missing)}"
+        )
+
+    _base_list_tools = mcp.list_tools
+
+    async def _fat_list_tools():
+        # Hide every narrow tool — the fat 4 are the only surface the
+        # model is allowed to see in this mode.
+        all_tools = await _base_list_tools()
+        return [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+
+    mcp._mcp_server.list_tools()(_fat_list_tools)
 
 
 _install_router()
