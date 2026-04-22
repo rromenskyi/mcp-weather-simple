@@ -1232,34 +1232,54 @@ async def _detect_my_location_by_ip_impl(ip: str | None = None) -> tuple[dict, s
 
 @mcp.tool()
 @_loop_guarded
-async def detect_my_location_by_ip(ip: str | None = None) -> dict:
-    """Auto-detect the caller's approximate location. Takes NO arguments in normal use.
+async def detect_my_location_by_ip() -> dict:
+    """Auto-detect the CALLER'S location — takes no arguments.
 
-    Call this tool when the user asks "where am I?", "what's the
-    weather here?", "what time is it here?" — i.e. wants a
-    location-aware answer without naming a city. Backed by the public
-    HTTPS service ipwho.is (no API key, no local GeoIP database).
+    Answers "where am I?", "what's the weather here?", "what time is
+    it here?" — questions where the user is asking about themselves.
+    Auto-detects the caller's public IP from the incoming HTTP
+    request (no argument needed). Backed by ipwho.is (no key).
 
-    **You do NOT need to know the caller's IP address.** Call this
-    tool with no arguments and the server auto-detects the IP from
-    the incoming HTTP request. The `ip` parameter is only for the
-    rare case where the caller has an explicit IPv4/IPv6 to look up
-    (e.g. debugging a specific endpoint); leave it unset in 99 % of
-    situations.
+    Feed the returned `city` + `country_code` straight into
+    `get_current_weather_in_city`, `get_weather_forecast` etc.
 
-    Returns `city`, `region`, `country`, `country_code`, `latitude`,
-    `longitude`, `timezone_id` (IANA id), `local_time`, `weekday` and
-    `utc_offset`. Feed `city` (plus `country_code` for disambiguation)
-    straight into `get_current_weather_in_city` / `get_weather_forecast`
-    to answer "weather here".
+    For a SPECIFIC IP (someone else's, debugging a load-balancer),
+    use `lookup_ip_geolocation(ip=...)` instead — that tool takes a
+    required `ip` argument and exists precisely to keep the
+    "MY location" semantics of this one clean.
 
-    Limitation: when the MCP server runs inside a Kubernetes cluster
-    or behind any NAT/VPN, the auto-detected IP is the cluster / NAT
-    gateway's egress IP, not the end user's browser IP — the reported
-    city is where the server's uplink terminates, which may be far
-    from the user.
+    Limitation: inside Kubernetes / NAT / VPN the auto-detected IP
+    is the cluster / NAT egress, not the end user's browser IP.
     """
-    body, guidance = await _detect_my_location_by_ip_impl(ip=ip)
+    body, guidance = await _detect_my_location_by_ip_impl(ip=None)
+    return _respond(body, guidance=guidance)
+
+
+@mcp.tool()
+@_loop_guarded
+async def lookup_ip_geolocation(ip: str) -> dict:
+    """Resolve a SPECIFIC IPv4 / IPv6 to city + country + coords.
+
+    Use this tool ONLY when the user has provided an explicit IP
+    address (or pastes one from elsewhere), e.g.
+    "where is 8.8.8.8 located?", "what city is 198.51.100.7 in?".
+
+    **Do NOT** use this tool to find the user's own location — that's
+    what `detect_my_location_by_ip` (no args) is for. The naming
+    split is deliberate: "MY" → self-lookup no args, "lookup" →
+    someone else's IP with the IP required.
+
+    `ip` is a required IPv4 or IPv6 string (e.g. "8.8.8.8",
+    "2001:4860:4860::8888"). Returns the same shape as
+    `detect_my_location_by_ip`: city, region, country, country_code,
+    lat / lon, timezone, local clock.
+
+    Accuracy depends on the IP-to-geo database; mobile carrier / VPN
+    / data-center addresses often resolve far from the actual user.
+    """
+    if not ip or not ip.strip():
+        raise ValueError("ip argument is required — use detect_my_location_by_ip for self-lookup")
+    body, guidance = await _detect_my_location_by_ip_impl(ip=ip.strip())
     return _respond(body, guidance=guidance)
 
 
