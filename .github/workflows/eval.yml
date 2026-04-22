@@ -118,11 +118,14 @@ on:
       router_mode:
         description: >-
           `off` (default) — 23 narrow @mcp.tool s, catalog ~5300 tokens.
-          `fat_tools` — 4 fat domain-tools (weather / geo / knowledge /
-          radio) dispatching via `action` enum, catalog ~1900 tokens
-          (-64%). Eval scorer auto-rewrites `expected_tool` to the
-          `fat(action)` form so the same cases.yaml scores both surfaces.
-          Use to A/B measure the prefill vs tool-picking-reliability
+          `fat_tools` — 4 fat domain-tools dispatching via `action` +
+          named kwargs, catalog ~1900 tokens (-64% vs off).
+          `fat_tools_lean` — 4 fat tools with signature `(action,
+          params={})`, drops the pydantic nullability shell on optional
+          kwargs, catalog ~1100 tokens (-79% vs off, -42% vs fat_tools).
+          Eval scorer rewrites `expected_tool` to `fat(action)` form
+          for both fat variants so the same cases.yaml scores all three.
+          Use to A/B the prefill-cost vs tool-picking-reliability
           tradeoff on a given model.
         required: false
         default: 'off'
@@ -130,6 +133,7 @@ on:
         options:
           - 'off'
           - 'fat_tools'
+          - 'fat_tools_lean'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
     # 14b) so nightly trend data covers both sizes. Schedule uses the

@@ -1,0 +1,237 @@
+"""Ultra-lean variant of `fat_tools.py` for `MCP_ROUTER_MODE=fat_tools_lean`.
+
+Same four domain-tools (weather / geo / knowledge / radio), same
+action names, but the signature drops from `(action, name=None,
+lat=None, lon=None, ...)` down to just `(action, params={})`. That's
+a huge win on FastMCP-generated schema: every optional kwarg in
+fat_tools.py expands to `anyOf: [{type: string}, {type: null}]` plus
+a `title` block — roughly 150 tokens per tool purely of pydantic
+nullability noise. Collapsing to one freeform `params` dict cuts
+that out entirely.
+
+Measured on 2026-04-22 against fat_tools baseline of ~1885 tokens:
+lean variant lands around **~900-1000 tokens** total catalog
+(~-50% vs fat_tools, ~-80% vs monolith).
+
+Trade-off: loss of parameter type hints in the schema — the model
+only sees `params` as a plain object. The docstring is what teaches
+it which keys each action needs. If hit rate drops noticeably vs
+fat_tools, the schema was doing real work and we back out.
+
+Action names are identical to `fat_tools.py`, so the eval scorer's
+`NARROW_TO_FAT` canonicalisation works unchanged — cases.yaml
+doesn't need any A/B-specific branching.
+
+Uses lazy `import server` for the same circular-import reason as
+fat_tools.py (see that module's docstring).
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+
+_WEATHER_ACTIONS = Literal[
+    "current_here",
+    "today_here",
+    "tomorrow_here",
+    "current_in_city",
+    "forecast_days",
+    "hourly",
+    "sunrise_sunset",
+    "air_quality",
+    "by_coordinates",
+    "historical",
+]
+
+
+async def weather(action: _WEATHER_ACTIONS, params: dict | None = None) -> dict:
+    """Weather, air quality, sunrise/sunset. Pass `action` + `params` dict.
+
+    Actions and their params:
+      - `current_here`:     {} — current weather at user's detected location.
+      - `today_here`:       {} — today's forecast at user's location.
+      - `tomorrow_here`:    {} — tomorrow's forecast at user's location.
+      - `current_in_city`:  {"city": str, "country_code"?: str}.
+      - `forecast_days`:    {"city": str, "days"?: int=7, "country_code"?: str}.
+      - `hourly`:           {"city": str, "hours"?: int=24, "country_code"?: str}.
+      - `sunrise_sunset`:   {"city": str, "date_iso"?: str, "days"?: int=1,
+                             "country_code"?: str}.
+      - `air_quality`:      {"city": str, "country_code"?: str}.
+      - `by_coordinates`:   {"latitude": float, "longitude": float}
+                            — **do not invent coordinates**.
+      - `historical`:       {"city": str, "start_date_iso": str,
+                             "end_date_iso"?: str, "country_code"?: str}.
+
+    `city` is always a single token (place name, postal code).
+    """
+    import server
+    p = params or {}
+    if action == "current_here":
+        return await server.get_weather_outside_right_now()
+    if action == "today_here":
+        return await server.get_weather_forecast_for_today()
+    if action == "tomorrow_here":
+        return await server.get_weather_forecast_for_tomorrow()
+    if action == "current_in_city":
+        _require(p, "city")
+        return await server.get_current_weather_in_city(p["city"], p.get("country_code"))
+    if action == "forecast_days":
+        _require(p, "city")
+        return await server.get_weather_forecast(p["city"], p.get("days", 7), p.get("country_code"))
+    if action == "hourly":
+        _require(p, "city")
+        return await server.get_hourly_forecast(p["city"], p.get("hours", 24), p.get("country_code"))
+    if action == "sunrise_sunset":
+        _require(p, "city")
+        return await server.get_sunrise_sunset(
+            p["city"], p.get("date_iso"), p.get("days", 1), p.get("country_code")
+        )
+    if action == "air_quality":
+        _require(p, "city")
+        return await server.get_air_quality(p["city"], p.get("country_code"))
+    if action == "by_coordinates":
+        _require(p, "latitude", "longitude")
+        return await server.get_weather_by_coordinates(p["latitude"], p["longitude"])
+    if action == "historical":
+        _require(p, "city", "start_date_iso")
+        return await server.get_historical_weather(
+            p["city"], p["start_date_iso"], p.get("end_date_iso"), p.get("country_code")
+        )
+    raise ValueError(f"weather: unknown action {action!r}")
+
+
+_GEO_ACTIONS = Literal[
+    "find_coordinates",
+    "search_places",
+    "resolve_address",
+    "detect_my_location",
+    "lookup_ip",
+    "time_here",
+    "time_in_city",
+    "date_in_timezone",
+]
+
+
+async def geo(action: _GEO_ACTIONS, params: dict | None = None) -> dict:
+    """Geocoding / reverse-geocoding / IP geolocation / time / date.
+
+    Actions and their params:
+      - `find_coordinates`:   {"city": str, "country_code"?: str}.
+      - `search_places`:      {"query": str, "country_code"?: str,
+                               "feature_types"?: list[str], "limit"?: int=5}
+                              — for ambiguous place queries.
+      - `resolve_address`:    {"address": str, "country_code"?: str}
+                              — free-form street address.
+      - `detect_my_location`: {} — user's location via IP.
+      - `lookup_ip`:          {"ip": str}.
+      - `time_here`:          {} — user's local time.
+      - `time_in_city`:       {"city": str, "country_code"?: str}.
+      - `date_in_timezone`:   {"timezone"?: str="UTC"} — IANA tz name.
+    """
+    import server
+    p = params or {}
+    if action == "find_coordinates":
+        _require(p, "city")
+        return await server.find_place_coordinates(p["city"], p.get("country_code"))
+    if action == "search_places":
+        _require(p, "query")
+        return await server.search_places(
+            p["query"], p.get("country_code"), p.get("feature_types"), p.get("limit", 5)
+        )
+    if action == "resolve_address":
+        _require(p, "address")
+        return await server.resolve_address(p["address"], p.get("country_code"))
+    if action == "detect_my_location":
+        return await server.detect_my_location_by_ip()
+    if action == "lookup_ip":
+        _require(p, "ip")
+        return await server.lookup_ip_geolocation(p["ip"])
+    if action == "time_here":
+        return await server.get_current_time_where_i_am()
+    if action == "time_in_city":
+        _require(p, "city")
+        return await server.get_current_time_in_city(p["city"], p.get("country_code"))
+    if action == "date_in_timezone":
+        return await server.get_current_date(p.get("timezone", "UTC"))
+    raise ValueError(f"geo: unknown action {action!r}")
+
+
+_KNOWLEDGE_ACTIONS = Literal[
+    "wikipedia",
+    "country_info",
+    "public_holidays",
+    "convert_currency",
+]
+
+
+async def knowledge(
+    action: _KNOWLEDGE_ACTIONS, params: dict | None = None
+) -> dict:
+    """Wikipedia / country facts / public holidays / currency conversion.
+
+    Actions and their params:
+      - `wikipedia`:         {"title": str, "lang"?: str="en"} — ISO-639 lang code.
+      - `country_info`:      {"country": str} — full name or ISO code.
+      - `public_holidays`:   {"country_code": str, "year"?: int=current} — ISO-3166-1 alpha-2.
+      - `convert_currency`:  {"amount": float, "from_currency": str, "to_currency": str}
+                              — ISO-4217 currency codes.
+    """
+    import server
+    p = params or {}
+    if action == "wikipedia":
+        _require(p, "title")
+        return await server.get_wikipedia_summary(p["title"], p.get("lang", "en"))
+    if action == "country_info":
+        _require(p, "country")
+        return await server.get_country_info(p["country"])
+    if action == "public_holidays":
+        _require(p, "country_code")
+        return await server.get_public_holidays(p["country_code"], p.get("year"))
+    if action == "convert_currency":
+        _require(p, "amount", "from_currency", "to_currency")
+        return await server.convert_currency(
+            p["amount"], p["from_currency"], p["to_currency"]
+        )
+    raise ValueError(f"knowledge: unknown action {action!r}")
+
+
+async def radio(params: dict | None = None) -> dict:
+    """Find internet-radio streams (NOT FM/AM frequencies).
+
+    Pass at least one filter in `params`:
+      - `country`?: str — ISO-2 (`"UA"`) preferred, or full name (`"Ukraine"`)
+      - `tag`?: str — genre keyword (`"jazz"`, `"news"`)
+      - `language`?: str — full English name (`"russian"`, not `"ru"`)
+      - `limit`?: int=5 — 1-20
+    """
+    import server
+    p = params or {}
+    return await server.list_radio_stations(
+        p.get("country"), p.get("tag"), p.get("language"), p.get("limit", 5)
+    )
+
+
+def install_fat_tools_lean(mcp) -> None:
+    """Register the 4 lean fat-domain tools on the FastMCP instance.
+
+    Called from `server._install_router()` only when mode is
+    `fat_tools_lean`. The narrow `@mcp.tool`s remain registered but
+    hidden by the list_tools override (same pattern as fat_tools).
+    """
+    mcp.tool()(weather)
+    mcp.tool()(geo)
+    mcp.tool()(knowledge)
+    mcp.tool()(radio)
+
+
+def _require(params: dict, *keys: str) -> None:
+    """Raise ValueError if any required key is missing / empty.
+
+    Error message lists all missing fields so the model can retry
+    in one shot. Same shape as fat_tools.py's helper — kept separate
+    because lean stays fully independent of the fatter sibling.
+    """
+    missing = [k for k in keys if params.get(k) in (None, "", [])]
+    if missing:
+        raise ValueError(f"missing required param(s) in `params`: {', '.join(missing)}")
