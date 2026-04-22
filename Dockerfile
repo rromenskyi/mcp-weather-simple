@@ -15,7 +15,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev || \
     uv sync --no-install-project --no-dev
 
-COPY server.py ./
+# Source files — server.py plus the fat-router helpers it lazily
+# imports when `MCP_ROUTER_MODE` is `fat_tools` or `fat_tools_lean`
+# (the latter is now the default — see docs/tool-catalog-scaling.md).
+# Glob picks up fat_tools.py, fat_tools_lean.py, fat_tools_map.py
+# without having to touch the Dockerfile every time a new router
+# variant lands.
+COPY server.py fat_tools*.py ./
 
 # --- Stage 2: runtime ---
 FROM python:3.12-slim-bookworm AS runtime
