@@ -253,14 +253,24 @@ jobs:
 
       - name: Install Ollama
         # Upstream installer script — touches /usr/local/bin and
-        # /etc/systemd. On ephemeral GHA runners that's fine; on a
-        # self-hosted runner pin the version.
+        # /etc/systemd. Skipped on self-hosted because
+        # terraform-gcp-eval-runner's startup.sh already installed
+        # Ollama with an OLLAMA_CONTEXT_LENGTH=8192 systemd drop-in;
+        # re-running the installer here would clobber the drop-in.
+        if: needs.plan.outputs.runs_on != 'self-hosted'
         run: curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Cache Ollama models
         # Model blobs live under ~/.ollama/models/blobs; 7B ~4.7 GB,
         # 14B ~9 GB. Cache keyed on model so each matrix row has its
         # own slot — no collisions, no unnecessary evictions.
+        # Skipped on self-hosted: models are pre-pulled by
+        # terraform-gcp-eval-runner startup.sh into the daemon's own
+        # data dir (/usr/share/ollama/.ollama), and the actions/cache
+        # restore would overlay ~/.ollama — a different path — with
+        # whatever's in the ubuntu-latest cache slot, wasting I/O and
+        # risking drift if the cached blobs are older than the VM's.
+        if: needs.plan.outputs.runs_on != 'self-hosted'
         uses: actions/cache@v4
         with:
           path: ~/.ollama
