@@ -286,43 +286,78 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"SKIP: model {args.model!r} not installed on this Ollama. Have: {installed}")
             return 0
 
-        # Warm-up: two separate concerns, both need to be hot before the
-        # first SCORED case or the 1st/2nd scored calls eat their entire
-        # per-request timeout:
+        # Warm-up runs in TWO independent phases so we can tell which
+        # kind of "not ready yet" we hit. Single-phase warmup (what
+        # we had before) couldn't distinguish "model still loading
+        # weights" from "prefill taking forever" — both looked like
+        # one ReadTimeout.
         #
-        # 1. Model weights loaded into RAM / VRAM. Cheap (~5 s on CPU,
-        #    ~1 s on GPU) once the weights are on disk.
-        # 2. KV cache for the ~5 K-token tool catalog warm. Without it,
-        #    the first scored case pays a full cold-prefill tax:
-        #    ~250 s on 2-vCPU × 14b, which blew past even the 480 s
-        #    timeout on 2026-04-21 — cases 1 and 2 both <error:
-        #    ReadTimeout>, case 3 succeeded in 228 s once the prefix
-        #    cache was warm.
+        # Phase 1 — readiness probe. Poll with a trivial `привет`
+        # prompt (no tools). If weights are loaded, this returns in
+        # 1-5 s. Retry with short timeout until it succeeds. This is
+        # the operator's suggestion of "keep pinging until the model
+        # answers" — we don't proceed to scored cases until we have
+        # positive confirmation the model is alive.
         #
-        # Fix: warm-up sends the IDENTICAL payload shape the scored
-        # loop will use (`tools=[...]`, `temperature=0`, `seed=42`) so
-        # Ollama's prefix caching actually primes the catalog. We keep
-        # `num_predict=4` so generation stays short and the full call
-        # fits inside the scored per-request timeout. Discard the
-        # result — we only care about the warm KV cache side-effect.
-        print("Warming up model (weights + tool-catalog KV cache)...", end=" ", flush=True)
+        # Phase 2 — prefix-cache prime. ONE call with the full tool
+        # catalog, generous timeout (2x the scored timeout). Goal is
+        # to land the catalog in Ollama's prefix cache so the first
+        # scored case doesn't pay cold-prefill. Best-effort — if it
+        # times out on a slow runner (14b on 2-vCPU has 5-10 min
+        # catalog prefill), we log and proceed; the first scored
+        # case gets its own generous timeout to catch up.
+        print("Phase 1/2: readiness probe (minimal prompt, no tools)...", flush=True)
+        for attempt in range(1, 11):
+            t0 = time.monotonic()
+            try:
+                r = await client.post(
+                    f"{args.ollama_url}/api/chat",
+                    json={
+                        "model": args.model,
+                        "messages": [{"role": "user", "content": "."}],
+                        "stream": False,
+                        "options": {"num_predict": 4},
+                    },
+                    timeout=60.0,
+                )
+                r.raise_for_status()
+                print(
+                    f"  [{attempt}] model responsive in {time.monotonic() - t0:.1f}s",
+                    flush=True,
+                )
+                break
+            except Exception as e:
+                print(
+                    f"  [{attempt}] {type(e).__name__} after {time.monotonic() - t0:.1f}s — retrying",
+                    flush=True,
+                )
+        else:
+            print(
+                "  WARN: 10 probes failed, model never answered — "
+                "scored cases will likely time out too.",
+                flush=True,
+            )
+
+        print("Phase 2/2: prefix-cache prime (full tool catalog, best-effort)...", flush=True)
         t0 = time.monotonic()
         try:
-            warm_resp = await client.post(
+            r = await client.post(
                 f"{args.ollama_url}/api/chat",
                 json={
                     "model": args.model,
-                    "messages": [{"role": "user", "content": "warmup — answer 'ok'"}],
+                    "messages": [{"role": "user", "content": "."}],
                     "tools": ollama_tools,
                     "stream": False,
                     "options": {"temperature": 0, "seed": 42, "num_predict": 4},
                 },
+                timeout=args.timeout * 2,
             )
-            warm_resp.raise_for_status()
-            print(f"done in {time.monotonic() - t0:.1f}s.", flush=True)
+            r.raise_for_status()
+            print(f"  primed in {time.monotonic() - t0:.1f}s.", flush=True)
         except Exception as e:
             print(
-                f"warm-up failed ({type(e).__name__}: {e}) — proceeding anyway.",
+                f"  {type(e).__name__} after {time.monotonic() - t0:.1f}s — "
+                "first scored case will bear cold-prefill cost.",
                 flush=True,
             )
 
