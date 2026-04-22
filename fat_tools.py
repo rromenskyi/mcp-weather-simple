@@ -25,14 +25,22 @@ from __future__ import annotations
 
 from typing import Literal
 
-import server
+# NB: deliberately **no** `import server` at module scope. When
+# `uv run server.py` starts the MCP server, Python loads server.py as
+# `__main__`, and server's `_install_router()` re-imports `fat_tools`
+# at module top, which would then do `import server` — creating a
+# SECOND server module (distinct from `__main__`) that also runs
+# `_install_router()`, which would re-import `fat_tools` again. The
+# second pass finds fat_tools mid-init and blows up with
+# `AttributeError: partially initialized module 'fat_tools' has no
+# attribute 'install_fat_tools'`. Lazy-import `server` inside each
+# dispatch function below so the binding happens at call time, well
+# after both modules have finished loading.
 
 # Re-export so callers already reading `fat_tools.NARROW_TO_FAT` keep
 # working. Canonical source lives in `fat_tools_map` — that module has
 # zero other imports so it can be pulled in from the eval harness
-# without triggering `server.__init__` (which would recurse through
-# `_install_router` → `fat_tools.install_fat_tools` and explode with
-# AttributeError on a partial module).
+# without triggering `server.__init__`.
 from fat_tools_map import NARROW_TO_FAT  # noqa: F401  (used by scorer)
 
 
@@ -91,6 +99,7 @@ async def weather(
     code (`"84010"`), or the shape `"City, Region"` when disambiguation
     is required. Full-sentence queries will fail.
     """
+    import server  # lazy — see module docstring
     if action == "current_here":
         return await server.get_weather_outside_right_now()
     if action == "today_here":
@@ -170,6 +179,7 @@ async def geo(
       - `date_in_timezone` — today's date in a named timezone.
           Optional: `timezone` (IANA, default `"UTC"`).
     """
+    import server  # lazy — see module docstring
     if action == "find_coordinates":
         _require(city=city)
         return await server.find_place_coordinates(city, country_code)
@@ -230,6 +240,7 @@ async def knowledge(
       - `convert_currency` — convert between currencies at today's ECB rate.
           Needs: `amount`, `from_currency` (ISO-4217), `to_currency` (ISO-4217).
     """
+    import server  # lazy — see module docstring
     if action == "wikipedia":
         _require(title=title)
         return await server.get_wikipedia_summary(title, lang)
@@ -263,6 +274,7 @@ async def radio(
     `"chillout"`), or `language` (full English name like `"russian"`,
     not the ISO code). `limit` caps the result count, 1-20 (default 5).
     """
+    import server  # lazy — see module docstring
     return await server.list_radio_stations(country, tag, language, limit)
 
 
