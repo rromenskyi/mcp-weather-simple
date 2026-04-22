@@ -305,7 +305,7 @@ Useful when you want to experiment without touching the cluster.
            -m ollama:llama3.1
    ```
 
-   Use a model that supports tool calling: `llama3.1`, `qwen2.5`,
+   Use a model that supports tool calling: `qwen3.5`, `qwen3`, `llama3.1`,
    `mistral-nemo`, `llama3.2`, etc. Models like `phi` or `gemma2` won't
    work.
 
@@ -343,8 +343,8 @@ Think of it as "the plumbing works, input X produces output Y".
 ### Tool-calling eval — do LLMs actually pick the right tool?
 
 Separate problem: even a perfectly-implemented tool is useless if
-the model ignores it. Small open-source LLMs (qwen2.5:7b,
-qwen2.5:14b, llama3.1:8b, …) read the tool's **description** and
+the model ignores it. Small open-source LLMs (qwen3.5:9b,
+qwen3:14b, llama3.1:8b, …) read the tool's **description** and
 name, and decide on the fly whether to invoke it. A docstring that
 reads clearly to a human but overlaps semantically with a sibling
 tool will cause the model to fumble the choice.
@@ -364,7 +364,7 @@ measure this as a **top-1 tool-selection hit rate**:
   scores it against the expected tool.
 - Reports a **per-family** and **overall** hit rate, lists the
   failing prompts. `pass_threshold` lives in `cases.yaml`; current
-  baseline on qwen2.5:7b is **~97 %** (86.8 % on the first run
+  baseline on qwen3.5:9b is **~97 %** (86.8 % on the first run
   before a warm-up call was added to neutralise the cold-start
   ReadTimeout on the first 4 scored cases).
 
@@ -375,7 +375,7 @@ runner gets 16 GB RAM / 4 vCPU, its own Ollama model cache
 
 Three matrix axes, fan-out independently:
 
-- **model** — `qwen2.5:7b` + `qwen2.5:14b` by default (leave input
+- **model** — `qwen3.5:9b` + `qwen3:14b` by default (leave input
   empty), or pick a single model via the `model` dropdown.
 - **output_schema** — `off` (default), `on`, or `both`. The `both`
   setting runs the outputSchema A/B experiment; see ROADMAP's
@@ -401,7 +401,7 @@ running Ollama and MCP server:
 ```bash
 OLLAMA_URL=http://127.0.0.1:11434 \
 MCP_URL=http://127.0.0.1:8000/mcp \
-OLLAMA_MODEL=qwen2.5:7b \
+OLLAMA_MODEL=qwen3.5:9b \
 uv run python tests/integration/eval_tool_calling.py
 ```
 

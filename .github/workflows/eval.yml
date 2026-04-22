@@ -12,7 +12,7 @@ name: eval tool-calling
 #
 # Triggers:
 #   - `workflow_dispatch`: manual button in the Actions tab. By default
-#     runs the full matrix (qwen2.5:7b + qwen2.5:14b, in parallel); an
+#     runs the full matrix (qwen3.5:9b + qwen3:14b, in parallel); an
 #     optional `model` input picks a single model for quick iteration.
 #   - `schedule`: one nightly run at 03:00 UTC across the matrix to
 #     catch regressions over time. The two runners fan out in parallel
@@ -29,14 +29,16 @@ on:
       model:
         description: >-
           Single model to evaluate (overrides the default matrix).
-          Leave empty to run qwen2.5:7b + qwen2.5:14b in parallel.
+          Leave empty to run qwen3.5:9b + qwen3:14b in parallel.
         required: false
         default: ''
         type: choice
         options:
           - ''
+          - qwen3.5:9b
+          - qwen3:14b
+          - qwen3:8b
           - qwen2.5:7b
-          - qwen2.5-coder:7b
           - qwen2.5:14b
           - llama3.1:8b
           - llama3.2:3b
@@ -140,7 +142,7 @@ jobs:
           if [ -n "$single" ]; then
             echo "models=[\"$single\"]" >> "$GITHUB_OUTPUT"
           else
-            echo 'models=["qwen2.5:7b","qwen2.5:14b"]' >> "$GITHUB_OUTPUT"
+            echo 'models=["qwen3.5:9b","qwen3:14b"]' >> "$GITHUB_OUTPUT"
           fi
           schema='${{ github.event.inputs.output_schema || 'off' }}'
           if [ "$schema" = "both" ]; then
