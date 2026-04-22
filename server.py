@@ -1965,14 +1965,16 @@ async def list_radio_stations(
     country: str | None = None,
     tag: str | None = None,
     language: str | None = None,
-    limit: int = 10,
+    limit: int = 5,
 ) -> dict:
     """Find internet-radio stations by country / tag / language.
 
     Answers "radio stations in Ukraine", "Ukrainian-language radio",
     "jazz stations". Pass at least one filter; `limit` caps the
-    result count (1-50). Data from radio-browser.info (volunteer
-    community catalogue).
+    result count (1-20). Data from radio-browser.info (volunteer
+    community catalogue). **Streams only** — FM/AM frequencies are
+    regulator-specific and out of scope; this tool returns internet
+    radio URLs.
 
     **`country` accepts two shapes** — prefer ISO for correctness:
       - ISO-3166-1 alpha-2 code ("US", "UA", "DE") — routed to
@@ -1989,7 +1991,7 @@ async def list_radio_stations(
       - Wrong: `"ru"`, `"uk"`, `"en"` — radio-browser indexes by the
         spelled-out name and an ISO code returns empty results.
     """
-    limit = max(1, min(int(limit), 50))
+    limit = max(1, min(int(limit), 20))
     if not any([country, tag, language]):
         raise ValueError(
             "At least one filter (country, tag, or language) is required to "
@@ -2036,16 +2038,17 @@ async def list_radio_stations(
         filtered = [s for s in filtered if lang_low in (s.get("language") or "").lower()]
     # Sort by click count desc so the most-listened-to stations are first.
     filtered.sort(key=lambda s: s.get("clickcount") or 0, reverse=True)
+    # Minimal per-station payload — the chat model only needs
+    # enough to pick one and hand the user a playable URL. Homepage,
+    # tags, codec, bitrate, language were live bloat: 8 fields × 10
+    # stations used to clock 3-5K tokens per response, enough to
+    # budget out the context on follow-up turns. Names are also
+    # capped because a few stations ship 100+ char joke titles.
     stations = [
         {
-            "name": s.get("name"),
+            "name": (s.get("name") or "")[:60],
             "country": s.get("country"),
-            "language": s.get("language"),
-            "tags": s.get("tags"),
             "url": s.get("url_resolved") or s.get("url"),
-            "homepage": s.get("homepage"),
-            "bitrate_kbps": s.get("bitrate"),
-            "codec": s.get("codec"),
         }
         for s in filtered[:limit]
     ]
