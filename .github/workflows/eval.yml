@@ -115,6 +115,21 @@ on:
         options:
           - 'github-hosted'
           - 'self-hosted'
+      router_mode:
+        description: >-
+          `off` (default) — 23 narrow @mcp.tool s, catalog ~5300 tokens.
+          `fat_tools` — 4 fat domain-tools (weather / geo / knowledge /
+          radio) dispatching via `action` enum, catalog ~1900 tokens
+          (-64%). Eval scorer auto-rewrites `expected_tool` to the
+          `fat(action)` form so the same cases.yaml scores both surfaces.
+          Use to A/B measure the prefill vs tool-picking-reliability
+          tradeoff on a given model.
+        required: false
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - 'fat_tools'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
     # 14b) so nightly trend data covers both sizes. Schedule uses the
@@ -153,6 +168,7 @@ jobs:
       chunk_count: ${{ steps.pick.outputs.chunk_count }}
       docstrings: ${{ steps.pick.outputs.docstrings }}
       runs_on: ${{ steps.pick.outputs.runs_on }}
+      router_mode: ${{ steps.pick.outputs.router_mode }}
     steps:
       - id: pick
         run: |
@@ -166,6 +182,9 @@ jobs:
           # input isn't populated) → default to github-hosted.
           runs_on='${{ github.event.inputs.runs_on || 'github-hosted' }}'
           echo "runs_on=$runs_on" >> "$GITHUB_OUTPUT"
+          # Router mode. Same schedule-default handling.
+          router_mode='${{ github.event.inputs.router_mode || 'off' }}'
+          echo "router_mode=$router_mode" >> "$GITHUB_OUTPUT"
           schema='${{ github.event.inputs.output_schema || 'off' }}'
           if [ "$schema" = "both" ]; then
             echo 'schemas=["off","on"]' >> "$GITHUB_OUTPUT"
@@ -292,12 +311,17 @@ jobs:
         # the streamable-http transport bound to loopback. No auth
         # because nothing else on the runner has network access to it.
         # `MCP_OUTPUT_SCHEMA` wires the A/B experiment into this row.
+        # `MCP_ROUTER_MODE` wires the router A/B — `off` is the 23-tool
+        # monolith, `fat_tools` is the 4 fat domain-tools. The eval
+        # scorer reads the same env to rewrite `expected_tool` into
+        # `fat(action)` form when fat_tools is active.
         env:
           MCP_TRANSPORT: streamable-http
           MCP_HOST: 127.0.0.1
           MCP_PORT: "8000"
           MCP_OUTPUT_SCHEMA: ${{ matrix.schema }}
           MCP_DOCSTRING_MODE: ${{ matrix.docstring }}
+          MCP_ROUTER_MODE: ${{ needs.plan.outputs.router_mode }}
         run: |
           nohup uv run server.py > /tmp/mcp.log 2>&1 &
           for i in {1..30}; do
@@ -318,6 +342,10 @@ jobs:
           OLLAMA_URL: http://127.0.0.1:11434
           MCP_URL: http://127.0.0.1:8000/mcp
           OLLAMA_MODEL: ${{ matrix.model }}
+          # Router mode needs to match the MCP server's startup env so
+          # the scorer rewrites expected tool names into `fat(action)`
+          # form that matches the model's actual tool_calls.
+          MCP_ROUTER_MODE: ${{ needs.plan.outputs.router_mode }}
           # Sharding env — the harness reads these to pick a
           # stride-N subset of cases.yaml so this row runs ~1/N of
           # the suite in parallel with its siblings.

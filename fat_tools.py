@@ -27,6 +27,14 @@ from typing import Literal
 
 import server
 
+# Re-export so callers already reading `fat_tools.NARROW_TO_FAT` keep
+# working. Canonical source lives in `fat_tools_map` — that module has
+# zero other imports so it can be pulled in from the eval harness
+# without triggering `server.__init__` (which would recurse through
+# `_install_router` → `fat_tools.install_fat_tools` and explode with
+# AttributeError on a partial module).
+from fat_tools_map import NARROW_TO_FAT  # noqa: F401  (used by scorer)
+
 
 # ── weather ─────────────────────────────────────────────────────────────
 

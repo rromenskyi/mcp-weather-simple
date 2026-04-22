@@ -120,6 +120,78 @@ def _is_qwen3_family(model: str) -> bool:
     return "qwen3" in model.lower()
 
 
+# Router-mode awareness for scoring. When the MCP server is started
+# with `MCP_ROUTER_MODE=fat_tools`, the 23 narrow tools are hidden
+# behind 4 fat tools (weather/geo/knowledge/radio) and the model
+# picks an operation via an `action` argument instead of a distinct
+# tool name. We map narrow → (fat_tool, action) so the same
+# cases.yaml scores against both surfaces without duplication.
+#
+# Populated at runtime via `from fat_tools import NARROW_TO_FAT` —
+# fat_tools imports server, which is the wrapper around the same
+# @mcp.tool set the harness targets over HTTP; the extra module
+# init is idempotent and cheap (no network bound at import time).
+_FAT_MODE = False
+_NARROW_TO_FAT: dict[str, tuple[str, str | None]] = {}
+
+
+def _load_fat_mapping_if_enabled() -> None:
+    global _FAT_MODE, _NARROW_TO_FAT
+    mode = os.environ.get("MCP_ROUTER_MODE", "off").strip().lower()
+    _FAT_MODE = mode == "fat_tools"
+    if _FAT_MODE:
+        # Late import from the zero-dep mini-module so we don't drag
+        # the whole `server` init chain into the eval harness.
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from fat_tools_map import NARROW_TO_FAT
+        _NARROW_TO_FAT = NARROW_TO_FAT
+
+
+def _canonicalise_expected(expected_narrow: str) -> str:
+    """Fat mode: rewrite `expected_tool` to `fat(action)` form so a
+    plain string equality check keeps working. Narrow mode: pass
+    through so the baseline path is bit-identical.
+
+    `radio` has no action discriminator → just `"radio"`.
+    """
+    if not _FAT_MODE:
+        return expected_narrow
+    fat, action = _NARROW_TO_FAT[expected_narrow]
+    return fat if action is None else f"{fat}({action})"
+
+
+def _canonicalise_picked(tool_name: str | None, arguments: dict | None) -> str | None:
+    """Mirror of `_canonicalise_expected` for what the model actually
+    called — same `fat(action)` form so string compare works.
+
+    Missing action in fat mode leaves `tool_name` unchanged; that
+    guarantees a mismatch (expected side always has `(action)`
+    unless the narrow was `list_radio_stations`), which is the right
+    scoring semantics — "model picked `weather` without telling us
+    which thing" is a failure.
+    """
+    if not _FAT_MODE or tool_name is None or tool_name.startswith("<"):
+        return tool_name
+    if tool_name == "radio":
+        return "radio"
+    action = (arguments or {}).get("action")
+    if action is None:
+        return tool_name
+    return f"{tool_name}({action})"
+
+
+def _expected_family(expected: str) -> str:
+    """In fat mode, use the fat tool name as the family bucket so the
+    per-family breakdown in the summary collapses to 4 groups
+    (weather / geo / knowledge / radio). In narrow mode fall back to
+    the historical `split('_')[:2]` heuristic so nightly baselines
+    stay comparable over time.
+    """
+    if _FAT_MODE:
+        return expected.split("(", 1)[0] if "(" in expected else expected
+    return "_".join(expected.split("_")[:2])
+
+
 def _supports_no_think_prompt_signal(model: str) -> bool:
     """Does the chat template recognise a trailing `/no_think` tag?
 
@@ -245,11 +317,12 @@ def summarise(results: list[dict], threshold: float) -> int:
     hits = sum(1 for r in results if r["picked"] == r["expected"])
     rate = hits / total if total else 0.0
 
-    # Family = common prefix of the expected tool (e.g. `get_weather_*`).
+    # Family = common prefix of the expected tool. Narrow mode keeps
+    # the historical `get_weather_*` / `get_current_*` / ... grouping;
+    # fat_tools mode collapses to the 4 fat-tool names.
     by_family: dict[str, list[dict]] = defaultdict(list)
     for r in results:
-        family = "_".join(r["expected"].split("_")[:2])  # get_weather, get_current, list_radio, …
-        by_family[family].append(r)
+        by_family[_expected_family(r["expected"])].append(r)
 
     # Header includes latency (mean / p50 / p95) — lets the operator
     # spot cases where an outputSchema or other tool-catalog change
@@ -295,6 +368,10 @@ def summarise(results: list[dict], threshold: float) -> int:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    _load_fat_mapping_if_enabled()
+    if _FAT_MODE:
+        print("Router mode: fat_tools — expected tools rewritten to fat(action) form.")
+
     cases_path = Path(args.cases)
     cfg = yaml.safe_load(cases_path.read_text())
     all_cases = cfg["cases"]
@@ -438,13 +515,15 @@ async def main_async(args: argparse.Namespace) -> int:
 
         results: list[dict] = []
         for i, case in enumerate(cases, 1):
-            prompt, expected = case["prompt"], case["expected_tool"]
+            prompt = case["prompt"]
+            expected = _canonicalise_expected(case["expected_tool"])
             try:
-                picked, arguments, latency = await run_case(
+                picked_raw, arguments, latency = await run_case(
                     client, args.ollama_url, args.model, prompt, ollama_tools
                 )
             except Exception as e:
-                picked, arguments, latency = f"<error: {type(e).__name__}>", None, 0.0
+                picked_raw, arguments, latency = f"<error: {type(e).__name__}>", None, 0.0
+            picked = _canonicalise_picked(picked_raw, arguments)
             mark = "✓" if picked == expected else "×"
             args_str = _format_arguments(arguments)
             tail = (picked or "<no tool_call>") + args_str
