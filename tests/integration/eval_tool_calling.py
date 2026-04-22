@@ -110,13 +110,30 @@ def mcp_tools_to_ollama(tools: list[dict]) -> list[dict]:
 def _is_qwen3_family(model: str) -> bool:
     """Identify qwen3 / qwen3.5 tags that default to thinking mode.
 
-    Qwen3 emits <think>...</think> reasoning blocks before tool_calls by
-    default. On CPU that's 2000-4000 extra tokens per case — enough to
-    blow the per-request timeout before the model ever emits a tool_call.
-    Qwen2.5 and other families have no such mode; we only gate
-    thinking-suppression on qwen3 so legacy baselines stay untouched.
+    Qwen3 and Qwen3.5 emit <think>...</think> reasoning blocks before
+    tool_calls by default. On CPU that's 2000-4000 extra tokens per
+    case — enough to blow the per-request timeout before the model
+    ever emits a tool_call. Qwen2.5 and other families have no such
+    mode; we only gate thinking-suppression on qwen3 so legacy
+    baselines stay untouched.
     """
     return "qwen3" in model.lower()
+
+
+def _supports_no_think_prompt_signal(model: str) -> bool:
+    """Does the chat template recognise a trailing `/no_think` tag?
+
+    Per Qwen/Qwen3 HF discussion, `/no_think` (and `/nothink`) is a
+    Qwen3-template signal — appending it to the user message turns
+    off reasoning on qwen3:14b / qwen3:8b / qwen3:4b. Qwen3.5 models
+    dropped that template branch; for them `/no_think` is just text
+    that lands in the prompt and pollutes the intent. Native
+    `think: false` (the Ollama top-level field set separately) is
+    the canonical disable and works for both families, so on qwen3.5
+    we skip the prompt tail entirely.
+    """
+    m = model.lower()
+    return "qwen3" in m and "qwen3.5" not in m
 
 
 async def run_case(
@@ -135,14 +152,17 @@ async def run_case(
     argument that the single-token contract from #14 is designed to
     prevent). Scoring is still name-only; arguments are informational.
     """
-    # For qwen3 belt-and-braces: append `/no_think` to the user content
-    # (recognised by the chat template) AND set `think: false` at the
-    # top level (native toggle in Ollama 0.6+). Either alone should work;
-    # both together survive version skew. For other families the prompt
-    # tail is just noise the model ignores, and `think: false` is a
-    # no-op because their templates don't branch on it.
+    # Thinking-mode disable for qwen3-family. `think: false` is the
+    # canonical Ollama toggle (top-level field in `/api/chat`, 0.6+)
+    # and is set below — it's load-bearing for BOTH qwen3 and qwen3.5.
+    # The `/no_think` prompt tail is additionally added only for
+    # qwen3 (not qwen3.5), where the chat template still recognises
+    # the signal; qwen3.5 dropped that template branch, so appending
+    # it there just adds noise without effect.
     qwen3 = _is_qwen3_family(model)
-    user_content = f"{prompt} /no_think" if qwen3 else prompt
+    user_content = (
+        f"{prompt} /no_think" if _supports_no_think_prompt_signal(model) else prompt
+    )
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
@@ -373,14 +393,12 @@ async def main_async(args: argparse.Namespace) -> int:
         # Ollama versions) and the whole Phase 2 budget is burned on
         # nothing useful.
         qwen3 = _is_qwen3_family(args.model)
+        warmup_content = (
+            ". /no_think" if _supports_no_think_prompt_signal(args.model) else "."
+        )
         warmup_payload: dict = {
             "model": args.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": ". /no_think" if qwen3 else ".",
-                }
-            ],
+            "messages": [{"role": "user", "content": warmup_content}],
             "tools": ollama_tools,
             "stream": False,
             "options": {"temperature": 0, "seed": 42, "num_predict": 4},
