@@ -399,15 +399,19 @@ async def main_async(args: argparse.Namespace) -> int:
 # nightly to be `<error: ReadTimeout>` rather than real regressions.
 # Pick a generous default for the larger model; callers can override
 # with `--timeout` / `EVAL_TIMEOUT`.
-# Bumped 2026-04-21 after catalog growth (22 tools → ~3000 desc +
+# Bumped 2026-04-21 after catalog growth (23 tools → ~3000 desc +
 # ~1400 schema tokens) pushed 2-vCPU GHA prefill past the old 120/300 s
-# ceilings. Observed as every scored case failing `<error: ReadTimeout>`
-# and warm-up itself dying on 7b. Current headroom covers worst-case
-# CPU prefill; GPU cuts it back to <5 s so the numbers are harmless
-# there.
+# ceilings. Current defaults cover 14b worst-case prefill; GPU runners
+# cut everything back to <5 s so the numbers are harmless there.
+#
+# Keys match the parameter-count suffix in Ollama tag names:
+# qwen3.5:9b, qwen3:14b, legacy qwen2.5:7b. Match on substring so
+# tag variants like `-q4_K_M`, `-coding-nvfp4` etc. still resolve.
 _DEFAULT_TIMEOUTS_BY_MODEL_SIZE = {
-    "14b": 480.0,   # was 300
-    "7b":  240.0,   # was 120
+    "14b": 480.0,
+    "9b":  240.0,   # qwen3.5:9b
+    "8b":  240.0,   # qwen3:8b if selected from dropdown
+    "7b":  240.0,   # legacy qwen2.5:7b
 }
 
 
@@ -447,7 +451,7 @@ def main() -> int:
     p.add_argument("--cases", default=str(Path(__file__).parent / "cases.yaml"))
     p.add_argument("--mcp-url", default=os.environ.get("MCP_URL", "http://127.0.0.1:8000/mcp"))
     p.add_argument("--ollama-url", default=os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434"))
-    p.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b"))
+    p.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen3.5:9b"))
     # Timeout can be overridden via `--timeout` or `EVAL_TIMEOUT`.
     # Leaving it unset auto-picks a ceiling that matches the model size
     # — 300 s for 14b, 120 s for 7b — so the nightly matrix stops
