@@ -13,13 +13,19 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field, create_model
 
 TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio")
 HOST = os.getenv("MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("MCP_PORT", "8000"))
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
+
+# Experimental — see docs/tool-catalog-scaling.md. Default "off" keeps
+# the monolith as advertised to the model. "list_changed" installs the
+# single-entry router and switches the HTTP session to stateful so
+# `notifications/tools/list_changed` can reach the client's SSE stream.
+ROUTER_MODE = os.getenv("MCP_ROUTER_MODE", "off").strip().lower()
 
 # ── Tool-calling policy (#19) ──────────────────────────────────────────────
 #
@@ -40,7 +46,14 @@ _INSTRUCTIONS = (
 mcp = FastMCP(
     "weather",
     instructions=_INSTRUCTIONS,
-    host=HOST, port=PORT, stateless_http=True,
+    host=HOST, port=PORT,
+    # Router mode needs a live session to push the
+    # `notifications/tools/list_changed` event over the SSE stream —
+    # stateless HTTP terminates the session at the end of the RPC call,
+    # which would drop the notification. Everywhere else (default
+    # monolith) stays stateless so the sidecar deployment topology
+    # on the platform doesn't need session affinity.
+    stateless_http=(ROUTER_MODE == "off"),
 )
 
 
@@ -2353,6 +2366,152 @@ def _apply_docstring_experiment() -> None:
 
 
 _apply_docstring_experiment()
+
+
+# ── Experimental router mode (MCP_ROUTER_MODE=list_changed) ─────────────────
+#
+# See `docs/tool-catalog-scaling.md` for the design context. Goal of
+# this block is NOT to be the production answer — it's a probe of
+# whether `notifications/tools/list_changed` reliably reaches the real
+# clients we use (mcphost, Open WebUI). If yes, we can narrow the
+# per-turn tool catalog from 23 tools to ~5-10 and free 2-3K tokens of
+# prefill. If not, we fall back to the first-message heuristic also
+# described in that doc.
+#
+# Shape:
+#   1. Initial `tools/list` → returns only `select_domain(domain)`.
+#   2. Model calls `select_domain(domain="weather")`.
+#   3. Handler updates process-global `_ROUTER_STATE["active"]` and
+#      pushes `send_tool_list_changed()` on the current session.
+#   4. Client (if compliant) re-fetches `tools/list` and sees the
+#      domain subset + `select_domain` (so cross-domain switches
+#      mid-session stay possible).
+#
+# Single process-global state is fine for the L4 single-user testing
+# scenario; for multi-tenant it would need per-session storage.
+
+_ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
+    "weather": (
+        "get_weather_outside_right_now",
+        "get_weather_forecast_for_today",
+        "get_weather_forecast_for_tomorrow",
+        "get_current_weather_in_city",
+        "get_weather_forecast",
+        "get_hourly_forecast",
+        "get_weather_by_coordinates",
+        "get_historical_weather",
+        "get_sunrise_sunset",
+        "get_air_quality",
+    ),
+    "location": (
+        "find_place_coordinates",
+        "search_places",
+        "resolve_address",
+        "detect_my_location_by_ip",
+        "lookup_ip_geolocation",
+    ),
+    "time": (
+        "get_current_time_where_i_am",
+        "get_current_time_in_city",
+        "get_current_date",
+    ),
+    "knowledge": (
+        "get_wikipedia_summary",
+        "get_country_info",
+        "get_public_holidays",
+        "convert_currency",
+        "list_radio_stations",
+    ),
+}
+
+_ROUTER_STATE: dict[str, str | None] = {"active": None}
+
+
+def _install_router() -> None:
+    """Wire `select_domain` tool + filtered `list_tools` handler.
+
+    Idempotent — only runs when `MCP_ROUTER_MODE=list_changed`. Leaves
+    the default (monolith) path untouched.
+    """
+    if ROUTER_MODE != "list_changed":
+        return
+
+    # Sanity-check the domain map against the registered tool names so
+    # a rename in one place + forgotten update here fails loudly at
+    # boot rather than silently hiding a tool from the router.
+    all_registered = {t.name for t in mcp._tool_manager.list_tools()}
+    mapped = {name for names in _ROUTER_DOMAINS.values() for name in names}
+    missing = mapped - all_registered
+    unmapped = all_registered - mapped
+    if missing:
+        raise RuntimeError(f"router domain map references unknown tools: {sorted(missing)}")
+    if unmapped:
+        raise RuntimeError(
+            f"router domain map leaves tools unreachable: {sorted(unmapped)} "
+            "— add them to _ROUTER_DOMAINS or this server is only partially routable."
+        )
+
+    valid_domains = tuple(_ROUTER_DOMAINS.keys())
+
+    @mcp.tool()
+    async def select_domain(
+        domain: Literal["weather", "location", "time", "knowledge"],
+        ctx: Context,
+    ) -> dict:
+        """Route this session to a tool subset. **Call once per user intent.**
+
+        Picks which family of tools becomes available to you:
+          - `weather` — current / forecast / historical / air / sunrise.
+          - `location` — geocoding, address parse, IP geolocation.
+          - `time`     — current date/time here or in a named city.
+          - `knowledge` — wikipedia, country info, holidays, currency,
+                          radio stations.
+
+        After you call this, the tool list updates (the client will
+        re-fetch it) and the domain's tools appear. Switch domains
+        mid-conversation by calling `select_domain` again. When the
+        user's next turn is clearly in a different family, switch
+        before calling the actual tool.
+        """
+        prev = _ROUTER_STATE["active"]
+        _ROUTER_STATE["active"] = domain
+        try:
+            await ctx.session.send_tool_list_changed()
+        except Exception as exc:
+            # Don't fail the tool call — the state change still counts;
+            # we just surface that the notification didn't land. On
+            # non-stateful sessions this is expected.
+            return {
+                "active_domain": domain,
+                "previous_domain": prev,
+                "list_changed_notification": f"failed: {type(exc).__name__}",
+                "guidance": "Domain selected but the client may not auto-refresh. Try calling a domain tool directly; if it's not visible, call select_domain again.",
+            }
+        return {
+            "active_domain": domain,
+            "previous_domain": prev,
+            "list_changed_notification": "sent",
+            "guidance": "Client should now re-fetch tool list. Proceed with the domain's tool.",
+        }
+
+    # Wrap the FastMCP list_tools handler. The low-level Server stores
+    # whatever we register last; re-registering overwrites cleanly.
+    _base_list_tools = mcp.list_tools
+
+    async def _router_list_tools():
+        all_tools = await _base_list_tools()
+        active = _ROUTER_STATE["active"]
+        if active is None:
+            # No domain selected yet — expose only the router entry
+            # point. This is the main-menu state.
+            return [t for t in all_tools if t.name == "select_domain"]
+        visible = {"select_domain", *_ROUTER_DOMAINS.get(active, ())}
+        return [t for t in all_tools if t.name in visible]
+
+    mcp._mcp_server.list_tools()(_router_list_tools)
+
+
+_install_router()
 
 
 if __name__ == "__main__":
