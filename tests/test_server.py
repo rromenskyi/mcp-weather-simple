@@ -2154,16 +2154,22 @@ def test_eval_canonicalise_expected_fat_mode(monkeypatch, narrow, canonical):
     import importlib.util
     from pathlib import Path
 
-    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools")
     spec = importlib.util.spec_from_file_location(
         "eval_tc_test",
         Path(__file__).parent.parent / "tests" / "integration" / "eval_tool_calling.py",
     )
-    m = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m)
-    m._load_fat_mapping_if_enabled()
-    assert m._FAT_MODE is True
-    assert m._canonicalise_expected(narrow) == canonical
+
+    # Both fat router variants share canonical names — a single scorer
+    # branch has to handle both. Regression guard against the bug that
+    # shipped on 2026-04-22: `_FAT_MODE = mode == "fat_tools"` missed
+    # `fat_tools_lean` entirely, every lean-run scored 0/44.
+    for mode_value in ("fat_tools", "fat_tools_lean"):
+        monkeypatch.setenv("MCP_ROUTER_MODE", mode_value)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        m._load_fat_mapping_if_enabled()
+        assert m._FAT_MODE is True, f"mode={mode_value!r} should enable fat scoring"
+        assert m._canonicalise_expected(narrow) == canonical
 
     # Narrow-mode path: reload without the env, canonicalise is a no-op.
     monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)

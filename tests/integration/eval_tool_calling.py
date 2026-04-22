@@ -136,9 +136,20 @@ _NARROW_TO_FAT: dict[str, tuple[str, str | None]] = {}
 
 
 def _load_fat_mapping_if_enabled() -> None:
+    """Activate fat-mode scoring for any router variant that reshapes
+    the catalog into `weather/geo/knowledge/radio` + `action` — both
+    `fat_tools` (named kwargs) and `fat_tools_lean` (params dict) emit
+    `action` as the top-level argument and share the same action names
+    through `fat_tools_map.NARROW_TO_FAT`. Matching only the exact
+    string `"fat_tools"` here (the bug caught on 2026-04-22's first
+    lean A/B run) made every scored case in lean mode a false miss —
+    model picked the right tool with the right action, scorer compared
+    `weather(current_in_city)` against the unrewritten narrow
+    `get_current_weather_in_city` and said ×.
+    """
     global _FAT_MODE, _NARROW_TO_FAT
     mode = os.environ.get("MCP_ROUTER_MODE", "off").strip().lower()
-    _FAT_MODE = mode == "fat_tools"
+    _FAT_MODE = mode in {"fat_tools", "fat_tools_lean"}
     if _FAT_MODE:
         # Late import from the zero-dep mini-module so we don't drag
         # the whole `server` init chain into the eval harness.
