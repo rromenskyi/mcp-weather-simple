@@ -1899,6 +1899,89 @@ async def test_list_radio_stations_sorts_by_clickcount_and_trims_to_limit():
     assert "mcp-weather-simple" in last_req.headers.get("user-agent", "")
 
 
+# ── calculate (safe AST walker) ───────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "expr,expected",
+    [
+        ("2 + 3", 5),
+        ("3847 * 29", 111563),                        # 4-digit × 2-digit
+        ("2450 * 0.15", 367.5),                       # percentage
+        ("(300 + 50) * 1.08 / 2", 189.0),             # chained
+        ("2 ** 10", 1024),                            # power
+        ("pow(2, 10)", 1024),                         # builtin pow
+        ("hypot(3, 4)", 5.0),                         # geometry primitive
+        ("abs(-42)", 42),
+        ("round(3.14159, 2)", 3.14),
+        ("min(3, 1, 2)", 1),
+        ("max(3, 1, 2)", 3),
+        ("factorial(5)", 120),
+        ("gcd(12, 18)", 6),
+        ("-5 + 3", -2),                               # unary
+        ("+5", 5),
+    ],
+)
+async def test_calculate_happy_path(expr, expected):
+    import server as srv
+    r = await srv.calculate(expr)
+    assert r.get("error") is None, f"unexpected error on {expr!r}: {r}"
+    assert r["expression"] == expr
+    assert abs(r["result"] - expected) < 1e-9 if isinstance(expected, float) else r["result"] == expected
+
+
+async def test_calculate_circle_area_via_pi_constant():
+    import math
+    import server as srv
+    r = await srv.calculate("pi * 5**2")
+    assert r["result"] == pytest.approx(math.pi * 25, rel=1e-12)
+
+
+async def test_calculate_trig_via_radians():
+    import math
+    import server as srv
+    r = await srv.calculate("sin(radians(30))")
+    assert r["result"] == pytest.approx(0.5, rel=1e-9)
+
+
+@pytest.mark.parametrize(
+    "expr,error_fragment",
+    [
+        ("foo + 1",                      "unknown name"),           # identifier
+        ("math.sqrt(2)",                 "attribute access"),       # attribute
+        ("__import__('os')",             "unknown function"),       # dunder
+        ("open('/etc/passwd')",          "unknown function"),       # builtin fn not in whitelist
+        ("x = 5",                         "syntax error"),           # assignment
+        ("[1, 2, 3]",                    "expression node not allowed"),  # list
+        ("{'a': 1}",                     "expression node not allowed"),  # dict
+        ("'hello'",                      "only numeric literals"),  # string
+        ("1 if True else 2",             "expression node not allowed"),  # ternary
+        ("lambda x: x",                  "expression node not allowed"),  # lambda
+    ],
+)
+async def test_calculate_rejects_unsafe_expressions(expr, error_fragment):
+    """Every non-arithmetic AST shape must be rejected with a clear
+    message. The rejections are the whole security story of this tool:
+    no `eval()`, no attribute access, no imports, no names outside the
+    constants whitelist. Regression guard against accidentally adding
+    an escape hatch to the walker later."""
+    import server as srv
+    r = await srv.calculate(expr)
+    assert "error" in r, f"expected error for {expr!r}, got {r}"
+    assert error_fragment in r["error"], (
+        f"error message for {expr!r} ({r['error']!r}) should mention {error_fragment!r}"
+    )
+    # Refusals disable relay — the model must not fabricate a result.
+    assert r["relay_to_user"] is False
+
+
+async def test_calculate_division_by_zero_is_handled_gracefully():
+    import server as srv
+    r = await srv.calculate("1 / 0")
+    assert "division by zero" in r["error"]
+    assert r["relay_to_user"] is False
+
+
 # ── Router prototype (MCP_ROUTER_MODE=list_changed) ───────────────────────
 
 
@@ -1965,7 +2048,7 @@ def test_router_mode_explicit_off_leaves_full_monolith(monkeypatch):
     assert srv.mcp.settings.stateless_http is True
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert "select_domain" not in names
-    assert len(names) == 23
+    assert len(names) == 24
 
 
 def test_router_mode_default_is_fat_tools_lean(monkeypatch):
@@ -1989,7 +2072,7 @@ def test_router_mode_default_is_fat_tools_lean(monkeypatch):
     # ones; list_tools filter is what hides the narrow set from clients.
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert {"weather", "geo", "knowledge", "radio"}.issubset(names)
-    assert len(names) == 27
+    assert len(names) == 28
 
 
 @pytest.mark.asyncio
@@ -2015,7 +2098,7 @@ async def test_router_mode_fat_tools_exposes_four_domain_tools(monkeypatch):
         all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
         assert {"weather", "geo", "knowledge", "radio"}.issubset(all_names)
         assert "get_current_weather_in_city" in all_names  # still registered
-        assert len(all_names) == 27
+        assert len(all_names) == 28
 
         from mcp.types import ListToolsRequest
 

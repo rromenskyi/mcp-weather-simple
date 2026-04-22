@@ -157,6 +157,20 @@ cases:
   - prompt: "Нормализуй адрес: Бульвар Лобановского, 23, Киев"
     expected_tool: resolve_address
 
+  # ── Calculator (added 2026-04-22) ──────────────────────────────────────
+  # Small-LLM arithmetic is unreliable on 4+ digit multiplication,
+  # percentages, and geometry formulas — `calculate` closes that gap.
+  # These cases verify the model picks the tool rather than answering
+  # from memory. Mix of EN/RU, plain / percentage / geometry shapes.
+  - prompt: "What's 3847 times 29?"
+    expected_tool: calculate
+  - prompt: "Сколько будет 15% от 2450?"
+    expected_tool: calculate
+  - prompt: "Give me the area of a circle with radius 5."
+    expected_tool: calculate
+  - prompt: "Площадь круга радиусом 7 метров"
+    expected_tool: calculate
+
 # Minimum hit-rate to consider the model "dialed in" for this surface.
 # Set below 1.0 because LLMs are not deterministic even at T=0 — a
 # single spurious tool pick is not a regression. Tightened over time
