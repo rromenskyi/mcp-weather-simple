@@ -1784,34 +1784,73 @@ async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
     include "что википедия говорит про X", "расскажи про X",
     "кто такой X", "что такое X", "расскажи о X".
 
-    `lang` is a Wikipedia language code ("en", "uk", "de", "ru"…);
-    pick it based on the language the user wrote the query in, not
-    the subject — Wikipedia has an article in each language, the
-    English one is the biggest. Title can be a name or a URL-slug
-    ("Kyiv", "Beverly_Hills"); pass the literal phrase the user said
-    and Wikipedia's redirect machinery will usually find the right
-    page.
+    `lang` is a Wikipedia language code ("en", "uk", "de", "ru"…).
+    Pass your best guess; the server also auto-tries language
+    fallbacks based on the title's script — a Cyrillic title with
+    `lang="en"` would 404 on en.wiki, so we silently retry on
+    ru.wiki / uk.wiki before giving up. The response reports which
+    `lang` actually returned the hit. Title can be a name or a
+    URL-slug ("Kyiv", "Beverly_Hills", "соль"); pass the literal
+    phrase the user said — Wikipedia redirects handle the rest.
     """
     safe_title = title.replace(" ", "_")
-    url = WIKIPEDIA_SUMMARY_URL.format(lang=lang, title=safe_title)
-    data = await _fetch_json(
-        url,
-        service="Wikipedia",
-        timeout=5.0,
-        # Wikipedia's REST API enforces its User-Agent ToS — a request
-        # without a descriptive UA returns HTTP 403 ("please provide a
-        # unique User-Agent with contact info"). Share the same repo-
-        # identifying string with radio-browser / OSM for simplicity;
-        # Wikipedia only cares that it's descriptive, not exclusive.
-        headers={"Accept": "application/json", "User-Agent": RADIO_BROWSER_UA},
-    )
-    return _respond({
-        "title": data.get("title"),
-        "description": data.get("description"),
-        "extract": data.get("extract"),
-        "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
-        "lang": lang,
-    })
+    # Build the language chain:
+    #   1. Caller's explicit `lang` first (they may know better).
+    #   2. Then the script-detected chain for the title — covers the
+    #      "Cyrillic title with default lang=en" 404 we hit live on
+    #      2026-04-21 ("соль"). `_detect_query_languages` returns an
+    #      ordered chain per script (Cyrillic → ru, uk).
+    #   3. Always fall through to "en" as last resort — Wikipedia's
+    #      English corpus is the largest and has redirect coverage.
+    # Deduplicate while preserving first-appearance order.
+    seen: set[str] = set()
+    chain: list[str] = []
+    for candidate in [lang, *_detect_query_languages(title), "en"]:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            chain.append(candidate)
+
+    # Wikipedia's REST API enforces its User-Agent ToS — a request
+    # without a descriptive UA returns HTTP 403 ("please provide a
+    # unique User-Agent with contact info"). Share the same repo-
+    # identifying string with radio-browser / OSM for simplicity;
+    # Wikipedia only cares that it's descriptive, not exclusive.
+    headers = {"Accept": "application/json", "User-Agent": RADIO_BROWSER_UA}
+
+    last_exc: Exception | None = None
+    for candidate_lang in chain:
+        url = WIKIPEDIA_SUMMARY_URL.format(lang=candidate_lang, title=safe_title)
+        try:
+            data = await _fetch_json(
+                url,
+                service="Wikipedia",
+                timeout=5.0,
+                headers=headers,
+            )
+        except RuntimeError as e:
+            # `_fetch_json` wraps upstream 4xx / 5xx / timeout as
+            # RuntimeError. 404 on `/page/summary/<title>` means this
+            # lang-wiki doesn't have the article — try the next lang.
+            # Keep the last exception so we can raise it if every
+            # candidate misses.
+            last_exc = e
+            continue
+        return _respond({
+            "title": data.get("title"),
+            "description": data.get("description"),
+            "extract": data.get("extract"),
+            "url": (data.get("content_urls") or {}).get("desktop", {}).get("page"),
+            "lang": candidate_lang,
+            "lang_chain_tried": chain,
+        })
+
+    if last_exc is not None:
+        raise last_exc
+    # Fell through without any request — means chain was empty, which
+    # shouldn't happen because "en" is always appended. Belt-and-
+    # suspenders error so an unexpected empty chain doesn't silently
+    # return None.
+    raise RuntimeError(f"Wikipedia: no lang candidates tried for title={title!r}")
 
 
 @mcp.tool()
