@@ -2036,3 +2036,60 @@ async def test_fat_weather_dispatches_to_underlying_impl(monkeypatch):
     finally:
         monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
         importlib.reload(srv)
+
+
+def test_narrow_to_fat_map_covers_every_registered_tool():
+    """`fat_tools_map.NARROW_TO_FAT` must map every narrow @mcp.tool
+    in server.py exactly once. Drift here silently breaks the eval
+    scorer in fat mode — kill it at test time."""
+    import fat_tools_map
+    import server
+
+    registered = {t.name for t in server.mcp._tool_manager.list_tools()}
+    mapped = set(fat_tools_map.NARROW_TO_FAT.keys())
+    missing = registered - mapped
+    extra = mapped - registered
+    assert not missing, f"NARROW_TO_FAT missing narrow tools: {sorted(missing)}"
+    assert not extra, f"NARROW_TO_FAT references unknown tools: {sorted(extra)}"
+
+    # Every mapped fat tool name must be one of the 4 known domains.
+    fat_tool_names = {fat for fat, _ in fat_tools_map.NARROW_TO_FAT.values()}
+    assert fat_tool_names == {"weather", "geo", "knowledge", "radio"}, (
+        f"unexpected fat tool name(s): {fat_tool_names}"
+    )
+
+
+@pytest.mark.parametrize(
+    "narrow,canonical",
+    [
+        ("get_current_weather_in_city", "weather(current_in_city)"),
+        ("get_wikipedia_summary",       "knowledge(wikipedia)"),
+        ("list_radio_stations",         "radio"),
+        ("get_current_date",            "geo(date_in_timezone)"),
+    ],
+)
+def test_eval_canonicalise_expected_fat_mode(monkeypatch, narrow, canonical):
+    """The eval scorer's `_canonicalise_expected` rewrites narrow tool
+    names into `fat(action)` strings (or bare fat name for radio) when
+    `MCP_ROUTER_MODE=fat_tools`. Narrow mode passes through unchanged."""
+    import importlib.util
+    from pathlib import Path
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools")
+    spec = importlib.util.spec_from_file_location(
+        "eval_tc_test",
+        Path(__file__).parent.parent / "tests" / "integration" / "eval_tool_calling.py",
+    )
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m._load_fat_mapping_if_enabled()
+    assert m._FAT_MODE is True
+    assert m._canonicalise_expected(narrow) == canonical
+
+    # Narrow-mode path: reload without the env, canonicalise is a no-op.
+    monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+    m2 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m2)
+    m2._load_fat_mapping_if_enabled()
+    assert m2._FAT_MODE is False
+    assert m2._canonicalise_expected(narrow) == narrow
