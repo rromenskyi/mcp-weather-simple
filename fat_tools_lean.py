@@ -162,13 +162,14 @@ _KNOWLEDGE_ACTIONS = Literal[
     "country_info",
     "public_holidays",
     "convert_currency",
+    "calculate",
 ]
 
 
 async def knowledge(
     action: _KNOWLEDGE_ACTIONS, params: dict | None = None
 ) -> dict:
-    """Wikipedia / country facts / public holidays / currency conversion.
+    """Wikipedia / country facts / public holidays / currency / arithmetic.
 
     Actions and their params:
       - `wikipedia`:         {"title": str, "lang"?: str="en"} — ISO-639 lang code.
@@ -176,6 +177,15 @@ async def knowledge(
       - `public_holidays`:   {"country_code": str, "year"?: int=current} — ISO-3166-1 alpha-2.
       - `convert_currency`:  {"amount": float, "from_currency": str, "to_currency": str}
                               — ISO-4217 currency codes.
+      - `calculate`:         {"expression": str} — AST-safe arithmetic, not `eval`.
+                              **Use for ANY math** — model arithmetic unreliable on 4+
+                              digits and chains. Geometry via explicit formulas
+                              (`pi*r**2`, `hypot(a,b)`, `(4/3)*pi*r**3`). Supports
+                              sqrt/cbrt/log/exp/sin/cos/tan + inverses, floor/ceil/
+                              round, radians/degrees, hypot, gcd/lcm/factorial,
+                              min/max/abs/pow. Constants pi/e/tau. No units, no
+                              unresolved symbols. Examples: `"3847 * 29"`,
+                              `"2450 * 0.15"`, `"pi * 5**2"`, `"hypot(3, 4)"`.
     """
     import server
     p = params or {}
@@ -193,6 +203,9 @@ async def knowledge(
         return await server.convert_currency(
             p["amount"], p["from_currency"], p["to_currency"]
         )
+    if action == "calculate":
+        _require(p, "expression")
+        return await server.calculate(p["expression"])
     raise ValueError(f"knowledge: unknown action {action!r}")
 
 

@@ -211,6 +211,7 @@ _KNOWLEDGE_ACTIONS = Literal[
     "country_info",
     "public_holidays",
     "convert_currency",
+    "calculate",
 ]
 
 
@@ -224,8 +225,9 @@ async def knowledge(
     amount: float | None = None,
     from_currency: str | None = None,
     to_currency: str | None = None,
+    expression: str | None = None,
 ) -> dict:
-    """Wikipedia, country facts, public-holiday calendar, currency conversion.
+    """Wikipedia, country facts, public holidays, currency, arithmetic.
 
     Actions:
       - `wikipedia` — concise summary of a Wikipedia article.
@@ -239,6 +241,18 @@ async def knowledge(
           (default current year).
       - `convert_currency` — convert between currencies at today's ECB rate.
           Needs: `amount`, `from_currency` (ISO-4217), `to_currency` (ISO-4217).
+      - `calculate` — evaluate an arithmetic expression (AST-safe,
+          not `eval`). **Use for ANY math the user asks** — model
+          arithmetic is unreliable on 4+ digits and chained formulas.
+          Geometry via explicit formulas (circle area `pi*r**2`,
+          hypotenuse `hypot(a,b)`, sphere volume `(4/3)*pi*r**3`).
+          Functions: sqrt / cbrt / log / log2 / log10 / exp /
+          sin / cos / tan + inverses / floor / ceil / round /
+          radians / degrees / hypot / gcd / lcm / factorial /
+          min / max / abs / pow. Constants: pi, e, tau.
+          Needs: `expression` (no units, no unresolved symbols).
+          Examples: `"3847 * 29"`, `"2450 * 0.15"`, `"pi * 5**2"`,
+          `"hypot(3, 4)"`, `"sqrt(2450) + pi"`.
     """
     import server  # lazy — see module docstring
     if action == "wikipedia":
@@ -255,6 +269,9 @@ async def knowledge(
             amount=amount, from_currency=from_currency, to_currency=to_currency
         )
         return await server.convert_currency(amount, from_currency, to_currency)
+    if action == "calculate":
+        _require(expression=expression)
+        return await server.calculate(expression)
     raise ValueError(f"knowledge: unknown action {action!r}")
 
 

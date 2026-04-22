@@ -41,4 +41,7 @@ NARROW_TO_FAT: dict[str, tuple[str, str | None]] = {
     "convert_currency":                  ("knowledge", "convert_currency"),
     # radio (single entry, no action discriminator)
     "list_radio_stations":               ("radio", None),
+    # knowledge — arithmetic calculator (added 2026-04-22 for small-LLM
+    # math reliability; see `server._safe_eval` for the whitelist).
+    "calculate":                         ("knowledge", "calculate"),
 }

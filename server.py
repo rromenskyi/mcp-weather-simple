@@ -1981,6 +1981,185 @@ async def convert_currency(
     })
 
 
+# ── calculator (safe AST walker) ─────────────────────────────────────────
+#
+# Small-LLM arithmetic is reliably wrong past 2-3 digit × 2-3 digit and
+# anything chained ("A plus B percent of C"). A trivial tool closes the
+# accuracy gap. AST-walker impl (NOT `eval()`) so the tool surface
+# doesn't accidentally become a Python-code sandbox escape — we allow
+# numeric literals, the six arithmetic operators, parentheses, unary
+# ± and a safelisted set of `math.*` functions / constants.
+#
+# Deliberately narrow: no imports, no attribute access, no assignments,
+# no comprehensions, no f-strings, no function definitions. Anything
+# not in the whitelist raises a clear ValueError with the expression
+# echoed back so the model can self-correct on the next turn.
+
+import ast as _ast
+import math as _math
+
+_SAFE_MATH_FUNCS: frozenset[str] = frozenset({
+    "sqrt", "cbrt", "log", "log2", "log10", "exp",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh",
+    "floor", "ceil", "trunc", "fabs",
+    "degrees", "radians",
+    "gcd", "lcm", "factorial", "hypot",
+})
+_SAFE_BUILTINS: dict[str, object] = {
+    "abs": abs,
+    "round": round,
+    "min": min,
+    "max": max,
+    "pow": pow,
+    "sum": sum,
+}
+_SAFE_CONSTS: frozenset[str] = frozenset({"pi", "e", "tau", "inf", "nan"})
+
+_SAFE_BINOPS: dict[type, object] = {
+    _ast.Add:      lambda a, b: a + b,
+    _ast.Sub:      lambda a, b: a - b,
+    _ast.Mult:     lambda a, b: a * b,
+    _ast.Div:      lambda a, b: a / b,
+    _ast.FloorDiv: lambda a, b: a // b,
+    _ast.Mod:      lambda a, b: a % b,
+    _ast.Pow:      lambda a, b: a ** b,
+}
+_SAFE_UNARYOPS: dict[type, object] = {
+    _ast.USub: lambda v: -v,
+    _ast.UAdd: lambda v: +v,
+}
+
+
+def _safe_eval(expression: str) -> float | int:
+    """Evaluate `expression` as a numeric formula. Whitelist-only AST walk.
+
+    Raises ValueError on any node shape outside the whitelist
+    (identifiers, function calls, operators). The error message names
+    the specific forbidden construct so the model can fix the call
+    rather than retrying an identical broken expression (which the
+    #19 loop detector would otherwise short-circuit).
+    """
+    try:
+        tree = _ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"syntax error in expression: {exc.msg}") from None
+    return _safe_eval_node(tree.body)
+
+
+def _safe_eval_node(node: _ast.AST) -> float | int:
+    if isinstance(node, _ast.Constant):
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        raise ValueError(f"only numeric literals allowed, got {type(node.value).__name__}")
+    if isinstance(node, _ast.BinOp):
+        op = _SAFE_BINOPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"operator not allowed: {type(node.op).__name__}")
+        return op(_safe_eval_node(node.left), _safe_eval_node(node.right))
+    if isinstance(node, _ast.UnaryOp):
+        op = _SAFE_UNARYOPS.get(type(node.op))
+        if op is None:
+            raise ValueError(f"unary op not allowed: {type(node.op).__name__}")
+        return op(_safe_eval_node(node.operand))
+    if isinstance(node, _ast.Name):
+        if node.id in _SAFE_CONSTS:
+            return getattr(_math, node.id)
+        raise ValueError(
+            f"unknown name {node.id!r}; constants allowed: {sorted(_SAFE_CONSTS)}"
+        )
+    if isinstance(node, _ast.Call):
+        func = node.func
+        if not isinstance(func, _ast.Name):
+            raise ValueError("only bare function calls allowed (no attribute access)")
+        name = func.id
+        # Validate the function name BEFORE evaluating args. An unknown
+        # `__import__(...)` with a string literal arg would otherwise
+        # error on the string-not-numeric check first, leaking an
+        # error message that blames the arg when the real issue is the
+        # function. Order matters for clarity, not security — either
+        # rejection stops the walk.
+        if name not in _SAFE_MATH_FUNCS and name not in _SAFE_BUILTINS:
+            raise ValueError(
+                f"unknown function {name!r}; math funcs: {sorted(_SAFE_MATH_FUNCS)}; "
+                f"builtins: {sorted(_SAFE_BUILTINS)}"
+            )
+        if node.keywords:
+            raise ValueError(f"keyword arguments not allowed for {name!r}")
+        args = [_safe_eval_node(a) for a in node.args]
+        if name in _SAFE_MATH_FUNCS:
+            return getattr(_math, name)(*args)
+        return _SAFE_BUILTINS[name](*args)
+    raise ValueError(f"expression node not allowed: {type(node).__name__}")
+
+
+@mcp.tool()
+@_loop_guarded
+async def calculate(expression: str) -> dict:
+    """Evaluate an arithmetic expression. Use for any math the user asks.
+
+    **Use this for ANY numeric answer you would otherwise compute from
+    memory.** Small-LLM arithmetic is reliably wrong on 4+ digit
+    multiplications, chained percentages, and non-trivial rounding.
+    Cheaper to call this than to guess.
+
+    Supported:
+      - Arithmetic: `+ - * / // % **`, unary `-`, parentheses.
+      - Constants: `pi`, `e`, `tau`, `inf`, `nan`.
+      - `math.*` functions: `sqrt`, `cbrt`, `log` (natural),
+        `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`,
+        `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `floor`, `ceil`,
+        `trunc`, `fabs`, `degrees`, `radians`, `gcd`, `lcm`,
+        `factorial`, `hypot`.
+      - Builtins: `abs`, `round`, `min`, `max`, `pow`, `sum`.
+
+    Example expressions by shape:
+      - Plain:          `3847 * 29`, `(12345 + 678) / 9`
+      - Percentages:    `2450 * 0.15`, `2450 * 15 / 100`
+      - Chained:        `(300 + 50) * 1.08 / 2`
+      - Powers/roots:   `2 ** 10`, `sqrt(2450)`, `cbrt(27)`
+      - Logs:           `log10(1000)`, `log(8, 2)`
+      - Trig:           `sin(radians(30))`, `atan2(1, 1)`
+
+    Geometry patterns (no dedicated functions — just express):
+      - Circle area:        `pi * r**2`      e.g. `pi * 5**2`
+      - Circle circum.:     `2 * pi * r`     e.g. `2 * pi * 5`
+      - Triangle area:      `0.5 * b * h`
+      - Rectangle area:     `w * h`
+      - Sphere volume:      `(4/3) * pi * r**3`
+      - Cylinder volume:    `pi * r**2 * h`
+      - Cube volume:        `s**3`
+      - Hypotenuse:         `hypot(a, b)`
+      - Distance (2D):      `hypot(x2-x1, y2-y1)`
+      - Angle deg→rad:      `radians(30)`
+      - Angle rad→deg:      `degrees(pi / 4)`
+
+    NOT supported — errors with a clear message: symbolic math (no
+    `x` / `y` / unresolved names), units (`5 meters` — strip the unit
+    yourself), currency (use the currency-conversion tool),
+    attribute access (`math.sqrt(2)` — write `sqrt(2)` instead),
+    keyword arguments, lists / sequences.
+
+    Args:
+      expression: formula, no leading `=`, no units.
+    """
+    try:
+        value = _safe_eval(expression)
+    except ValueError as exc:
+        return _respond(
+            {"expression": expression, "error": str(exc)},
+            relay_to_user=False,
+            guidance="Expression rejected. Rewrite using plain arithmetic and listed functions/constants, or ask the user to clarify. Do not retry an identical expression.",
+        )
+    except ZeroDivisionError:
+        return _respond(
+            {"expression": expression, "error": "division by zero"},
+            relay_to_user=False,
+            guidance="Division by zero is undefined. Ask the user whether they meant something else.",
+        )
+    return _respond({"expression": expression, "result": value})
+
+
 @mcp.tool()
 @_loop_guarded
 async def list_radio_stations(
@@ -2430,6 +2609,7 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "get_public_holidays",
         "convert_currency",
         "list_radio_stations",
+        "calculate",
     ),
 }
 
