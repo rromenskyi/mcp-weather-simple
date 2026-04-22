@@ -2071,7 +2071,15 @@ def test_narrow_to_fat_map_covers_every_registered_tool():
 def test_eval_canonicalise_expected_fat_mode(monkeypatch, narrow, canonical):
     """The eval scorer's `_canonicalise_expected` rewrites narrow tool
     names into `fat(action)` strings (or bare fat name for radio) when
-    `MCP_ROUTER_MODE=fat_tools`. Narrow mode passes through unchanged."""
+    `MCP_ROUTER_MODE=fat_tools`. Narrow mode passes through unchanged.
+
+    Loading `eval_tool_calling.py` pulls in `yaml` at module scope, which
+    only lives in the `eval` extra — the CI unit-test job syncs only
+    `--extra test`. Skip here so this test is meaningful locally (where
+    `uv sync --extra test --extra eval` is typical) and invisible in CI
+    until the unit job starts pulling eval deps too.
+    """
+    pytest.importorskip("yaml", reason="requires the 'eval' extra (pyyaml)")
     import importlib.util
     from pathlib import Path
 
