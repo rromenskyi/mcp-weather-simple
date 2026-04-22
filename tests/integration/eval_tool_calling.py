@@ -131,7 +131,18 @@ async def run_case(
         # Deterministic: minimum temperature + fixed seed so the eval is
         # reproducible across CI runs. Otherwise consecutive runs on the
         # same model can disagree on marginal cases.
-        "options": {"temperature": 0, "seed": 42},
+        #
+        # num_predict caps runaway generation: without it, a model that
+        # refuses to emit a tool_call and drifts into prose / reasoning
+        # will generate until EOS or the context limit. With stream=False
+        # that blocks the HTTP call for the full 240s timeout per case;
+        # worse, Ollama keeps generating after the client disconnect, so
+        # subsequent cases queue behind the stuck one and the whole chunk
+        # stalls for 40+ min. 512 tokens is a comfortable ceiling: real
+        # tool_call JSON is 20-50 tokens, so legitimate calls finish well
+        # under the cap; illegitimate rambles get cut off and the case is
+        # scored as "no tool_call" instead of hanging.
+        "options": {"temperature": 0, "seed": 42, "num_predict": 512},
     }
     t0 = time.monotonic()
     r = await client.post(f"{ollama_url}/api/chat", json=payload)
