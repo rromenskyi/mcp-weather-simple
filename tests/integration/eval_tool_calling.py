@@ -353,18 +353,33 @@ async def main_async(args: argparse.Namespace) -> int:
         # times out on a slow runner (14b on 2-vCPU has 5-10 min
         # catalog prefill), we log and proceed; the first scored
         # case gets its own generous timeout to catch up.
+        # Phase 1 payload mirrors Phase 2's thinking-mode suppression for
+        # qwen3 family. Without it the "." probe drags qwen3.5 into a
+        # multi-thousand-token reasoning trace even without tools —
+        # num_predict=4 only caps visible output, thinking tokens slip
+        # past on the Ollama versions under test. On L4 that's ~25-40s
+        # per probe; across up to 10 retries the user sees "Phase 1...
+        # thiiiiinking" for minutes before the job moves on.
+        phase1_qwen3 = _is_qwen3_family(args.model)
+        phase1_content = (
+            ". /no_think" if _supports_no_think_prompt_signal(args.model) else "."
+        )
+        phase1_payload: dict = {
+            "model": args.model,
+            "messages": [{"role": "user", "content": phase1_content}],
+            "stream": False,
+            "options": {"num_predict": 4},
+        }
+        if phase1_qwen3:
+            phase1_payload["think"] = False
+
         print("Phase 1/2: readiness probe (minimal prompt, no tools)...", flush=True)
         for attempt in range(1, 11):
             t0 = time.monotonic()
             try:
                 r = await client.post(
                     f"{args.ollama_url}/api/chat",
-                    json={
-                        "model": args.model,
-                        "messages": [{"role": "user", "content": "."}],
-                        "stream": False,
-                        "options": {"num_predict": 4},
-                    },
+                    json=phase1_payload,
                     timeout=60.0,
                 )
                 r.raise_for_status()
