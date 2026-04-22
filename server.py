@@ -2437,21 +2437,30 @@ def _install_router() -> None:
         `docs/tool-catalog-scaling.md` for the theory and known client
         limitations (mcphost / Open WebUI don't honour the notification).
       - ``fat_tools``: four fat domain-tools (`weather` / `geo` /
-        `knowledge` / `radio`) dispatching via `action` enum.
-        Works with static-catalog clients — no protocol magic.
-        Tradeoff: model picks from 4 tools instead of 23 (prefill win),
-        but must route internally via the `action` enum (may hurt
-        small-model reliability; that's what the experiment measures).
+        `knowledge` / `radio`) dispatching via `action` enum + per-action
+        named kwargs. Works with static-catalog clients — no protocol
+        magic. Catalog ~1885 tokens (−64% vs monolith) on the current
+        23-tool set.
+      - ``fat_tools_lean``: same four tools but signature collapses to
+        `(action, params={})` — drops the pydantic-generated
+        nullability schema on every optional kwarg (fat_tools' 1885
+        tokens include ~1000 of that shell). Target catalog
+        ~900-1000 tokens. Tradeoff: model sees `params` as a plain
+        object with no type hints — has to learn the per-action
+        param shape from the docstring alone.
     """
     if ROUTER_MODE == "off":
         return
     if ROUTER_MODE == "fat_tools":
         _install_fat_tools_mode()
         return
+    if ROUTER_MODE == "fat_tools_lean":
+        _install_fat_tools_lean_mode()
+        return
     if ROUTER_MODE != "list_changed":
         raise RuntimeError(
             f"MCP_ROUTER_MODE={ROUTER_MODE!r} unrecognised; expected "
-            "one of: off, list_changed, fat_tools."
+            "one of: off, list_changed, fat_tools, fat_tools_lean."
         )
 
     # Sanity-check the domain map against the registered tool names so
@@ -2572,6 +2581,38 @@ def _install_fat_tools_mode() -> None:
         return [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
 
     mcp._mcp_server.list_tools()(_fat_list_tools)
+
+
+def _install_fat_tools_lean_mode() -> None:
+    """Register the 4 lean fat-domain tools (signature: action + params dict).
+
+    Same list_tools-filter machinery as ``_install_fat_tools_mode``, just
+    registering the `fat_tools_lean.*` variants (which share the fat-
+    tool names `weather` / `geo` / `knowledge` / `radio`). Tool-
+    manager registration is mutually exclusive — lean and non-lean
+    can't both be active because FastMCP would reject the name clash.
+    """
+    import fat_tools_lean
+
+    fat_tools_lean.install_fat_tools_lean(mcp)
+
+    all_registered = {t.name for t in mcp._tool_manager.list_tools()}
+    required = _FAT_TOOL_NAMES | {
+        name for names in _ROUTER_DOMAINS.values() for name in names
+    }
+    missing = required - all_registered
+    if missing:
+        raise RuntimeError(
+            f"fat-tools-lean mode missing expected registrations: {sorted(missing)}"
+        )
+
+    _base_list_tools = mcp.list_tools
+
+    async def _lean_list_tools():
+        all_tools = await _base_list_tools()
+        return [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+
+    mcp._mcp_server.list_tools()(_lean_list_tools)
 
 
 _install_router()

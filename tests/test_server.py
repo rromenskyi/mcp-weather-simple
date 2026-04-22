@@ -2003,6 +2003,77 @@ async def test_router_mode_fat_tools_exposes_four_domain_tools(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_router_mode_fat_tools_lean_exposes_four_with_params_dict(monkeypatch):
+    """`MCP_ROUTER_MODE=fat_tools_lean` registers the same 4 fat names
+    but each takes only `(action, params)` — schema shrinks ~50% vs
+    plain fat_tools because the per-kwarg nullability shell goes away.
+    """
+    import importlib
+
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
+    srv = importlib.reload(srv)
+    try:
+        assert srv.ROUTER_MODE == "fat_tools_lean"
+
+        all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert {"weather", "geo", "knowledge", "radio"}.issubset(all_names)
+        assert "get_current_weather_in_city" in all_names  # still registered
+
+        from mcp.types import ListToolsRequest
+        handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
+        req = ListToolsRequest(method="tools/list")
+        tools = (await handler(req)).root.tools
+        assert sorted(t.name for t in tools) == ["geo", "knowledge", "radio", "weather"]
+
+        # The lean schema has exactly two top-level props (action, params)
+        # on the enum-bearing tools — that's the whole point of the variant.
+        weather = next(t for t in tools if t.name == "weather")
+        assert set(weather.inputSchema.get("properties", {}).keys()) == {"action", "params"}
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)
+
+
+@pytest.mark.asyncio
+async def test_fat_tools_lean_weather_dispatch_via_params_dict(monkeypatch):
+    """Smoke the lean `weather` dispatcher — `params` dict flows through
+    to the narrow impl with required / optional keys honoured."""
+    import importlib
+
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
+    srv = importlib.reload(srv)
+    try:
+        import fat_tools_lean
+
+        sentinel = {"ok": "delegated"}
+
+        async def fake_impl(city, country_code=None):
+            assert city == "Kyiv" and country_code == "UA"
+            return sentinel
+
+        monkeypatch.setattr(srv, "get_current_weather_in_city", fake_impl)
+        result = await fat_tools_lean.weather(
+            action="current_in_city", params={"city": "Kyiv", "country_code": "UA"}
+        )
+        assert result is sentinel
+
+        # Missing required param raises with a clear message.
+        with pytest.raises(ValueError, match="missing required"):
+            await fat_tools_lean.weather(action="current_in_city", params={})
+
+        # Unknown action fails closed.
+        with pytest.raises(ValueError, match="unknown action"):
+            await fat_tools_lean.weather(action="does_not_exist", params={})  # type: ignore[arg-type]
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)
+
+
+@pytest.mark.asyncio
 async def test_fat_weather_dispatches_to_underlying_impl(monkeypatch):
     """Smoke-test the dispatcher in `fat_tools.weather` — confirms the
     `action` enum flows to the correct narrow implementation."""
