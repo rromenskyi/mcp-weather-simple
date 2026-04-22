@@ -383,16 +383,22 @@ async def main_async(args: argparse.Namespace) -> int:
             f"(chunk {args.chunk_index + 1}/{args.chunk_count})"
         )
 
-    # Fetch the tool catalog once — it doesn't change between cases.
+    # Environment-level failures exit 2 (distinct from 1 = threshold
+    # failure) so CI / workflow jobs actually fail instead of being
+    # marked "success" on a silent skip. Lesson from 2026-04-22: when
+    # the MCP server crashed at startup in fat_tools mode (see #54),
+    # eval's "SKIP: MCP unreachable" printed and `return 0` hid the
+    # infrastructure break — workflow reported green while nothing was
+    # actually tested. These are real errors, not skips.
     try:
         async with MCPClient(args.mcp_url) as mcp:
             tools = await mcp.tools_list()
     except Exception as e:
-        print(f"SKIP: MCP unreachable at {args.mcp_url} ({type(e).__name__}: {e})")
-        return 0
+        print(f"FAIL: MCP unreachable at {args.mcp_url} ({type(e).__name__}: {e})")
+        return 2
     if not tools:
-        print(f"SKIP: MCP returned an empty tool list from {args.mcp_url}")
-        return 0
+        print(f"FAIL: MCP returned an empty tool list from {args.mcp_url}")
+        return 2
     print(f"Loaded {len(tools)} tools from {args.mcp_url}")
     ollama_tools = mcp_tools_to_ollama(tools)
 
@@ -403,12 +409,12 @@ async def main_async(args: argparse.Namespace) -> int:
             probe = await client.get(f"{args.ollama_url}/api/tags")
             probe.raise_for_status()
         except Exception as e:
-            print(f"SKIP: Ollama unreachable at {args.ollama_url} ({type(e).__name__}: {e})")
-            return 0
+            print(f"FAIL: Ollama unreachable at {args.ollama_url} ({type(e).__name__}: {e})")
+            return 2
         installed = [m["name"] for m in probe.json().get("models", [])]
         if args.model not in installed:
-            print(f"SKIP: model {args.model!r} not installed on this Ollama. Have: {installed}")
-            return 0
+            print(f"FAIL: model {args.model!r} not installed on this Ollama. Have: {installed}")
+            return 2
 
         # Warm-up runs in TWO independent phases so we can tell which
         # kind of "not ready yet" we hit. Single-phase warmup (what
