@@ -35,22 +35,33 @@ features of headroom.
 ## Experiment results (2026-04-22)
 
 Three router variants built, gated behind `MCP_ROUTER_MODE`
-(default `off`). Measured on qwen3.5:9b via eval harness
-(`tests/integration/eval_tool_calling.py`) running against the L4
-self-hosted runner — same 44 cases each.
+(**default flipped to `fat_tools_lean` in the same 2026-04-22 round
+once the numbers below landed**). Measured on qwen3.5:9b via eval
+harness (`tests/integration/eval_tool_calling.py`) running against
+the L4 self-hosted runner — same 44 cases each.
 
 | Mode | Tools visible | Catalog tokens | vs off | Hit rate | Δ hit rate |
 |---|---:|---:|---:|---:|---:|
 | `off` (monolith)     | 23 | 5289 | —    | 41/44 = 93.2 % | baseline |
 | `list_changed`       | dynamic | dynamic | n/a  | **DNF** | clients ignore the notification |
 | `fat_tools`          |  4 | 1885 | **-64 %** | 41/44 = 93.2 % | **0** |
-| `fat_tools_lean`     |  4 | 1090 | **-79 %** | *tbd*          | *tbd*    |
+| `fat_tools_lean` *(default)* | 4 | **1090** | **-79 %** | 41/44 = **93.2 %** | **0** |
 
-The 3 misses on the monolith and `fat_tools` are the same cases in
-both: "What's the capital of Ukraine?" / "столица Нидерландов?" /
+Three identical 93.2 %'s are the **same 3 failures** in every mode:
+"What's the capital of Ukraine?" / "столица Нидерландов?" /
 "Which Springfield is the user asking about?" — the model answers
-from memory instead of tool-calling, which is arguably the right
-call. They cost us nothing that we weren't already paying.
+from memory instead of tool-calling, arguably the right call. Not
+a router artefact.
+
+**Bottom line: ~4200 tokens of prefill bought back (−79 % of
+catalog) for ~100 LOC of `fat_tools_lean.py` + a module-level
+constant, with zero hit-rate regression.** On a 2-vCPU CPU at
+~15 tok/s prefill, that's **4-5 minutes saved on every first-turn
+request**; on GPU it's single-digit seconds but still free. Server
+default is now `fat_tools_lean`; set `MCP_ROUTER_MODE=off` to pin
+the historical monolith surface (nightly eval cron does this so
+baseline trend data stays comparable, and it's the escape hatch if
+a specific client turns out to misbehave on the fat surface).
 
 Conclusions that flipped during the experiments:
 
