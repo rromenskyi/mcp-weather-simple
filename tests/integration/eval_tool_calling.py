@@ -107,6 +107,18 @@ def mcp_tools_to_ollama(tools: list[dict]) -> list[dict]:
     ]
 
 
+def _is_qwen3_family(model: str) -> bool:
+    """Identify qwen3 / qwen3.5 tags that default to thinking mode.
+
+    Qwen3 emits <think>...</think> reasoning blocks before tool_calls by
+    default. On CPU that's 2000-4000 extra tokens per case — enough to
+    blow the per-request timeout before the model ever emits a tool_call.
+    Qwen2.5 and other families have no such mode; we only gate
+    thinking-suppression on qwen3 so legacy baselines stay untouched.
+    """
+    return "qwen3" in model.lower()
+
+
 async def run_case(
     client: httpx.AsyncClient,
     ollama_url: str,
@@ -123,27 +135,31 @@ async def run_case(
     argument that the single-token contract from #14 is designed to
     prevent). Scoring is still name-only; arguments are informational.
     """
+    # For qwen3 belt-and-braces: append `/no_think` to the user content
+    # (recognised by the chat template) AND set `think: false` at the
+    # top level (native toggle in Ollama 0.6+). Either alone should work;
+    # both together survive version skew. For other families the prompt
+    # tail is just noise the model ignores, and `think: false` is a
+    # no-op because their templates don't branch on it.
+    qwen3 = _is_qwen3_family(model)
+    user_content = f"{prompt} /no_think" if qwen3 else prompt
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": user_content}],
         "tools": tools,
         "stream": False,
         # Deterministic: minimum temperature + fixed seed so the eval is
         # reproducible across CI runs. Otherwise consecutive runs on the
         # same model can disagree on marginal cases.
         #
-        # num_predict caps runaway generation: without it, a model that
-        # refuses to emit a tool_call and drifts into prose / reasoning
-        # will generate until EOS or the context limit. With stream=False
-        # that blocks the HTTP call for the full 240s timeout per case;
-        # worse, Ollama keeps generating after the client disconnect, so
-        # subsequent cases queue behind the stuck one and the whole chunk
-        # stalls for 40+ min. 512 tokens is a comfortable ceiling: real
-        # tool_call JSON is 20-50 tokens, so legitimate calls finish well
-        # under the cap; illegitimate rambles get cut off and the case is
-        # scored as "no tool_call" instead of hanging.
+        # num_predict caps runaway generation on non-thinking models.
+        # For qwen3 the thinking disable above is load-bearing — without
+        # it, the model burns the whole 512-token budget on reasoning
+        # and never reaches the tool_call token.
         "options": {"temperature": 0, "seed": 42, "num_predict": 512},
     }
+    if qwen3:
+        payload["think"] = False
     t0 = time.monotonic()
     r = await client.post(f"{ollama_url}/api/chat", json=payload)
     latency = time.monotonic() - t0
@@ -350,17 +366,32 @@ async def main_async(args: argparse.Namespace) -> int:
             )
 
         print("Phase 2/2: prefix-cache prime (full tool catalog, best-effort)...", flush=True)
+        # Warmup payload mirrors the scored-case shape — same thinking
+        # suppression on qwen3. Without it the "." probe still drags the
+        # model into a multi-thousand-token reasoning trace (num_predict=4
+        # only caps visible tokens, thinking tokens slip past on some
+        # Ollama versions) and the whole Phase 2 budget is burned on
+        # nothing useful.
+        qwen3 = _is_qwen3_family(args.model)
+        warmup_payload: dict = {
+            "model": args.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": ". /no_think" if qwen3 else ".",
+                }
+            ],
+            "tools": ollama_tools,
+            "stream": False,
+            "options": {"temperature": 0, "seed": 42, "num_predict": 4},
+        }
+        if qwen3:
+            warmup_payload["think"] = False
         t0 = time.monotonic()
         try:
             r = await client.post(
                 f"{args.ollama_url}/api/chat",
-                json={
-                    "model": args.model,
-                    "messages": [{"role": "user", "content": "."}],
-                    "tools": ollama_tools,
-                    "stream": False,
-                    "options": {"temperature": 0, "seed": 42, "num_predict": 4},
-                },
+                json=warmup_payload,
                 timeout=args.timeout * 2,
             )
             r.raise_for_status()
