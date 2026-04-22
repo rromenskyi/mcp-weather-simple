@@ -1897,3 +1897,70 @@ async def test_list_radio_stations_sorts_by_clickcount_and_trims_to_limit():
     # we always send it with the repo-identifying string.
     last_req = respx.calls.last.request
     assert "mcp-weather-simple" in last_req.headers.get("user-agent", "")
+
+
+# ── Router prototype (MCP_ROUTER_MODE=list_changed) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_router_mode_filters_list_tools_by_active_domain(monkeypatch):
+    """Router mode is opt-in via env; off by default.
+
+    Exercises the three states the filtered `list_tools` handler has to
+    get right:
+      1. no domain selected → only `select_domain` is visible,
+      2. domain selected    → `select_domain` + that domain's tools,
+      3. domain switched    → the OTHER domain's tools (not both).
+    """
+    import importlib
+
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "list_changed")
+    srv = importlib.reload(srv)
+    try:
+        assert srv.ROUTER_MODE == "list_changed"
+        assert srv.mcp.settings.stateless_http is False
+
+        from mcp.types import ListToolsRequest
+
+        handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
+        req = ListToolsRequest(method="tools/list")
+
+        # State 1: fresh session, no domain picked yet.
+        srv._ROUTER_STATE["active"] = None
+        names = sorted(t.name for t in (await handler(req)).root.tools)
+        assert names == ["select_domain"]
+
+        # State 2: weather picked → weather tools + router entry.
+        srv._ROUTER_STATE["active"] = "weather"
+        names = sorted(t.name for t in (await handler(req)).root.tools)
+        assert "select_domain" in names
+        assert "get_current_weather_in_city" in names
+        # Must not leak tools from other domains.
+        assert "get_wikipedia_summary" not in names
+        assert "convert_currency" not in names
+
+        # State 3: switch to knowledge — weather-only tools drop.
+        srv._ROUTER_STATE["active"] = "knowledge"
+        names = sorted(t.name for t in (await handler(req)).root.tools)
+        assert "get_wikipedia_summary" in names
+        assert "get_current_weather_in_city" not in names
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)
+
+
+def test_router_mode_off_leaves_full_monolith(monkeypatch):
+    """Sanity check the default path: no `select_domain`, stateless HTTP."""
+    import importlib
+
+    import server as srv
+
+    monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+    srv = importlib.reload(srv)
+    assert srv.ROUTER_MODE == "off"
+    assert srv.mcp.settings.stateless_http is True
+    names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+    assert "select_domain" not in names
+    assert len(names) == 23
