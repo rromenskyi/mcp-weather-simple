@@ -21,11 +21,20 @@ HOST = os.getenv("MCP_HOST", "0.0.0.0")
 PORT = int(os.getenv("MCP_PORT", "8000"))
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
-# Experimental — see docs/tool-catalog-scaling.md. Default "off" keeps
-# the monolith as advertised to the model. "list_changed" installs the
-# single-entry router and switches the HTTP session to stateful so
-# `notifications/tools/list_changed` can reach the client's SSE stream.
-ROUTER_MODE = os.getenv("MCP_ROUTER_MODE", "off").strip().lower()
+# Default `fat_tools_lean` since 2026-04-22 — see
+# docs/tool-catalog-scaling.md for the measurements. Collapses the
+# 23 narrow tools into 4 fat domain-tools with an `(action, params)`
+# signature; catalog drops 5289 → 1090 tokens (−79%) with zero hit-rate
+# regression on qwen3.5:9b (93.2% both ways). Set `MCP_ROUTER_MODE=off`
+# to get the historical monolith surface — needed for nightly eval
+# baseline continuity and as an escape hatch if any specific client
+# turns out to misbehave on the fat surface.
+#
+# Other modes kept behind this flag: `fat_tools` (fat with named
+# kwargs, +800 tokens vs lean) and `list_changed` (spec-correct
+# dynamic router — confirmed unsupported by mcphost / Open WebUI,
+# kept as a reference implementation only).
+ROUTER_MODE = os.getenv("MCP_ROUTER_MODE", "fat_tools_lean").strip().lower()
 
 # ── Tool-calling policy (#19) ──────────────────────────────────────────────
 #

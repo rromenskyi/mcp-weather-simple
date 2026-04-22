@@ -1951,19 +1951,45 @@ async def test_router_mode_filters_list_tools_by_active_domain(monkeypatch):
         importlib.reload(srv)
 
 
-def test_router_mode_off_leaves_full_monolith(monkeypatch):
-    """Sanity check the default path: no `select_domain`, stateless HTTP."""
+def test_router_mode_explicit_off_leaves_full_monolith(monkeypatch):
+    """Explicit `MCP_ROUTER_MODE=off` restores the historical 23-tool
+    monolith with stateless HTTP. Used by the nightly eval cron to
+    keep baseline trend data comparable to pre-router numbers."""
     import importlib
 
     import server as srv
 
-    monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+    monkeypatch.setenv("MCP_ROUTER_MODE", "off")
     srv = importlib.reload(srv)
     assert srv.ROUTER_MODE == "off"
     assert srv.mcp.settings.stateless_http is True
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert "select_domain" not in names
     assert len(names) == 23
+
+
+def test_router_mode_default_is_fat_tools_lean(monkeypatch):
+    """When MCP_ROUTER_MODE isn't set, server boots in fat_tools_lean.
+
+    Flipped 2026-04-22 — measured catalog drops 5289 → 1090 tokens
+    (-79 %) with 93.2 % hit rate in both modes on qwen3.5:9b.
+    Production Docker image + platform sidecar inherit this default
+    so i7-CPU deployments stop paying the 3-7 min monolith prefill.
+    """
+    import importlib
+
+    import server as srv
+
+    monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+    srv = importlib.reload(srv)
+    assert srv.ROUTER_MODE == "fat_tools_lean", (
+        f"default should be fat_tools_lean, got {srv.ROUTER_MODE!r}"
+    )
+    # fat modes register the 4 fat tools in addition to the 23 narrow
+    # ones; list_tools filter is what hides the narrow set from clients.
+    names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+    assert {"weather", "geo", "knowledge", "radio"}.issubset(names)
+    assert len(names) == 27
 
 
 @pytest.mark.asyncio
@@ -2109,14 +2135,25 @@ async def test_fat_weather_dispatches_to_underlying_impl(monkeypatch):
         importlib.reload(srv)
 
 
-def test_narrow_to_fat_map_covers_every_registered_tool():
+def test_narrow_to_fat_map_covers_every_registered_tool(monkeypatch):
     """`fat_tools_map.NARROW_TO_FAT` must map every narrow @mcp.tool
     in server.py exactly once. Drift here silently breaks the eval
-    scorer in fat mode — kill it at test time."""
-    import fat_tools_map
-    import server
+    scorer in fat mode — kill it at test time.
 
-    registered = {t.name for t in server.mcp._tool_manager.list_tools()}
+    Since the default router mode is now `fat_tools_lean`, the tool
+    manager also contains the 4 fat tool names; pin to `off` here
+    so `registered` is the pure narrow set we want to check coverage
+    against.
+    """
+    import importlib
+
+    import fat_tools_map
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "off")
+    srv = importlib.reload(srv)
+
+    registered = {t.name for t in srv.mcp._tool_manager.list_tools()}
     mapped = set(fat_tools_map.NARROW_TO_FAT.keys())
     missing = registered - mapped
     extra = mapped - registered
