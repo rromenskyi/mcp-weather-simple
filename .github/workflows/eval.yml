@@ -98,6 +98,23 @@ on:
           - 'terse'
           - 'verbose'
           - 'both'
+      runs_on:
+        description: >-
+          Which runner pool to use. `github-hosted` (default) is
+          ubuntu-latest on GitHub's 2-vCPU hosted tier — fine for
+          llama3.2:3b-scale but qwen3.5:9b+ blow the per-request
+          timeout on prefill. `self-hosted` routes to a VM labelled
+          `self-hosted,eval-runner` — e.g. the L4 GPU runner spun up
+          via terraform-gcp-eval-runner with `mode = "agent"`. That
+          cuts prefill to <5s and a 44-case eval from 40+min to ~5.
+          Scheduled cron runs always stay on github-hosted (this
+          input is only read on workflow_dispatch).
+        required: false
+        default: 'github-hosted'
+        type: choice
+        options:
+          - 'github-hosted'
+          - 'self-hosted'
   schedule:
     # 03:00 UTC every day. Runs the full default matrix (both 7b and
     # 14b) so nightly trend data covers both sizes. Schedule uses the
@@ -135,6 +152,7 @@ jobs:
       chunks: ${{ steps.pick.outputs.chunks }}
       chunk_count: ${{ steps.pick.outputs.chunk_count }}
       docstrings: ${{ steps.pick.outputs.docstrings }}
+      runs_on: ${{ steps.pick.outputs.runs_on }}
     steps:
       - id: pick
         run: |
@@ -144,6 +162,10 @@ jobs:
           else
             echo 'models=["qwen3.5:9b","qwen3:14b"]' >> "$GITHUB_OUTPUT"
           fi
+          # Runner pool. Empty on schedule events (workflow_dispatch
+          # input isn't populated) → default to github-hosted.
+          runs_on='${{ github.event.inputs.runs_on || 'github-hosted' }}'
+          echo "runs_on=$runs_on" >> "$GITHUB_OUTPUT"
           schema='${{ github.event.inputs.output_schema || 'off' }}'
           if [ "$schema" = "both" ]; then
             echo 'schemas=["off","on"]' >> "$GITHUB_OUTPUT"
@@ -173,7 +195,14 @@ jobs:
   eval:
     needs: plan
     name: eval / ${{ matrix.model }} / outputSchema=${{ matrix.schema }} / docs=${{ matrix.docstring }} / chunk ${{ matrix.chunk }}
-    runs-on: ubuntu-latest
+    # Dynamic runner selection. `plan.runs_on` resolves to
+    # "github-hosted" by default (also what schedule events get —
+    # `workflow_dispatch.inputs` is absent there) or "self-hosted"
+    # when the manual trigger picks that. The expression returns a
+    # list when self-hosted so GHA ANDs the labels (`self-hosted` +
+    # `eval-runner`) — the VM registered by terraform-gcp-eval-runner
+    # with mode=agent advertises both.
+    runs-on: ${{ (needs.plan.outputs.runs_on == 'self-hosted') && fromJSON('["self-hosted","eval-runner"]') || 'ubuntu-latest' }}
     # Generous but bounded. With the default chunk_count=4 each row
     # runs ~11 cases; worst-case 14b × 480 s timeout × 11 = 88 min
     # ceiling in theory, but typical case is ~60-90 s so real
@@ -228,9 +257,22 @@ jobs:
         # coherent-looking but with an empty tool_call — the model
         # literally didn't see those tools. qwen2.5 supports 128K
         # natively so 8K is well within spec.
+        #
+        # Check-first: on self-hosted runners (mode=agent in the
+        # terraform sibling repo) Ollama is already running as a
+        # systemd service on 127.0.0.1:11434 with the same context
+        # length baked into a drop-in unit. Starting another serve
+        # there would fail-fast on port bind and leave a noisy
+        # "address already in use" in /tmp/ollama.log that gets
+        # uploaded as an artefact on failure. Reuse the running
+        # daemon instead.
         env:
           OLLAMA_CONTEXT_LENGTH: "8192"
         run: |
+          if curl -sf http://127.0.0.1:11434/api/version > /dev/null; then
+            echo "Ollama already running — reusing existing daemon."
+            exit 0
+          fi
           ollama serve > /tmp/ollama.log 2>&1 &
           for i in {1..30}; do
             if curl -sf http://127.0.0.1:11434/api/version > /dev/null; then
