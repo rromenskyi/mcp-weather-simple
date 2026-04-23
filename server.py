@@ -252,6 +252,13 @@ RADIO_BROWSER_UA = "mcp-weather-simple/0.2 (https://github.com/rromenskyi/mcp-we
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 PHOTON_URL = "https://photon.komoot.io/api"
 OSM_UA = RADIO_BROWSER_UA  # same self-identification string — one repo, one UA
+# US National Weather Service active-alerts endpoint. Free, key-less,
+# public-domain CAP-GeoJSON. Their docs explicitly ask for a UA that
+# identifies the app — our `WEB_UA` with the repo URL satisfies that.
+# Coverage is US + US territories only; other countries fall through
+# to an empty alerts list. (EU/MeteoAlarm integration tracked
+# separately; see the RV/travel-surface backlog.)
+NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 
 # ── Web-domain sources (search / news / HN / trends) ────────────────────────
 #
@@ -1271,7 +1278,7 @@ async def get_weather_outside_right_now() -> dict:
         return body
     return _respond(
         {**body, "location_source": "geoip_autodetected"},
-        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+        guidance=_compose_alerts_guidance(_GUIDANCE_GEOIP_AUTODETECT, body.get("alerts")),
     )
 
 
@@ -1290,7 +1297,7 @@ async def get_weather_forecast_for_today() -> dict:
         return body
     return _respond(
         {**body, "location_source": "geoip_autodetected"},
-        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+        guidance=_compose_alerts_guidance(_GUIDANCE_GEOIP_AUTODETECT, body.get("alerts")),
     )
 
 
@@ -1340,7 +1347,7 @@ async def get_weather_forecast_for_tomorrow() -> dict:
         return body
     return _respond(
         {**body, "location_source": "geoip_autodetected"},
-        guidance=_GUIDANCE_GEOIP_AUTODETECT,
+        guidance=_compose_alerts_guidance(_GUIDANCE_GEOIP_AUTODETECT, body.get("alerts")),
     )
 
 
@@ -1502,6 +1509,94 @@ async def get_current_date(timezone: str = "UTC") -> dict:
     })
 
 
+# ── Weather alerts ────────────────────────────────────────────────────────
+#
+# NWS (US only) publishes active watches / warnings / advisories at
+# `api.weather.gov/alerts/active?point={lat},{lon}`. Free, key-less,
+# CAP-GeoJSON. We fold the active-alerts query into every forward-
+# looking weather tool via `asyncio.gather` so the HTTP overhead is
+# hidden behind Open-Meteo's own round-trip — zero perceptible
+# latency added. When no alert is active (99 % of the time) the field
+# is an empty list; when something IS active the body carries a
+# summarised entry per alert, and the response envelope's `guidance`
+# is rewritten to tell the model "prioritise surfacing the warning".
+#
+# Non-US points: NWS returns an empty result, we map that to `[]`. No
+# free, global alerts provider exists. EU/MeteoAlarm integration is
+# tracked separately (RV/travel surface backlog).
+
+# Countries NWS actually covers. Alerts call is skipped entirely for
+# anything else so we don't pay a useless HTTP round-trip.
+_NWS_COVERED_COUNTRIES: frozenset[str] = frozenset({
+    "US", "PR", "VI", "GU", "MP", "AS",  # US + territories
+})
+
+
+async def _fetch_us_weather_alerts(
+    latitude: float,
+    longitude: float,
+    country_code: str | None,
+) -> list[dict]:
+    """Return a list of active NWS alerts for a coordinate, or `[]`.
+
+    Failure modes all degrade to `[]` silently — a flaky alerts feed
+    must never take out the normal weather response. If country_code
+    is set and NWS doesn't cover it, we short-circuit without a call.
+    """
+    if country_code and country_code.strip().upper() not in _NWS_COVERED_COUNTRIES:
+        return []
+    try:
+        data = await _fetch_json(
+            NWS_ALERTS_URL,
+            service="NWS alerts",
+            timeout=5.0,
+            params={"point": f"{latitude},{longitude}"},
+            headers={"User-Agent": WEB_UA, "Accept": "application/geo+json"},
+        )
+    except Exception as exc:
+        _log.info("NWS alerts unavailable for (%s, %s): %s", latitude, longitude, exc)
+        return []
+    features = data.get("features") if isinstance(data, dict) else None
+    if not features:
+        return []
+    alerts: list[dict] = []
+    for feat in features:
+        p = (feat or {}).get("properties") or {}
+        alerts.append({
+            "event": p.get("event"),
+            "severity": p.get("severity"),
+            "urgency": p.get("urgency"),
+            "certainty": p.get("certainty"),
+            "headline": p.get("headline"),
+            "area_desc": p.get("areaDesc"),
+            "effective": p.get("effective"),
+            "expires": p.get("expires"),
+            "nws_url": (feat or {}).get("id"),
+        })
+    return alerts
+
+
+def _alerts_guidance(alerts: list[dict]) -> str:
+    """Guidance string that scales with alert severity. Pushes the
+    model to surface the warning prominently rather than burying it."""
+    if not alerts:
+        return _GUIDANCE_DIRECT
+    severities = {(a.get("severity") or "").lower() for a in alerts}
+    if "extreme" in severities or "severe" in severities:
+        lead = "⚠️ ACTIVE SEVERE weather alert. Lead with it, then the forecast."
+    else:
+        lead = "Active weather alert in `alerts`. Surface it alongside the forecast."
+    return lead
+
+
+def _compose_alerts_guidance(base: str, alerts: list[dict] | None) -> str:
+    """Merge an alerts prefix with a base guidance (e.g. GeoIP caveat).
+    When `alerts` is empty / None the base string is returned unchanged."""
+    if not alerts:
+        return base
+    return f"{_alerts_guidance(alerts)} {base}"
+
+
 async def _get_current_weather_in_city_impl(city: str, country_code: str | None = None) -> dict:
     """Raw current-weather fetch — returns either a bare body dict or,
     on geocoder ambiguity (#17), a pre-built envelope with
@@ -1511,27 +1606,32 @@ async def _get_current_weather_in_city_impl(city: str, country_code: str | None 
     loc, clarify = await _resolve_place(city, country_code=country_code)
     if clarify:
         return clarify  # already an envelope (relay_to_user=False)
-    data = await _fetch_json(
-        FORECAST_URL,
-        service="Open-Meteo forecast",
-        timeout=8.0,
-        params={
-            "latitude": loc["latitude"],
-            "longitude": loc["longitude"],
-            # Bundled free-ride: `precipitation_probability` + `uv_index`
-            # come from the same endpoint, zero extra HTTP. `daily=sunrise,
-            # sunset` with `forecast_days=1` adds today's sun times so
-            # "weather + во сколько закат" resolves in one tool call.
-            # Docstring stays silent — self-explanatory field names
-            # (sunrise / uv_index / feels_like via apparent_temperature)
-            # carry the contract.
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                       "precipitation,precipitation_probability,"
-                       "weather_code,wind_speed_10m,wind_direction_10m,uv_index",
-            "daily": "sunrise,sunset",
-            "forecast_days": 1,
-            "timezone": "auto",
-        },
+    resolved_cc = (loc.get("country_code") or country_code or "").upper()
+    import asyncio as _asyncio
+    data, alerts = await _asyncio.gather(
+        _fetch_json(
+            FORECAST_URL,
+            service="Open-Meteo forecast",
+            timeout=8.0,
+            params={
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                # Bundled free-ride: `precipitation_probability` + `uv_index`
+                # come from the same endpoint, zero extra HTTP. `daily=sunrise,
+                # sunset` with `forecast_days=1` adds today's sun times so
+                # "weather + во сколько закат" resolves in one tool call.
+                # Docstring stays silent — self-explanatory field names
+                # (sunrise / uv_index / feels_like via apparent_temperature)
+                # carry the contract.
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                           "precipitation,precipitation_probability,"
+                           "weather_code,wind_speed_10m,wind_direction_10m,uv_index",
+                "daily": "sunrise,sunset",
+                "forecast_days": 1,
+                "timezone": "auto",
+            },
+        ),
+        _fetch_us_weather_alerts(loc["latitude"], loc["longitude"], resolved_cc),
     )
     cur = data.get("current", {})
     daily = data.get("daily", {})
@@ -1551,6 +1651,7 @@ async def _get_current_weather_in_city_impl(city: str, country_code: str | None 
         "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
         "sunrise": sunrise,
         "sunset": sunset,
+        "alerts": alerts,
     }
 
 
@@ -1573,7 +1674,7 @@ async def get_current_weather_in_city(city: str, country_code: str | None = None
     body = await _get_current_weather_in_city_impl(city, country_code=country_code)
     if body.get("relay_to_user") is False:
         return body  # ambiguity envelope — already final
-    return _respond(body)
+    return _respond(body, guidance=_alerts_guidance(body.get("alerts", [])))
 
 
 async def _get_weather_forecast_impl(
@@ -1590,25 +1691,30 @@ async def _get_weather_forecast_impl(
     loc, clarify = await _resolve_place(city, country_code=country_code)
     if clarify:
         return clarify
-    data = await _fetch_json(
-        FORECAST_URL,
-        service="Open-Meteo forecast",
-        timeout=8.0,
-        params={
-            "latitude": loc["latitude"],
-            "longitude": loc["longitude"],
-            # Zero-cost bundle: `apparent_temperature_max/min`, `sunrise`,
-            # `sunset`, `uv_index_max` ride on the same daily query.
-            # Closes "закат завтра?" / "жарко будет?" / "UV высокий?"
-            # without a second round-trip. Docstring silent — field
-            # names self-explanatory.
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
-                     "apparent_temperature_max,apparent_temperature_min,"
-                     "precipitation_sum,precipitation_probability_max,"
-                     "wind_speed_10m_max,sunrise,sunset,uv_index_max",
-            "forecast_days": days,
-            "timezone": "auto",
-        },
+    resolved_cc = (loc.get("country_code") or country_code or "").upper()
+    import asyncio as _asyncio
+    data, alerts = await _asyncio.gather(
+        _fetch_json(
+            FORECAST_URL,
+            service="Open-Meteo forecast",
+            timeout=8.0,
+            params={
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                # Zero-cost bundle: `apparent_temperature_max/min`, `sunrise`,
+                # `sunset`, `uv_index_max` ride on the same daily query.
+                # Closes "закат завтра?" / "жарко будет?" / "UV высокий?"
+                # without a second round-trip. Docstring silent — field
+                # names self-explanatory.
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
+                         "apparent_temperature_max,apparent_temperature_min,"
+                         "precipitation_sum,precipitation_probability_max,"
+                         "wind_speed_10m_max,sunrise,sunset,uv_index_max",
+                "forecast_days": days,
+                "timezone": "auto",
+            },
+        ),
+        _fetch_us_weather_alerts(loc["latitude"], loc["longitude"], resolved_cc),
     )
     d = data.get("daily", {})
     dates = d.get("time", [])
@@ -1649,6 +1755,7 @@ async def _get_weather_forecast_impl(
         "location": f"{loc['name']}, {loc['country']}",
         "timezone_id": loc.get("timezone"),
         "days": out,
+        "alerts": alerts,
     }
 
 
@@ -1674,7 +1781,7 @@ async def get_weather_forecast(
     body = await _get_weather_forecast_impl(city, days=days, country_code=country_code)
     if body.get("relay_to_user") is False:
         return body  # ambiguity envelope
-    return _respond(body)
+    return _respond(body, guidance=_alerts_guidance(body.get("alerts", [])))
 
 
 @mcp.tool()
