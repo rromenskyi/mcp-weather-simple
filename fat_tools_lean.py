@@ -71,6 +71,11 @@ async def weather(action: str, params: dict | None = None) -> dict:
     NOT here — wiki / country / holidays / currency / calc → `knowledge`;
     geocoding / address / IP / time → `geo`; search / news / HN /
     trends / radio → `web`.
+
+    **Arguments shape — concrete example:**
+    RIGHT: `{"action": "current_in_city", "params": {"city": "Kyiv"}}`
+    WRONG: `{"action": "current_in_city", "city": "Kyiv"}` — the per-
+    action fields MUST be inside `params`, not at the top level.
     """
     _check_action("weather", action, _WEATHER_ACTIONS)
     import server
@@ -135,6 +140,11 @@ async def geo(action: str, params: dict | None = None) -> dict:
     NOT here — weather / air quality / sunrise / sunset → `weather`;
     wiki / country / holidays / currency / calc → `knowledge`; search
     / news / HN / trends / radio → `web`.
+
+    **Arguments shape — concrete example:**
+    RIGHT: `{"action": "find_coordinates", "params": {"city": "Kyiv"}}`
+    WRONG: `{"action": "find_coordinates", "city": "Kyiv"}` — the per-
+    action fields MUST be inside `params`, not at the top level.
     """
     _check_action("geo", action, _GEO_ACTIONS)
     import server
@@ -193,6 +203,11 @@ async def knowledge(action: str, params: dict | None = None) -> dict:
     NOT here — weather / air quality / sunrise / sunset → `weather`;
     geocoding / address / IP / time → `geo`; search / news / HN /
     trends / radio → `web`.
+
+    **Arguments shape — concrete example:**
+    RIGHT: `{"action": "wikipedia", "params": {"title": "Kyiv"}}`
+    WRONG: `{"action": "wikipedia", "title": "Kyiv"}` — the per-action
+    fields MUST be inside `params`, not at the top level.
     """
     _check_action("knowledge", action, _KNOWLEDGE_ACTIONS)
     import server
@@ -246,6 +261,11 @@ async def web(action: str, params: dict | None = None) -> dict:
     NOT here — weather / air quality / sunrise → `weather`; geocoding
     / address / IP / time → `geo`; wiki / country / calc / currency →
     `knowledge`.
+
+    **Arguments shape — concrete example:**
+    RIGHT: `{"action": "search", "params": {"query": "cat videos"}}`
+    WRONG: `{"action": "search", "query": "cat videos"}` — the per-
+    action fields MUST be inside `params`, not at the top level.
     """
     _check_action("web", action, _WEB_ACTIONS)
     import server

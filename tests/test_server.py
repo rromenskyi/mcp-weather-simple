@@ -3207,11 +3207,124 @@ async def test_smoke_every_tool_returns_envelope(tool_name):
         )
     )
 
+    # Silence NWS alerts endpoint for the smoke pass — we're testing
+    # that the tool runs, not that alerts arrive; full alert tests
+    # live below.
+    respx.route(url__regex=r".*api\.weather\.gov/alerts/active.*").mock(
+        return_value=httpx.Response(200, json={"features": []})
+    )
     fn = getattr(server, tool_name)
     r = await fn(**_SMOKE_CASES[tool_name])
     assert isinstance(r, dict), f"{tool_name} returned non-dict {type(r).__name__}"
     assert "relay_to_user" in r, f"{tool_name} missing `relay_to_user`"
     assert "guidance" in r, f"{tool_name} missing `guidance`"
+
+
+# ── NWS weather alerts integration ────────────────────────────────────────
+
+
+def _nws_alert_feature(event="Flash Flood Warning", severity="Severe",
+                       headline="Flash Flood Warning — move to higher ground",
+                       area="Salt Lake County, UT"):
+    return {
+        "id": "https://api.weather.gov/alerts/abc",
+        "properties": {
+            "event": event, "severity": severity,
+            "urgency": "Immediate", "certainty": "Observed",
+            "headline": headline, "areaDesc": area,
+            "effective": "2026-04-22T20:00:00-06:00",
+            "expires":   "2026-04-22T23:00:00-06:00",
+        },
+    }
+
+
+@respx.mock
+async def test_weather_alerts_attached_when_nws_reports_active():
+    """US point with an active severe alert: `alerts` is populated,
+    guidance leads with the `⚠️ SEVERE` prefix so a small model
+    can't miss it."""
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={
+        "results": [{
+            "name": "Salt Lake City", "country": "United States", "country_code": "US",
+            "latitude": 40.76, "longitude": -111.89, "timezone": "America/Denver",
+            "feature_code": "PPLA", "admin1": "Utah", "population": 200_000,
+        }],
+    }))
+    respx.get(server.FORECAST_URL).mock(return_value=httpx.Response(200, json={
+        "current": {
+            "time": "2026-04-22T20:00", "temperature_2m": 12.0,
+            "relative_humidity_2m": 55, "apparent_temperature": 11.0,
+            "precipitation": 0.0, "weather_code": 1,
+            "wind_speed_10m": 8.0, "wind_direction_10m": 180,
+        },
+        "daily": {"time": ["2026-04-22"], "sunrise": ["06:00"], "sunset": ["20:00"]},
+    }))
+    respx.get(server.NWS_ALERTS_URL).mock(
+        return_value=httpx.Response(200, json={"features": [_nws_alert_feature()]}),
+    )
+
+    r = await server.get_current_weather_in_city("Salt Lake City", country_code="US")
+    assert r["relay_to_user"] is True
+    assert len(r["alerts"]) == 1
+    assert r["alerts"][0]["event"] == "Flash Flood Warning"
+    assert r["alerts"][0]["severity"] == "Severe"
+    assert "SEVERE" in r["guidance"] or "alert" in r["guidance"].lower()
+
+
+@respx.mock
+async def test_weather_alerts_empty_for_non_us_point():
+    """Non-US country: NWS is never called (they only serve US), the
+    `alerts` field lands as `[]`, guidance stays plain."""
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={
+        "results": [{
+            "name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+            "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+            "feature_code": "PPLC", "admin1": "Kyiv City", "population": 3_000_000,
+        }],
+    }))
+    respx.get(server.FORECAST_URL).mock(return_value=httpx.Response(200, json={
+        "current": {
+            "time": "2026-04-22T20:00", "temperature_2m": 12.0,
+            "relative_humidity_2m": 55, "apparent_temperature": 11.0,
+            "precipitation": 0.0, "weather_code": 1,
+            "wind_speed_10m": 8.0, "wind_direction_10m": 180,
+        },
+        "daily": {"time": ["2026-04-22"], "sunrise": ["06:00"], "sunset": ["20:00"]},
+    }))
+    # NOT mocked — if the tool tries to hit NWS for a non-US point, respx
+    # will blow up with an unhandled request error. That failure IS the
+    # assertion.
+    r = await server.get_current_weather_in_city("Kyiv", country_code="UA")
+    assert r["relay_to_user"] is True
+    assert r["alerts"] == []
+
+
+@respx.mock
+async def test_weather_alerts_failure_does_not_break_forecast():
+    """NWS 503ing must NOT take out the normal weather response —
+    `alerts` degrades to `[]` silently."""
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={
+        "results": [{
+            "name": "Denver", "country": "United States", "country_code": "US",
+            "latitude": 39.74, "longitude": -104.99, "timezone": "America/Denver",
+            "feature_code": "PPLA", "admin1": "Colorado", "population": 700_000,
+        }],
+    }))
+    respx.get(server.FORECAST_URL).mock(return_value=httpx.Response(200, json={
+        "current": {
+            "time": "2026-04-22T20:00", "temperature_2m": 15.0,
+            "relative_humidity_2m": 40, "apparent_temperature": 14.0,
+            "precipitation": 0.0, "weather_code": 1,
+            "wind_speed_10m": 10.0, "wind_direction_10m": 200,
+        },
+        "daily": {"time": ["2026-04-22"], "sunrise": ["06:10"], "sunset": ["19:50"]},
+    }))
+    respx.get(server.NWS_ALERTS_URL).mock(return_value=httpx.Response(503))
+
+    r = await server.get_current_weather_in_city("Denver", country_code="US")
+    assert r["relay_to_user"] is True
+    assert r["alerts"] == []  # degraded, not raised
+    assert r["temperature_c"] == 15.0
 
 
 # ── Cross-fat-tool error messages ────────────────────────────────────────
