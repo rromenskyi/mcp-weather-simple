@@ -295,7 +295,11 @@ async def _fetch_text(
     message shape as any other Open-Meteo / Wikipedia 4xx.
     """
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # DDG Lite, Google News RSS and Google Trends all serve 302s to
+        # canonical URLs on first hit (geo / locale / UA-dependent). Must
+        # follow — `httpx` default is `follow_redirects=False` which
+        # would surface as "HTTP 302" RuntimeErrors in production.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, params=params, headers=headers)
             r.raise_for_status()
             return r.text
