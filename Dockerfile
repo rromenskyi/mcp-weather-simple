@@ -45,7 +45,11 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request,sys; \
-        r=urllib.request.urlopen('http://127.0.0.1:8000/mcp',timeout=3); \
-        sys.exit(0 if r.status in (200,400,405,406) else 1)" || exit 1
+        r=urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3); \
+        sys.exit(0 if r.status == 200 else 1)" || exit 1
+# `/healthz` is the auth-bypassed liveness endpoint (always 200, no
+# I/O). Previously the healthcheck hit `/mcp` which returns 401 when
+# MCP_AUTH_TOKEN is set → a perfectly healthy container would flip
+# to `unhealthy` under every auth-enabled deployment.
 
 ENTRYPOINT ["python", "server.py"]

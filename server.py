@@ -77,17 +77,47 @@ mcp = FastMCP(
 # chat session runs in its own Pod with its own mcp-weather process,
 # so process-local memory IS the session.
 #
-# Tuple is (fingerprint, monotonic_timestamp). maxlen=10 caps memory;
+# Per-session history of recent calls. Keyed by session id (or a
+# stable fallback when the MCP request context isn't available — stdio
+# mode, tests, direct Python imports). Each value is a deque of
+# (fingerprint, monotonic_timestamp) tuples. maxlen=10 caps memory;
 # entries older than `_LOOP_WINDOW_SECONDS` are pruned on each check.
-_RECENT_CALLS: "collections.deque[tuple[str, float]]" = collections.deque(maxlen=10)
+#
+# Sessions isolation: pre-2026-04-23 a single process-global deque
+# meant two unrelated HTTP clients asking the same question within
+# 120s would see the second request short-circuit as
+# `duplicate_of_recent_call` — a live bug for the platform sidecar
+# that could be called by two chat sessions on the same pod.
+_RECENT_CALLS_BY_SESSION: dict[str, "collections.deque[tuple[str, float]]"] = {}
 _LOOP_WINDOW_SECONDS = 120
+_DEFAULT_SESSION_KEY = "_default"
+
+
+def _current_session_key() -> str:
+    """Resolve a stable key for the current MCP session, or a fallback.
+
+    FastMCP stores the active request in the lowlevel server's
+    `request_ctx` ContextVar. When set, the session object carries a
+    unique id; we key on that so each client gets its own detector
+    window. Outside a request (stdio spawn without a live
+    session, or unit tests calling tools directly), we fall back to
+    a single shared key — same behaviour as the old global deque.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        ctx = request_ctx.get()
+    except (ImportError, LookupError):
+        return _DEFAULT_SESSION_KEY
+    session = getattr(ctx, "session", None)
+    sid = getattr(session, "session_id", None) or id(session) if session else None
+    return str(sid) if sid else _DEFAULT_SESSION_KEY
 
 
 def _reset_recent_calls() -> None:
-    """Clear the detector's state. Exposed for tests — the fixture wipes
-    between cases so a `get_current_weather_in_city("Kyiv")` in test A
-    doesn't short-circuit the same call in test B."""
-    _RECENT_CALLS.clear()
+    """Clear every session's detector state. Exposed for tests — the
+    fixture wipes between cases so a `get_current_weather_in_city("Kyiv")`
+    in test A doesn't short-circuit the same call in test B."""
+    _RECENT_CALLS_BY_SESSION.clear()
 
 
 def _call_fingerprint(tool_name: str, arguments: dict) -> str:
@@ -101,18 +131,29 @@ def _call_fingerprint(tool_name: str, arguments: dict) -> str:
 
 
 def _detect_and_record_call(fingerprint: str) -> bool:
-    """True if this fingerprint matches a recent call still inside the window.
+    """True if this fingerprint matches a recent call from the SAME
+    session still inside the window.
 
     Always appends the current call (even on duplicates) so the window
     stays fresh. Returning True does NOT stop the caller from running —
     the decision to short-circuit is the caller's.
     """
     now = time.monotonic()
+    session_key = _current_session_key()
+    recent = _RECENT_CALLS_BY_SESSION.get(session_key)
+    if recent is None:
+        recent = collections.deque(maxlen=10)
+        _RECENT_CALLS_BY_SESSION[session_key] = recent
     # Prune the left side of the deque until the head is within window.
-    while _RECENT_CALLS and now - _RECENT_CALLS[0][1] > _LOOP_WINDOW_SECONDS:
-        _RECENT_CALLS.popleft()
-    is_dup = any(fp == fingerprint for fp, _ in _RECENT_CALLS)
-    _RECENT_CALLS.append((fingerprint, now))
+    while recent and now - recent[0][1] > _LOOP_WINDOW_SECONDS:
+        recent.popleft()
+    is_dup = any(fp == fingerprint for fp, _ in recent)
+    recent.append((fingerprint, now))
+    # Opportunistic housekeeping — drop per-session deques that went
+    # fully stale, otherwise long-running servers accumulate empty
+    # entries for every dead session.
+    if not recent:
+        _RECENT_CALLS_BY_SESSION.pop(session_key, None)
     return is_dup
 
 
@@ -718,8 +759,12 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     if country_code:
         cc_upper = country_code.strip().upper()
         filtered = [h for h in results if (h.get("country_code") or "").upper() == cc_upper]
-        if filtered:
-            results = filtered
+        # Hard filter — if the caller pinned a country, a zero-length
+        # filtered list means "no matching hit in that country". Silently
+        # falling back to the unfiltered top-1 was the pre-2026-04-23
+        # behaviour, which masked wrong-country hits as successful
+        # results and made `country_code` a meaningless hint.
+        results = filtered
     if not results:
         raise ValueError(_city_not_found_error(city, country_code))
     # Ambiguity detection uses the RAW hits (not _annotate'd yet) so the
@@ -1026,11 +1071,14 @@ async def _try_nominatim(address: str, country_code: str | None, accept_language
 
 
 async def _try_photon(address: str, country_code: str | None) -> dict | None:
-    params: dict[str, str | int] = {"q": address, "limit": 1}
-    if country_code:
-        # Photon uses lowercase ISO-2 via `lang` param? No — it uses
-        # `layer` and doesn't have a clean country filter. Skip.
-        pass
+    # Request a wider candidate list when the caller pins a country —
+    # Photon has no server-side country filter, so we filter in the
+    # response. With `limit=1` a spurious first hit in the wrong
+    # country used to mask the correct later hit as "not found".
+    params: dict[str, str | int] = {
+        "q": address,
+        "limit": 10 if country_code else 1,
+    }
     try:
         data = await _fetch_json(
             PHOTON_URL,
@@ -1044,16 +1092,17 @@ async def _try_photon(address: str, country_code: str | None) -> dict | None:
     features = data.get("features") if isinstance(data, dict) else None
     if not features:
         return None
-    feat = features[0]
-    # Apply country_code filter client-side if requested. Photon puts
-    # the ISO-2 in `properties.countrycode`; a mismatch means we asked
-    # for US and got a Canadian hit on a spurious lexical match.
     if country_code:
         cc_want = country_code.strip().upper()
-        cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
-        if cc_got and cc_got != cc_want:
-            return None
-    return _normalise_photon_feature(feat, address_input=address)
+        # Walk the list; return the first hit whose `countrycode`
+        # matches. Photon orders by relevance so the chosen item is the
+        # best-scoring match within the requested country.
+        for feat in features:
+            cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
+            if cc_got == cc_want:
+                return _normalise_photon_feature(feat, address_input=address)
+        return None
+    return _normalise_photon_feature(features[0], address_input=address)
 
 
 @mcp.tool()
@@ -2362,6 +2411,16 @@ async def calculate(expression: str) -> dict:
             relay_to_user=False,
             guidance="Division by zero. Ask user what they meant.",
         )
+    except (TypeError, OverflowError) as exc:
+        # Whitelisted funcs still raise on bad argument types: `factorial(3.5)`
+        # (non-int), `sum(1, 2)` (non-iterable), `gcd(1.2, 2)` (non-int),
+        # `math.exp(10000)` (overflow). Surface as a controlled envelope
+        # rather than bubbling an internal Python error to the client.
+        return _respond(
+            {"expression": expression, "error": f"{type(exc).__name__}: {exc}"},
+            relay_to_user=False,
+            guidance="Wrong argument type or range for a math function. Ask user to clarify.",
+        )
     return _respond({"expression": expression, "result": value})
 
 
@@ -2975,16 +3034,15 @@ def _apply_output_schema_experiment() -> None:
     registered tool so the MCP catalog advertises the envelope contract
     via spec 2025-06-18's `outputSchema` field.
 
-    Runs after all @mcp.tool decorators have registered, so every Tool
-    object is in `mcp._tool_manager._tools` by the time we iterate.
+    Must run AFTER `_install_router()` so that fat-mode tools
+    (weather / geo / knowledge / web), which are registered inside
+    the router installer, also receive the outputSchema stamp. Called
+    once at module bottom (see the final block).
     """
     if _OUTPUT_SCHEMA_MODE != "on":
         return
     for tool in mcp._tool_manager._tools.values():
         tool.output_schema = _ENVELOPE_OUTPUT_SCHEMA
-
-
-_apply_output_schema_experiment()
 
 
 # ── Docstring verbosity A/B (terse vs verbose) ─────────────────────────────
@@ -3456,6 +3514,12 @@ def _install_off_mode_domain_filter() -> None:
 _install_router()
 if ROUTER_MODE == "off" and ENABLED_DOMAINS:
     _install_off_mode_domain_filter()
+
+# Output-schema experiment runs LAST — fat-mode tools are registered
+# inside `_install_router()`, so stamping has to come after them
+# or the fat surface would ship without outputSchema even though the
+# experiment env says otherwise.
+_apply_output_schema_experiment()
 
 
 if __name__ == "__main__":
