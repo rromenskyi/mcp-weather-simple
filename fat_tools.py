@@ -100,6 +100,10 @@ async def weather(
     `city` is ALWAYS a single token: a place name (`"Kyiv"`), a postal
     code (`"84010"`), or the shape `"City, Region"` when disambiguation
     is required. Full-sentence queries will fail.
+
+    NOT here — wiki / country / holidays / currency / calc → `knowledge`;
+    geocoding / address / IP / time → `geo`; search / news / HN /
+    trends / radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "current_here":
@@ -180,6 +184,10 @@ async def geo(
           Needs: `city`. Optional: `country_code`.
       - `date_in_timezone` — today's date in a named timezone.
           Optional: `timezone` (IANA, default `"UTC"`).
+
+    NOT here — weather / air quality / sunrise → `weather`; wiki /
+    country / holidays / currency / calc → `knowledge`; search /
+    news / HN / trends / radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "find_coordinates":
@@ -255,6 +263,10 @@ async def knowledge(
           Needs: `expression` (no units, no unresolved symbols).
           Examples: `"3847 * 29"`, `"2450 * 0.15"`, `"pi * 5**2"`,
           `"hypot(3, 4)"`, `"sqrt(2450) + pi"`.
+
+    NOT here — weather / air quality / sunrise → `weather`; geocoding
+    / address / IP / time → `geo`; search / news / HN / trends /
+    radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "wikipedia":
@@ -325,6 +337,10 @@ async def web(
           Pass ≥1: `country` (ISO-2 or English name), `tag` (genre),
           `language` (English name like "russian", not "ru").
           Optional: `limit` (1-20, default 5).
+
+    NOT here — weather / air quality / sunrise → `weather`; geocoding
+    / address / IP / time → `geo`; wiki / country / calc / currency
+    → `knowledge`.
     """
     import server  # lazy — see module docstring
     if action == "search":

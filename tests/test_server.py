@@ -3000,3 +3000,260 @@ async def test_fat_lean_web_dispatch(monkeypatch):
     finally:
         monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
         importlib.reload(srv)
+
+
+# ── Linear smoke — one call per @mcp.tool ────────────────────────────────
+#
+# Regression net for "did we accidentally break / rename / lose a
+# tool" — catches things a feature-specific test won't: a tool that
+# still exists but raises on its minimal happy path, or a tool whose
+# response shape changed silently. One parametrised case per narrow
+# tool, each with minimal valid input + broad upstream mocks.
+#
+# NOT a full contract test — existing per-feature tests own deep
+# assertions. This is the "nothing explodes on boot" net.
+
+
+def _smoke_geocode_json():
+    return {"results": [{
+        "name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+        "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+        "feature_code": "PPLC", "admin1": "Kyiv City", "population": 3_000_000,
+    }]}
+
+
+def _smoke_geoip_json():
+    return {
+        "success": True, "ip": "203.0.113.10",
+        "city": "Kyiv", "region": "Kyiv City",
+        "country": "Ukraine", "country_code": "UA",
+        "latitude": 50.45, "longitude": 30.52,
+        "timezone": {"id": "Europe/Kyiv"},
+    }
+
+
+def _smoke_forecast_current_json():
+    return {
+        "current": {
+            "time": "2026-04-22T10:00",
+            "temperature_2m": 12.0, "relative_humidity_2m": 55,
+            "apparent_temperature": 11.0,
+            "precipitation": 0.0, "weather_code": 1,
+            "wind_speed_10m": 8.0, "wind_direction_10m": 180,
+        },
+        "daily": {"time": ["2026-04-22"], "sunrise": ["06:00"], "sunset": ["20:00"]},
+    }
+
+
+def _smoke_forecast_daily_json(days: int = 1):
+    fill = lambda v: [v] * days
+    return {"daily": {
+        "time": [f"2026-04-{22+i:02d}" for i in range(days)],
+        "weather_code": fill(1),
+        "temperature_2m_max": fill(20.0), "temperature_2m_min": fill(10.0),
+        "temperature_2m_mean": fill(15.0),
+        "precipitation_sum": fill(0.0), "precipitation_probability_max": fill(10),
+        "wind_speed_10m_max": fill(15.0),
+        "sunrise": [f"2026-04-{22+i:02d}T06:00" for i in range(days)],
+        "sunset":  [f"2026-04-{22+i:02d}T20:00" for i in range(days)],
+        "daylight_duration": fill(50400.0), "sunshine_duration": fill(36000.0),
+        "uv_index_max": fill(5.0),
+        "apparent_temperature_max": fill(19.0), "apparent_temperature_min": fill(9.0),
+    }}
+
+
+def _smoke_forecast_hourly_json(hours: int = 1):
+    fill = lambda v: [v] * hours
+    return {"hourly": {
+        "time": [f"2026-04-22T{h:02d}:00" for h in range(hours)],
+        "temperature_2m": fill(12.0), "relative_humidity_2m": fill(55),
+        "apparent_temperature": fill(11.0),
+        "precipitation": fill(0.0), "precipitation_probability": fill(10),
+        "cloud_cover": fill(10), "weather_code": fill(1),
+        "wind_speed_10m": fill(8.0), "wind_direction_10m": fill(180),
+    }}
+
+
+_SMOKE_CASES = {
+    "get_current_date":              {"timezone": "UTC"},
+    "get_current_time_in_city":      {"city": "Kyiv"},
+    "get_current_time_where_i_am":   {},
+    "detect_my_location_by_ip":      {},
+    "lookup_ip_geolocation":         {"ip": "8.8.8.8"},
+    "find_place_coordinates":        {"city": "Kyiv"},
+    "search_places":                 {"query": "Kyiv"},
+    "resolve_address":               {"address": "Khreshchatyk 1, Kyiv"},
+    "get_current_weather_in_city":   {"city": "Kyiv"},
+    "get_weather_outside_right_now": {},
+    "get_weather_forecast":          {"city": "Kyiv", "days": 1},
+    "get_weather_forecast_for_today":    {},
+    "get_weather_forecast_for_tomorrow": {},
+    "get_hourly_forecast":           {"city": "Kyiv", "hours": 1},
+    "get_sunrise_sunset":            {"city": "Kyiv"},
+    "get_air_quality":               {"city": "Kyiv"},
+    "get_weather_by_coordinates":    {"latitude": 50.45, "longitude": 30.52},
+    "get_historical_weather":        {"city": "Kyiv", "start_date_iso": "2024-01-01",
+                                      "end_date_iso": "2024-01-01"},
+    "get_wikipedia_summary":         {"title": "Kyiv"},
+    "get_country_info":              {"country": "UA"},
+    "get_public_holidays":           {"country_code": "UA", "year": 2026},
+    "convert_currency":              {"amount": 10, "from_currency": "USD", "to_currency": "EUR"},
+    "calculate":                     {"expression": "2 + 2"},
+    "list_radio_stations":           {"country": "UA", "limit": 1},
+    "web_search":                    {"query": "kyiv", "limit": 1},
+    "news":                          {"query": "kyiv"},
+    "hackernews":                    {"category": "top", "limit": 1},
+    "trends":                        {"country_code": "US", "limit": 1},
+}
+
+
+@pytest.mark.parametrize("tool_name", sorted(_SMOKE_CASES.keys()))
+@respx.mock
+async def test_smoke_every_tool_returns_envelope(tool_name):
+    """Call each @mcp.tool once on its happy path; assert response is
+    a dict with `relay_to_user` and `guidance` (envelope contract).
+    Every upstream is mocked at the URL level to return plausible
+    success payloads — the goal is "nothing raises", not canonicality."""
+    respx.get(server.GEOIP_URL).mock(return_value=httpx.Response(200, json=_smoke_geoip_json()))
+    respx.get(f"{server.GEOIP_URL}/").mock(return_value=httpx.Response(200, json=_smoke_geoip_json()))
+    respx.get(f"{server.GEOIP_URL}/8.8.8.8").mock(return_value=httpx.Response(200, json=_smoke_geoip_json()))
+    respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json=_smoke_geocode_json()))
+
+    def _forecast_side_effect(request):
+        q = request.url.params
+        if "hourly" in q:
+            return httpx.Response(200, json=_smoke_forecast_hourly_json(int(q.get("forecast_days", "1"))))
+        if "current" in q:
+            return httpx.Response(200, json=_smoke_forecast_current_json())
+        return httpx.Response(200, json=_smoke_forecast_daily_json(int(q.get("forecast_days", "1"))))
+    respx.get(server.FORECAST_URL).mock(side_effect=_forecast_side_effect)
+    respx.get(server.ARCHIVE_URL).mock(return_value=httpx.Response(200, json=_smoke_forecast_daily_json()))
+    respx.get(server.AIR_QUALITY_URL).mock(return_value=httpx.Response(200, json={
+        "current": {
+            "time": "2026-04-22T10:00", "pm2_5": 5.0, "pm10": 10.0,
+            "ozone": 50.0, "nitrogen_dioxide": 10.0, "sulphur_dioxide": 1.0,
+            "carbon_monoxide": 100.0, "european_aqi": 20, "us_aqi": 30,
+        },
+    }))
+    respx.route(url__regex=r".*wikipedia\.org.*").mock(
+        return_value=httpx.Response(200, json={
+            "title": "Kyiv", "description": "desc", "extract": "Kyiv is the capital",
+            "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Kyiv"}},
+            "lang": "en",
+        }))
+    respx.route(url__regex=r".*restcountries\.com.*").mock(
+        return_value=httpx.Response(200, json=[{
+            "name": {"common": "Ukraine", "official": "Ukraine"},
+            "cca2": "UA", "capital": ["Kyiv"], "region": "Europe",
+            "subregion": "Eastern Europe", "population": 44_000_000,
+            "area": 603500,
+            "currencies": {"UAH": {"name": "hryvnia", "symbol": "₴"}},
+            "languages": {"ukr": "Ukrainian"},
+            "idd": {"root": "+3", "suffixes": ["80"]},
+            "borders": [], "timezones": ["UTC+02:00"], "flag": "🇺🇦",
+        }]))
+    respx.route(url__regex=r".*date\.nager\.at.*").mock(
+        return_value=httpx.Response(200, json=[{
+            "date": "2026-01-01", "localName": "NY", "name": "New Year",
+            "countryCode": "UA", "fixed": True, "global": True,
+            "counties": None, "launchYear": None, "types": ["Public"],
+        }]))
+    respx.route(url__regex=r".*er-api\.com.*").mock(
+        return_value=httpx.Response(200, json={
+            "result": "success", "base_code": "USD",
+            "rates": {"USD": 1.0, "EUR": 0.9, "UAH": 40.0},
+            "time_last_update_utc": "Mon, 22 Apr 2026 00:00 +0000",
+        }))
+    respx.route(url__regex=r".*radio-browser\.info.*").mock(
+        return_value=httpx.Response(200, json=[{
+            "name": "R1", "url": "http://r1", "url_resolved": "http://r1",
+            "homepage": "http://r1", "favicon": "", "tags": "",
+            "country": "Ukraine", "countrycode": "UA", "language": "ukrainian",
+            "bitrate": 128, "codec": "mp3",
+        }]))
+    respx.route(url__regex=r".*nominatim\.openstreetmap\.org.*").mock(
+        return_value=httpx.Response(200, json=[{
+            "lat": "50.45", "lon": "30.52",
+            "display_name": "Khreshchatyk 1, Kyiv",
+            "address": {"city": "Kyiv", "country_code": "ua",
+                        "country": "Ukraine", "road": "Khreshchatyk",
+                        "house_number": "1"},
+        }]))
+    respx.route(url__regex=r".*photon\.komoot\.io.*").mock(
+        return_value=httpx.Response(200, json={"features": []}))
+    respx.get(server.DDG_LITE_URL).mock(return_value=httpx.Response(
+        200,
+        text='<a class="result__a" href="http://x">X</a>'
+             '<a class="result__snippet">snippet</a>',
+    ))
+    respx.get(server.GNEWS_SEARCH_URL).mock(return_value=httpx.Response(
+        200,
+        text='<?xml version="1.0"?><rss><channel><item>'
+             '<title>T</title><link>http://x</link><source>S</source>'
+             '<pubDate>Tue, 22 Apr 2026 09:00:00 GMT</pubDate>'
+             '</item></channel></rss>',
+    ))
+    respx.get(server.GNEWS_TOP_URL).mock(return_value=httpx.Response(
+        200, text='<?xml version="1.0"?><rss><channel/></rss>'))
+    respx.get(server.GTRENDS_RSS_URL).mock(return_value=httpx.Response(
+        200, text='<?xml version="1.0"?><rss><channel/></rss>'))
+    respx.route(url__regex=r".*hacker-news\.firebaseio\.com.*").mock(
+        side_effect=lambda req: httpx.Response(
+            200,
+            json=[101] if "stories" in req.url.path else {
+                "id": 101, "title": "T", "url": "http://x",
+                "score": 10, "descendants": 5, "by": "u", "time": 1_700_000_000,
+            },
+        )
+    )
+
+    fn = getattr(server, tool_name)
+    r = await fn(**_SMOKE_CASES[tool_name])
+    assert isinstance(r, dict), f"{tool_name} returned non-dict {type(r).__name__}"
+    assert "relay_to_user" in r, f"{tool_name} missing `relay_to_user`"
+    assert "guidance" in r, f"{tool_name} missing `guidance`"
+
+
+# ── Cross-fat-tool error messages ────────────────────────────────────────
+#
+# Live repro 2026-04-23 (4b model chat session): model called
+# `geo(action="air_quality")` and got Pydantic's bare "Input should be
+# 'find_coordinates', 'search_places', …" — no hint that `air_quality`
+# is an action on `weather`, so the model spiralled through other geo
+# actions. The lean variant now widens `action: str` and runs its own
+# check that suggests the correct fat tool by name.
+
+
+@pytest.mark.parametrize(
+    "wrong_tool,action,expected_correct_tool",
+    [
+        ("geo",       "air_quality",     "weather"),
+        ("geo",       "by_coordinates",  "weather"),
+        ("weather",   "wikipedia",       "knowledge"),
+        ("weather",   "find_coordinates","geo"),
+        ("knowledge", "search",          "web"),
+        ("web",       "calculate",       "knowledge"),
+    ],
+)
+async def test_fat_lean_action_on_wrong_domain_suggests_correct_tool(
+    wrong_tool, action, expected_correct_tool
+):
+    import fat_tools_lean
+    fn = getattr(fat_tools_lean, wrong_tool)
+    with pytest.raises(ValueError, match=rf"belongs to `{expected_correct_tool}`") as e:
+        await fn(action=action, params={})
+    # Message MUST name both the wrong tool and the suggestion.
+    assert wrong_tool in str(e.value)
+    assert f"{expected_correct_tool}(action={action!r}" in str(e.value)
+
+
+async def test_fat_lean_action_unknown_lists_valid_set():
+    """Completely unknown action (not in ANY fat tool) falls back to
+    the per-tool valid-set enumeration so the model at least sees
+    what THIS tool supports."""
+    import fat_tools_lean
+    with pytest.raises(ValueError, match="unknown action 'frobnicate'") as e:
+        await fat_tools_lean.geo(action="frobnicate", params={})
+    # The valid list must be shown (alphabetised for stability).
+    msg = str(e.value)
+    assert "find_coordinates" in msg and "search_places" in msg
