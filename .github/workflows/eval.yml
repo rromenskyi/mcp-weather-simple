@@ -26,26 +26,10 @@ name: eval tool-calling
 on:
   workflow_dispatch:
     inputs:
-      preset:
-        description: >-
-          Shortcut that hard-codes every other axis so a one-click
-          dispatch doesn't need 5 dropdowns. Non-empty wins over the
-          individual fields below.
-            `quick-4b` — qwen3.5:4b on fat_tools_lean, chunk_count=1,
-              terse docs, schema=off. Smallest-model smoke on the
-              production surface. 2-3 min on self-hosted L4.
-            (leave empty to use the individual fields as before.)
-        required: false
-        default: ''
-        type: choice
-        options:
-          - ''
-          - quick-4b
       model:
         description: >-
           Single model to evaluate (overrides the default matrix).
           Leave empty to run qwen3.5:9b + qwen3:14b in parallel.
-          Ignored when `preset` is set.
         required: false
         default: ''
         type: choice
@@ -193,49 +177,35 @@ jobs:
     steps:
       - id: pick
         run: |
-          # Preset shortcut: when set, hard-codes every axis so a
-          # one-click dispatch doesn't need 5 dropdowns. Falls through
-          # to the individual inputs when empty.
-          preset='${{ github.event.inputs.preset }}'
-          case "$preset" in
-            quick-4b)
-              single='qwen3.5:4b'
-              router_mode='fat_tools_lean'
-              runs_on='self-hosted'
-              schema='off'
-              docstrings='terse'
-              count='1'
-              ;;
-            ""|*)
-              single='${{ github.event.inputs.model }}'
-              router_mode='${{ github.event.inputs.router_mode || 'off' }}'
-              runs_on='${{ github.event.inputs.runs_on || 'github-hosted' }}'
-              schema='${{ github.event.inputs.output_schema || 'off' }}'
-              docstrings='${{ github.event.inputs.docstrings || 'terse' }}'
-              count='${{ github.event.inputs.chunk_count || '4' }}'
-              ;;
-          esac
-
+          single='${{ github.event.inputs.model }}'
           if [ -n "$single" ]; then
             echo "models=[\"$single\"]" >> "$GITHUB_OUTPUT"
           else
             echo 'models=["qwen3.5:9b","qwen3:14b"]' >> "$GITHUB_OUTPUT"
           fi
+          # Runner pool. Empty on schedule events (workflow_dispatch
+          # input isn't populated) → default to github-hosted.
+          runs_on='${{ github.event.inputs.runs_on || 'github-hosted' }}'
           echo "runs_on=$runs_on" >> "$GITHUB_OUTPUT"
+          # Router mode. Same schedule-default handling.
+          router_mode='${{ github.event.inputs.router_mode || 'off' }}'
           echo "router_mode=$router_mode" >> "$GITHUB_OUTPUT"
+          schema='${{ github.event.inputs.output_schema || 'off' }}'
           if [ "$schema" = "both" ]; then
             echo 'schemas=["off","on"]' >> "$GITHUB_OUTPUT"
           else
             echo "schemas=[\"$schema\"]" >> "$GITHUB_OUTPUT"
           fi
+          docstrings='${{ github.event.inputs.docstrings || 'terse' }}'
           if [ "$docstrings" = "both" ]; then
             echo 'docstrings=["terse","verbose"]' >> "$GITHUB_OUTPUT"
           else
             echo "docstrings=[\"$docstrings\"]" >> "$GITHUB_OUTPUT"
           fi
-          # Chunk count defaults to 4 (schedule default). Build the
-          # indices array inline so the eval job can use it straight
-          # via fromJSON with matrix expansion.
+          # Chunk count defaults to 2 (schedule default + explicit).
+          # Build the indices array inline so the eval job can use it
+          # straight via fromJSON with matrix expansion.
+          count='${{ github.event.inputs.chunk_count || '4' }}'
           case "$count" in
             1) echo 'chunks=["0"]' >> "$GITHUB_OUTPUT" ;;
             2) echo 'chunks=["0","1"]' >> "$GITHUB_OUTPUT" ;;
