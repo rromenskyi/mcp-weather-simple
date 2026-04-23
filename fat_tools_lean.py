@@ -1,6 +1,6 @@
 """Ultra-lean variant of `fat_tools.py` for `MCP_ROUTER_MODE=fat_tools_lean`.
 
-Same four domain-tools (weather / geo / knowledge / radio), same
+Same four domain-tools (weather / geo / knowledge / web), same
 action names, but the signature drops from `(action, name=None,
 lat=None, lon=None, ...)` down to just `(action, params={})`. That's
 a huge win on FastMCP-generated schema: every optional kwarg in
@@ -28,24 +28,27 @@ fat_tools.py (see that module's docstring).
 
 from __future__ import annotations
 
-from typing import Literal
+
+# Lean variant deliberately widens `action` from a `Literal[...]` to
+# plain `str`. The enum still lives in the per-fat-tool valid-set
+# below — we check the incoming value ourselves so the rejection can
+# point the model at the RIGHT fat tool instead of just listing this
+# tool's valid options. Lesson from the 2026-04-23 4b chat session:
+# `geo(action="air_quality")` failed with Pydantic's "Input should be
+# 'find_coordinates', 'search_places', …" — no hint that air_quality
+# is on `weather`, so the model spiralled through other geo actions.
+# Schema loses the enum annotation (client-side dropdown goes empty);
+# docstring still carries the contract. Fat (non-lean) variant keeps
+# Literal because its per-kwarg typed schema is the whole point.
+
+_WEATHER_ACTIONS: frozenset[str] = frozenset({
+    "current_here", "today_here", "tomorrow_here", "current_in_city",
+    "forecast_days", "hourly", "sunrise_sunset", "air_quality",
+    "by_coordinates", "historical",
+})
 
 
-_WEATHER_ACTIONS = Literal[
-    "current_here",
-    "today_here",
-    "tomorrow_here",
-    "current_in_city",
-    "forecast_days",
-    "hourly",
-    "sunrise_sunset",
-    "air_quality",
-    "by_coordinates",
-    "historical",
-]
-
-
-async def weather(action: _WEATHER_ACTIONS, params: dict | None = None) -> dict:
+async def weather(action: str, params: dict | None = None) -> dict:
     """Weather, air quality, sunrise/sunset. Pass `action` + `params` dict.
 
     Actions and their params:
@@ -64,7 +67,12 @@ async def weather(action: _WEATHER_ACTIONS, params: dict | None = None) -> dict:
                              "end_date_iso"?: str, "country_code"?: str}.
 
     `city` is always a single token (place name, postal code).
+
+    NOT here — wiki / country / holidays / currency / calc → `knowledge`;
+    geocoding / address / IP / time → `geo`; search / news / HN /
+    trends / radio → `web`.
     """
+    _check_action("weather", action, _WEATHER_ACTIONS)
     import server
     p = params or {}
     if action == "current_here":
@@ -101,19 +109,14 @@ async def weather(action: _WEATHER_ACTIONS, params: dict | None = None) -> dict:
     raise ValueError(f"weather: unknown action {action!r}")
 
 
-_GEO_ACTIONS = Literal[
-    "find_coordinates",
-    "search_places",
-    "resolve_address",
-    "detect_my_location",
-    "lookup_ip",
-    "time_here",
-    "time_in_city",
-    "date_in_timezone",
-]
+_GEO_ACTIONS: frozenset[str] = frozenset({
+    "find_coordinates", "search_places", "resolve_address",
+    "detect_my_location", "lookup_ip",
+    "time_here", "time_in_city", "date_in_timezone",
+})
 
 
-async def geo(action: _GEO_ACTIONS, params: dict | None = None) -> dict:
+async def geo(action: str, params: dict | None = None) -> dict:
     """Geocoding / reverse-geocoding / IP geolocation / time / date.
 
     Actions and their params:
@@ -128,7 +131,12 @@ async def geo(action: _GEO_ACTIONS, params: dict | None = None) -> dict:
       - `time_here`:          {} — user's local time.
       - `time_in_city`:       {"city": str, "country_code"?: str}.
       - `date_in_timezone`:   {"timezone"?: str="UTC"} — IANA tz name.
+
+    NOT here — weather / air quality / sunrise / sunset → `weather`;
+    wiki / country / holidays / currency / calc → `knowledge`; search
+    / news / HN / trends / radio → `web`.
     """
+    _check_action("geo", action, _GEO_ACTIONS)
     import server
     p = params or {}
     if action == "find_coordinates":
@@ -157,18 +165,13 @@ async def geo(action: _GEO_ACTIONS, params: dict | None = None) -> dict:
     raise ValueError(f"geo: unknown action {action!r}")
 
 
-_KNOWLEDGE_ACTIONS = Literal[
-    "wikipedia",
-    "country_info",
-    "public_holidays",
-    "convert_currency",
-    "calculate",
-]
+_KNOWLEDGE_ACTIONS: frozenset[str] = frozenset({
+    "wikipedia", "country_info", "public_holidays",
+    "convert_currency", "calculate",
+})
 
 
-async def knowledge(
-    action: _KNOWLEDGE_ACTIONS, params: dict | None = None
-) -> dict:
+async def knowledge(action: str, params: dict | None = None) -> dict:
     """Wikipedia / country facts / public holidays / currency / arithmetic.
 
     Actions and their params:
@@ -186,7 +189,12 @@ async def knowledge(
                               min/max/abs/pow. Constants pi/e/tau. No units, no
                               unresolved symbols. Examples: `"3847 * 29"`,
                               `"2450 * 0.15"`, `"pi * 5**2"`, `"hypot(3, 4)"`.
+
+    NOT here — weather / air quality / sunrise / sunset → `weather`;
+    geocoding / address / IP / time → `geo`; search / news / HN /
+    trends / radio → `web`.
     """
+    _check_action("knowledge", action, _KNOWLEDGE_ACTIONS)
     import server
     p = params or {}
     if action == "wikipedia":
@@ -209,52 +217,37 @@ async def knowledge(
     raise ValueError(f"knowledge: unknown action {action!r}")
 
 
-async def radio(params: dict | None = None) -> dict:
-    """Find internet-radio streams (NOT FM/AM frequencies).
-
-    Pass at least one filter in `params`:
-      - `country`?: str — ISO-2 (`"UA"`) preferred, or full name (`"Ukraine"`)
-      - `tag`?: str — genre keyword (`"jazz"`, `"news"`)
-      - `language`?: str — full English name (`"russian"`, not `"ru"`)
-      - `limit`?: int=5 — 1-20
-    """
-    import server
-    p = params or {}
-    return await server.list_radio_stations(
-        p.get("country"), p.get("tag"), p.get("language"), p.get("limit", 5)
-    )
+_WEB_ACTIONS: frozenset[str] = frozenset({
+    "search", "news", "hackernews", "trends", "radio",
+})
 
 
-_WEB_ACTIONS = Literal["search", "news", "hackernews", "trends"]
+async def web(action: str, params: dict | None = None) -> dict:
+    """Internet search / news / HN / trends / radio — anything off the live web.
 
-
-async def web(action: _WEB_ACTIONS, params: dict | None = None) -> dict:
-    """Internet search / news / Hacker News / Google Trends — real-time info.
-
-    Pick by user intent — all four route through this one tool:
-      - `search`:     {"query": str, "limit"?: int=8}
-                       general DuckDuckGo web search (docs, references,
-                       static content). Use for «найди», «что такое X»,
-                       non-time-sensitive queries.
+    Actions:
+      - `search`:     {"query": str, "limit"?: int=8} — DuckDuckGo; docs/refs.
       - `news`:       {"query"?: str, "topic"?: str, "lang"?: str, "limit"?: int=10}
-                       recent journalism via Google News. No args →
-                       top headlines for user's detected country
-                       (GeoIP). `query` → news-search. `topic`
-                       (e.g. "tech", "business") → category-style
-                       search. Use for current events and «что
-                       нового про X».
-      - `hackernews`: {"category"?: "top"|"new"|"best"|"ask"|"show"|"job", "limit"?: int=15}
-                       HN feed. Use when the user names HN, asks
-                       about the tech community, or wants Show HN /
-                       Ask HN.
-      - `trends`:     {"country_code"?: str, "limit"?: int=15}
-                       today's top search queries by country (GeoIP
-                       default). Answers «что в трендах сегодня».
+                       — Google News. No args → GeoIP-country top headlines.
+      - `hackernews`: {"category"?: "top"|"new"|"best"|"ask"|"show"|"job",
+                        "limit"?: int=15} — HN feed; use when named or for
+                        programmer-community discussion.
+      - `trends`:     {"country_code"?: str, "limit"?: int=15} — Google Trends
+                        (GeoIP default).
+      - `radio`:      {"country"?: str, "tag"?: str, "language"?: str,
+                        "limit"?: int=5} — internet-radio streams (NOT FM/AM).
+                        Pass ≥1 filter. `country`=ISO-2 or English name,
+                        `language`=English name ("russian", not "ru").
 
-    Disambiguation in one sentence: `search` = static web, `news` =
-    time-sensitive journalism, `hackernews` = tech-community feed,
-    `trends` = mass-attention signal.
+    One-line rule: `search`=static web, `news`=time-sensitive journalism,
+    `hackernews`=tech community, `trends`=mass-attention signal,
+    `radio`=audio streams.
+
+    NOT here — weather / air quality / sunrise → `weather`; geocoding
+    / address / IP / time → `geo`; wiki / country / calc / currency →
+    `knowledge`.
     """
+    _check_action("web", action, _WEB_ACTIONS)
     import server
     p = params or {}
     if action == "search":
@@ -268,11 +261,15 @@ async def web(action: _WEB_ACTIONS, params: dict | None = None) -> dict:
         return await server.hackernews(p.get("category", "top"), p.get("limit", 15))
     if action == "trends":
         return await server.trends(p.get("country_code"), p.get("limit", 15))
+    if action == "radio":
+        return await server.list_radio_stations(
+            p.get("country"), p.get("tag"), p.get("language"), p.get("limit", 5)
+        )
     raise ValueError(f"web: unknown action {action!r}")
 
 
 def install_fat_tools_lean(mcp) -> None:
-    """Register the 5 lean fat-domain tools on the FastMCP instance.
+    """Register the 4 lean fat-domain tools on the FastMCP instance.
 
     Called from `server._install_router()` only when mode is
     `fat_tools_lean`. The narrow `@mcp.tool`s remain registered but
@@ -281,7 +278,6 @@ def install_fat_tools_lean(mcp) -> None:
     mcp.tool()(weather)
     mcp.tool()(geo)
     mcp.tool()(knowledge)
-    mcp.tool()(radio)
     mcp.tool()(web)
 
 
@@ -295,3 +291,39 @@ def _require(params: dict, *keys: str) -> None:
     missing = [k for k in keys if params.get(k) in (None, "", [])]
     if missing:
         raise ValueError(f"missing required param(s) in `params`: {', '.join(missing)}")
+
+
+# Reverse index: action_name → owning fat tool. Populated once from
+# the frozenset declarations above so renaming an action in exactly
+# one place updates everything.
+_ACTION_TO_FAT: dict[str, str] = {
+    **{a: "weather"   for a in _WEATHER_ACTIONS},
+    **{a: "geo"       for a in _GEO_ACTIONS},
+    **{a: "knowledge" for a in _KNOWLEDGE_ACTIONS},
+    **{a: "web"       for a in _WEB_ACTIONS},
+}
+
+
+def _check_action(fat_name: str, action: str, valid: frozenset[str]) -> None:
+    """Validate `action` and raise a self-correcting error on miss.
+
+    If the given action is valid for THIS fat tool: no-op. If it's
+    valid for another fat tool: explicit suggestion ("action `X`
+    belongs to `Y`, try `Y(action='X')`"). Completely unknown: list
+    the valid set for this tool. The pointed-at-correct-tool case is
+    the whole reason this lean variant widened its `action` parameter
+    from `Literal[...]` to `str` — Pydantic's LiteralError message
+    lists the current tool's valid actions but can't know that the
+    user was calling the wrong tool in the first place.
+    """
+    if action in valid:
+        return
+    correct = _ACTION_TO_FAT.get(action)
+    if correct and correct != fat_name:
+        raise ValueError(
+            f"action {action!r} belongs to `{correct}`, not `{fat_name}`. "
+            f"Try `{correct}(action={action!r}, params=...)`."
+        )
+    raise ValueError(
+        f"{fat_name}: unknown action {action!r}. Valid: {sorted(valid)}."
+    )

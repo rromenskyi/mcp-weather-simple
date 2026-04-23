@@ -5,9 +5,13 @@ import functools
 import hashlib
 import inspect
 import json
+import logging
 import os
+import re as _re
 import secrets
 import time
+
+_log = logging.getLogger("mcp-weather")
 from datetime import date, datetime, timezone as _tz
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -22,18 +26,21 @@ PORT = int(os.getenv("MCP_PORT", "8000"))
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
 # Default `fat_tools_lean` since 2026-04-22 — see
-# docs/tool-catalog-scaling.md for the measurements. Collapses the
-# 23 narrow tools into 4 fat domain-tools with an `(action, params)`
-# signature; catalog drops 5289 → 1090 tokens (−79%) with zero hit-rate
-# regression on qwen3.5:9b (93.2% both ways). Set `MCP_ROUTER_MODE=off`
-# to get the historical monolith surface — needed for nightly eval
-# baseline continuity and as an escape hatch if any specific client
-# turns out to misbehave on the fat surface.
+# docs/tool-catalog-scaling.md for the original measurements.
+# Collapses the 28 narrow tools into 4 fat domain-tools
+# (weather / geo / knowledge / web) with an `(action, params)`
+# signature; catalog ≈ 1350 tokens post-2026-04-23 (radio folded into
+# `web(radio)`, web domain added) vs ~6800 for the monolith. Hit rate
+# stays at 93.2% on qwen3.5:9b across live modes. Set
+# `MCP_ROUTER_MODE=off` for the historical monolith surface — needed
+# for nightly eval baseline continuity and as an escape hatch if any
+# specific client turns out to misbehave on the fat surface.
 #
 # Other modes kept behind this flag: `fat_tools` (fat with named
-# kwargs, +800 tokens vs lean) and `list_changed` (spec-correct
-# dynamic router — confirmed unsupported by mcphost / Open WebUI,
-# kept as a reference implementation only).
+# kwargs, ~900 tokens more than lean because of the pydantic
+# nullability shell) and `list_changed` (spec-correct dynamic router —
+# confirmed unsupported by mcphost / Open WebUI, kept as a reference
+# implementation only).
 ROUTER_MODE = os.getenv("MCP_ROUTER_MODE", "fat_tools_lean").strip().lower()
 
 # ── Tool-calling policy (#19) ──────────────────────────────────────────────
@@ -73,17 +80,47 @@ mcp = FastMCP(
 # chat session runs in its own Pod with its own mcp-weather process,
 # so process-local memory IS the session.
 #
-# Tuple is (fingerprint, monotonic_timestamp). maxlen=10 caps memory;
+# Per-session history of recent calls. Keyed by session id (or a
+# stable fallback when the MCP request context isn't available — stdio
+# mode, tests, direct Python imports). Each value is a deque of
+# (fingerprint, monotonic_timestamp) tuples. maxlen=10 caps memory;
 # entries older than `_LOOP_WINDOW_SECONDS` are pruned on each check.
-_RECENT_CALLS: "collections.deque[tuple[str, float]]" = collections.deque(maxlen=10)
+#
+# Sessions isolation: pre-2026-04-23 a single process-global deque
+# meant two unrelated HTTP clients asking the same question within
+# 120s would see the second request short-circuit as
+# `duplicate_of_recent_call` — a live bug for the platform sidecar
+# that could be called by two chat sessions on the same pod.
+_RECENT_CALLS_BY_SESSION: dict[str, "collections.deque[tuple[str, float]]"] = {}
 _LOOP_WINDOW_SECONDS = 120
+_DEFAULT_SESSION_KEY = "_default"
+
+
+def _current_session_key() -> str:
+    """Resolve a stable key for the current MCP session, or a fallback.
+
+    FastMCP stores the active request in the lowlevel server's
+    `request_ctx` ContextVar. When set, the session object carries a
+    unique id; we key on that so each client gets its own detector
+    window. Outside a request (stdio spawn without a live
+    session, or unit tests calling tools directly), we fall back to
+    a single shared key — same behaviour as the old global deque.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+        ctx = request_ctx.get()
+    except (ImportError, LookupError):
+        return _DEFAULT_SESSION_KEY
+    session = getattr(ctx, "session", None)
+    sid = getattr(session, "session_id", None) or id(session) if session else None
+    return str(sid) if sid else _DEFAULT_SESSION_KEY
 
 
 def _reset_recent_calls() -> None:
-    """Clear the detector's state. Exposed for tests — the fixture wipes
-    between cases so a `get_current_weather_in_city("Kyiv")` in test A
-    doesn't short-circuit the same call in test B."""
-    _RECENT_CALLS.clear()
+    """Clear every session's detector state. Exposed for tests — the
+    fixture wipes between cases so a `get_current_weather_in_city("Kyiv")`
+    in test A doesn't short-circuit the same call in test B."""
+    _RECENT_CALLS_BY_SESSION.clear()
 
 
 def _call_fingerprint(tool_name: str, arguments: dict) -> str:
@@ -97,18 +134,38 @@ def _call_fingerprint(tool_name: str, arguments: dict) -> str:
 
 
 def _detect_and_record_call(fingerprint: str) -> bool:
-    """True if this fingerprint matches a recent call still inside the window.
+    """True if this fingerprint matches a recent call from the SAME
+    session still inside the window.
 
     Always appends the current call (even on duplicates) so the window
     stays fresh. Returning True does NOT stop the caller from running —
     the decision to short-circuit is the caller's.
     """
     now = time.monotonic()
+    session_key = _current_session_key()
+
+    # Opportunistic GC for abandoned sessions. Before touching the
+    # current session's deque, scan every OTHER session and drop ones
+    # whose most-recent call is past the window. Worst-case O(N)
+    # sessions per call with N ≤ small in practice (each chat pod
+    # concurrency is bounded). The previous "after append, pop if
+    # empty" sweep was dead code — an append-then-check never fires
+    # because append just pushed one entry.
+    for other_key, other_deque in list(_RECENT_CALLS_BY_SESSION.items()):
+        if other_key == session_key or not other_deque:
+            continue
+        if now - other_deque[-1][1] > _LOOP_WINDOW_SECONDS:
+            del _RECENT_CALLS_BY_SESSION[other_key]
+
+    recent = _RECENT_CALLS_BY_SESSION.get(session_key)
+    if recent is None:
+        recent = collections.deque(maxlen=10)
+        _RECENT_CALLS_BY_SESSION[session_key] = recent
     # Prune the left side of the deque until the head is within window.
-    while _RECENT_CALLS and now - _RECENT_CALLS[0][1] > _LOOP_WINDOW_SECONDS:
-        _RECENT_CALLS.popleft()
-    is_dup = any(fp == fingerprint for fp, _ in _RECENT_CALLS)
-    _RECENT_CALLS.append((fingerprint, now))
+    while recent and now - recent[0][1] > _LOOP_WINDOW_SECONDS:
+        recent.popleft()
+    is_dup = any(fp == fingerprint for fp, _ in recent)
+    recent.append((fingerprint, now))
     return is_dup
 
 
@@ -144,9 +201,8 @@ def _loop_guarded(fn):
                 },
                 relay_to_user=False,
                 guidance=(
-                    f"Duplicate call: you already ran `{fn.__name__}` with "
-                    "these arguments in the last few minutes. Use that "
-                    "previous result or ask the user to clarify — do NOT retry."
+                    f"Duplicate `{fn.__name__}` call in last few min. "
+                    "Use previous result or ask user; don't retry."
                 ),
             )
         return await fn(*args, **kwargs)
@@ -663,16 +719,10 @@ def _ambiguity_response(query: str, candidates: list[dict], reason: str, country
     # today — the escape hatch is `get_weather_by_coordinates` which
     # takes lat/lon straight from the chosen candidate.
     if country_code:
-        narrow = (
-            "Take the chosen candidate's `latitude` and `longitude` "
-            "and call `get_weather_by_coordinates` directly."
-        )
+        narrow = "Use chosen candidate's lat/lon via `get_weather_by_coordinates`."
     else:
-        narrow = (
-            "Then re-call with `country_code` set (ISO-3166 alpha-2) "
-            "to narrow the geocoder."
-        )
-    guidance = f"Ambiguous: {reason}. Ask the user to pick one: {names}. {narrow}"
+        narrow = "Re-call with `country_code` (ISO-3166 alpha-2) to narrow."
+    guidance = f"Ambiguous: {reason}. Ask user to pick: {names}. {narrow}"
     return _respond(
         {
             "query": query,
@@ -721,8 +771,12 @@ async def _geocode(city: str, country_code: str | None = None) -> dict:
     if country_code:
         cc_upper = country_code.strip().upper()
         filtered = [h for h in results if (h.get("country_code") or "").upper() == cc_upper]
-        if filtered:
-            results = filtered
+        # Hard filter — if the caller pinned a country, a zero-length
+        # filtered list means "no matching hit in that country". Silently
+        # falling back to the unfiltered top-1 was the pre-2026-04-23
+        # behaviour, which masked wrong-country hits as successful
+        # results and made `country_code` a meaningless hint.
+        results = filtered
     if not results:
         raise ValueError(_city_not_found_error(city, country_code))
     # Ambiguity detection uses the RAW hits (not _annotate'd yet) so the
@@ -1029,11 +1083,14 @@ async def _try_nominatim(address: str, country_code: str | None, accept_language
 
 
 async def _try_photon(address: str, country_code: str | None) -> dict | None:
-    params: dict[str, str | int] = {"q": address, "limit": 1}
-    if country_code:
-        # Photon uses lowercase ISO-2 via `lang` param? No — it uses
-        # `layer` and doesn't have a clean country filter. Skip.
-        pass
+    # Request a wider candidate list when the caller pins a country —
+    # Photon has no server-side country filter, so we filter in the
+    # response. With `limit=1` a spurious first hit in the wrong
+    # country used to mask the correct later hit as "not found".
+    params: dict[str, str | int] = {
+        "q": address,
+        "limit": 10 if country_code else 1,
+    }
     try:
         data = await _fetch_json(
             PHOTON_URL,
@@ -1047,16 +1104,25 @@ async def _try_photon(address: str, country_code: str | None) -> dict | None:
     features = data.get("features") if isinstance(data, dict) else None
     if not features:
         return None
-    feat = features[0]
-    # Apply country_code filter client-side if requested. Photon puts
-    # the ISO-2 in `properties.countrycode`; a mismatch means we asked
-    # for US and got a Canadian hit on a spurious lexical match.
     if country_code:
         cc_want = country_code.strip().upper()
-        cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
-        if cc_got and cc_got != cc_want:
-            return None
-    return _normalise_photon_feature(feat, address_input=address)
+        # Walk the list; return the first hit whose `countrycode`
+        # matches. Photon orders by relevance so the chosen item is the
+        # best-scoring match within the requested country.
+        for feat in features:
+            cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
+            if cc_got == cc_want:
+                return _normalise_photon_feature(feat, address_input=address)
+        # Observability: when N candidates all miss the country pin, the
+        # default response is opaque ("nothing found"). Log the miss so
+        # a debugging operator can tell whether Photon had data but we
+        # filtered it vs. the upstream genuinely didn't know the address.
+        _log.info(
+            "Photon returned %d candidates for %r, none in %s — falling through to 'not found'",
+            len(features), address, cc_want,
+        )
+        return None
+    return _normalise_photon_feature(features[0], address_input=address)
 
 
 @mcp.tool()
@@ -1109,8 +1175,7 @@ async def resolve_address(address: str, country_code: str | None = None) -> dict
         {"address": query, "country_code": country_code, "candidates": []},
         relay_to_user=False,
         guidance=(
-            f"No address resolved for {query!r}. Ask the user to "
-            "rephrase or provide more detail (city, country)."
+            f"No address for {query!r}. Ask user to rephrase or add city/country."
         ),
     )
 
@@ -1167,14 +1232,11 @@ _GUIDANCE_DIRECT = "Relay directly."
 # models truncate or ignore long instructions. The full rationale
 # (VPN / NAT / cluster egress specifics) is in the repo; the LLM just
 # needs the action verb + the uncertainty flag.
-_GUIDANCE_GEOIP_AUTODETECT = (
-    "Relay with a caveat: city was auto-detected from the caller's IP and "
-    "may be wrong (VPN / NAT). If the user disagrees, ask for the city."
-)
-_GUIDANCE_GEOIP_EXPLICIT = (
-    "Relay with a caveat: city is a GeoIP approximation, may be off for "
-    "VPN / mobile / data-center IPs."
-)
+# Kept terse — these ride every GeoIP-backed response; every token is
+# context tax per turn. The rule (add a caveat, ask if wrong) is
+# shorter than the explanation.
+_GUIDANCE_GEOIP_AUTODETECT = "Caveat: city from caller's IP; may miss on VPN/NAT. Ask user if off."
+_GUIDANCE_GEOIP_EXPLICIT = "Caveat: GeoIP approximation."
 
 
 def _respond(
@@ -1996,8 +2058,9 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
     Returns None when the mirror can't resolve the input either (so
     the outer handler re-raises the original restcountries error)."""
     code_or_name = country.strip()
-    # The mirror's `country(code: ID!)` only accepts alpha-2, so plain
-    # names route through the `countries(filter: {name})` list query.
+    # The mirror's `country(code: ID!)` only accepts alpha-2. alpha-3
+    # codes (`"USA"`, `"DEU"`) and plain names (`"United States"`) both
+    # route through the `countries(filter: {name})` list query.
     if len(code_or_name) == 2 and code_or_name.isalpha():
         query = """
         query ($c: ID!) {
@@ -2020,8 +2083,11 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
           }
         }
         """
-        # GraphQL filter uses re2 — anchor to start for reasonable precision.
-        variables = {"q": f"^{code_or_name}$"}
+        # GraphQL filter uses RE2. `(?i)` enables case-insensitive match
+        # so "united states" / "USA" / "ukraine" all hit. No anchors —
+        # partial match so alpha-3 codes (which upstream doesn't index
+        # as names) degrade to None gracefully rather than false-hit.
+        variables = {"q": f"(?i){_re.escape(code_or_name)}"}
         key = "countries"
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
@@ -2032,7 +2098,14 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
             )
             r.raise_for_status()
             payload = r.json()
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
+        # Mirror also failed. Log so that when the outer `get_country_info`
+        # re-raises the restcountries error, the operator has both failure
+        # reasons in the log stream ("primary 502 + mirror timeout" vs
+        # "primary 502 + mirror also 5xx'd" vs "primary 502 + mirror
+        # unreachable"). Level=INFO on purpose — not error-worthy by
+        # itself, the outer path decides that.
+        _log.info("country_info mirror fallback failed for %r: %s", country, exc)
         return None
     data = (payload.get("data") or {}).get(key)
     if isinstance(data, list):
@@ -2056,7 +2129,8 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
         "borders": [],
         "timezones": [],
         "flag_emoji": data.get("emoji"),
-        "data_source": "graphql_mirror",
+        # `data_source` intentionally not set here — the caller in
+        # `get_country_info` stamps it so the marker lives in one place.
     }
 
 
@@ -2084,14 +2158,15 @@ async def get_country_info(country: str) -> dict:
         # original error (mirror's error would be misleading).
         fallback = await _country_info_graphql_fallback(code)
         if fallback:
-            guidance = (
-                "Relay with a caveat: primary country database is temporarily "
-                "unavailable; these values come from a public mirror that does "
-                "NOT carry population / area / borders / timezones."
+            return _respond(
+                {**fallback, "data_source": "graphql_mirror"},
+                guidance="Caveat: mirror fallback, no population/area/borders/timezones.",
             )
-            return _respond({**fallback, "data_source": "graphql_mirror"},
-                            guidance=guidance)
-        raise primary_err
+        # Bubble the primary failure. The helper already logs its own
+        # exception context on failure (see _country_info_graphql_fallback),
+        # so the debugging operator sees BOTH "why primary failed" and
+        # "why the mirror didn't save us".
+        raise
     hit = data[0] if isinstance(data, list) else data
     currencies = hit.get("currencies") or {}
     languages = hit.get("languages") or {}
@@ -2359,13 +2434,25 @@ async def calculate(expression: str) -> dict:
         return _respond(
             {"expression": expression, "error": str(exc)},
             relay_to_user=False,
-            guidance="Expression rejected. Rewrite using plain arithmetic and listed functions/constants, or ask the user to clarify. Do not retry an identical expression.",
+            guidance="Invalid expression. Rewrite with listed ops/funcs or ask user. Don't retry same.",
         )
     except ZeroDivisionError:
         return _respond(
             {"expression": expression, "error": "division by zero"},
             relay_to_user=False,
-            guidance="Division by zero is undefined. Ask the user whether they meant something else.",
+            guidance="Division by zero. Ask user what they meant.",
+        )
+    except (TypeError, OverflowError, MemoryError) as exc:
+        # Whitelisted funcs still raise on bad argument types: `factorial(3.5)`
+        # (non-int), `sum(1, 2)` (non-iterable), `gcd(1.2, 2)` (non-int),
+        # `math.exp(10000)` (overflow), `factorial(10**8)` (MemoryError —
+        # Python arbitrary-precision ints don't overflow, they allocate
+        # until the process is OOM-killed). Surface each as a controlled
+        # envelope rather than bubbling an internal Python error.
+        return _respond(
+            {"expression": expression, "error": f"{type(exc).__name__}: {exc}"},
+            relay_to_user=False,
+            guidance="Wrong argument type or range for a math function. Ask user to clarify.",
         )
     return _respond({"expression": expression, "result": value})
 
@@ -2383,7 +2470,6 @@ async def calculate(expression: str) -> dict:
 # to summarise an answer.
 
 
-import re as _re
 import xml.etree.ElementTree as _ET
 from urllib.parse import parse_qs as _parse_qs, urlparse as _urlparse
 
@@ -2470,7 +2556,7 @@ async def web_search(query: str, limit: int = 8) -> dict:
         return _respond(
             {"query": query, "results": []},
             relay_to_user=False,
-            guidance="DuckDuckGo returned no results or its HTML shape drifted. Ask the user to rephrase, or try news/hackernews if intent allows.",
+            guidance="No DDG hits. Ask user to rephrase, or try news/hackernews.",
         )
     return _respond({"query": query, "results": results})
 
@@ -2693,7 +2779,7 @@ async def trends(country_code: str | None = None, limit: int = 15) -> dict:
         return _respond(
             {"country_code": country_code, "items": []},
             relay_to_user=False,
-            guidance="Google Trends returned an unparseable body — try again in a minute.",
+            guidance="Trends RSS unparseable; retry shortly.",
         )
     items: list[dict] = []
     # Google Trends RSS uses a `ht:` namespace for `approx_traffic` and
@@ -2976,21 +3062,32 @@ _ENVELOPE_OUTPUT_SCHEMA = {
 }
 
 
+_OUTPUT_SCHEMA_SKIP: frozenset[str] = frozenset({"select_domain"})
+
+
 def _apply_output_schema_experiment() -> None:
     """When MCP_OUTPUT_SCHEMA=on, attach _ENVELOPE_OUTPUT_SCHEMA to every
     registered tool so the MCP catalog advertises the envelope contract
     via spec 2025-06-18's `outputSchema` field.
 
-    Runs after all @mcp.tool decorators have registered, so every Tool
-    object is in `mcp._tool_manager._tools` by the time we iterate.
+    Must run AFTER `_install_router()` so that fat-mode tools
+    (weather / geo / knowledge / web), which are registered inside
+    the router installer, also receive the outputSchema stamp. Called
+    once at module bottom (see the final block).
+
+    `select_domain` is skipped: its response is router metadata
+    (`active_domain` / `previous_domain` / `list_changed_notification`),
+    not the data-tool envelope, so stamping the envelope schema would
+    advertise a contract its payload doesn't satisfy — strict clients
+    that validate `structuredContent` against `outputSchema` would
+    reject the call.
     """
     if _OUTPUT_SCHEMA_MODE != "on":
         return
-    for tool in mcp._tool_manager._tools.values():
+    for name, tool in mcp._tool_manager._tools.items():
+        if name in _OUTPUT_SCHEMA_SKIP:
+            continue
         tool.output_schema = _ENVELOPE_OUTPUT_SCHEMA
-
-
-_apply_output_schema_experiment()
 
 
 # ── Docstring verbosity A/B (terse vs verbose) ─────────────────────────────
@@ -3169,7 +3266,6 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "get_country_info",
         "get_public_holidays",
         "convert_currency",
-        "list_radio_stations",
         "calculate",
     ),
     "web": (
@@ -3177,6 +3273,7 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "news",
         "hackernews",
         "trends",
+        "list_radio_stations",
     ),
 }
 
@@ -3248,9 +3345,9 @@ def _install_router() -> None:
           - `location` — geocoding, address parse, IP geolocation.
           - `time`     — current date/time here or in a named city.
           - `knowledge` — wikipedia, country info, holidays, currency,
-                          radio stations.
+                          calculator.
           - `web`      — DuckDuckGo search, Google News, Hacker News,
-                          Google Trends.
+                          Google Trends, radio streams.
 
         After you call this, the tool list updates (the client will
         re-fetch it) and the domain's tools appear. Switch domains
@@ -3301,18 +3398,18 @@ def _install_router() -> None:
 # fat_tools.py. Kept at module scope so the `_install_fat_tools_mode`
 # filter knows which of the registered tools to keep visible.
 _FAT_TOOL_NAMES: frozenset[str] = frozenset(
-    {"weather", "geo", "knowledge", "radio", "web"}
+    {"weather", "geo", "knowledge", "web"}
 )
 
 
 # ── Domain filter (MCP_ENABLED_DOMAINS) ─────────────────────────────────────
 #
 # Optional CSV env var that restricts the advertised tool surface to a
-# subset of domains. Empty / unset (default) = all 5 domains visible.
+# subset of domains. Empty / unset (default) = all 4 domains visible.
 # Validation is strict — an unknown domain name fails loudly at boot
 # rather than silently hiding every tool. The filter composes with
 # whatever list_tools override the active router mode installs:
-# in fat modes it narrows the 5 fat tools; in off mode it narrows the
+# in fat modes it narrows the 4 fat tools; in off mode it narrows the
 # full narrow surface via the NARROW_TO_FAT mapping; in list_changed
 # mode it further narrows `_ROUTER_DOMAINS`-derived visibility.
 #
@@ -3368,7 +3465,7 @@ def _apply_domain_filter(tools: list) -> list:
 
 
 def _install_fat_tools_mode() -> None:
-    """Register the 4 fat domain-tools and hide the 23 narrow ones.
+    """Register the 4 fat domain-tools and hide the 28 narrow ones.
 
     Works with static-catalog clients (mcphost, Open WebUI) — no
     `notifications/tools/list_changed` involved. Clients see a stable,
@@ -3396,7 +3493,7 @@ def _install_fat_tools_mode() -> None:
     _base_list_tools = mcp.list_tools
 
     async def _fat_list_tools():
-        # Hide every narrow tool — the fat 5 are the only surface the
+        # Hide every narrow tool — the fat 4 are the only surface the
         # model is allowed to see in this mode. Then drop any fat tool
         # outside `ENABLED_DOMAINS` (no-op when the filter is empty).
         all_tools = await _base_list_tools()
@@ -3411,9 +3508,9 @@ def _install_fat_tools_lean_mode() -> None:
 
     Same list_tools-filter machinery as ``_install_fat_tools_mode``, just
     registering the `fat_tools_lean.*` variants (which share the fat-
-    tool names `weather` / `geo` / `knowledge` / `radio`). Tool-
-    manager registration is mutually exclusive — lean and non-lean
-    can't both be active because FastMCP would reject the name clash.
+    tool names `weather` / `geo` / `knowledge` / `web`). Tool-manager
+    registration is mutually exclusive — lean and non-lean can't both
+    be active because FastMCP would reject the name clash.
     """
     import fat_tools_lean
 
@@ -3462,6 +3559,12 @@ def _install_off_mode_domain_filter() -> None:
 _install_router()
 if ROUTER_MODE == "off" and ENABLED_DOMAINS:
     _install_off_mode_domain_filter()
+
+# Output-schema experiment runs LAST — fat-mode tools are registered
+# inside `_install_router()`, so stamping has to come after them
+# or the fat surface would ship without outputSchema even though the
+# experiment env says otherwise.
+_apply_output_schema_experiment()
 
 
 if __name__ == "__main__":

@@ -121,10 +121,10 @@ def _is_qwen3_family(model: str) -> bool:
 
 
 # Router-mode awareness for scoring. When the MCP server is started
-# with `MCP_ROUTER_MODE=fat_tools`, the 23 narrow tools are hidden
-# behind 4 fat tools (weather/geo/knowledge/radio) and the model
-# picks an operation via an `action` argument instead of a distinct
-# tool name. We map narrow → (fat_tool, action) so the same
+# with `MCP_ROUTER_MODE=fat_tools` / `fat_tools_lean`, the 28 narrow
+# tools are hidden behind 4 fat tools (weather/geo/knowledge/web) and
+# the model picks an operation via an `action` argument instead of a
+# distinct tool name. We map narrow → (fat_tool, action) so the same
 # cases.yaml scores against both surfaces without duplication.
 #
 # Populated at runtime via `from fat_tools import NARROW_TO_FAT` —

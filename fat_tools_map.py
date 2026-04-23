@@ -39,18 +39,15 @@ NARROW_TO_FAT: dict[str, tuple[str, str | None]] = {
     "get_country_info":                  ("knowledge", "country_info"),
     "get_public_holidays":               ("knowledge", "public_holidays"),
     "convert_currency":                  ("knowledge", "convert_currency"),
-    # radio (single entry, no action discriminator)
-    "list_radio_stations":               ("radio", None),
     # knowledge — arithmetic calculator (added 2026-04-22 for small-LLM
     # math reliability; see `server._safe_eval` for the whitelist).
     "calculate":                         ("knowledge", "calculate"),
-    # web — search / news / HN / trends (added 2026-04-22). All four
-    # providers are no-auth; see the narrow tools' docstrings in
-    # server.py for the disambiguation rules (search = static refs,
-    # news = time-sensitive journalism, hackernews = tech community,
-    # trends = mass-attention signal).
+    # web — search / news / HN / trends / radio. Radio folded in from
+    # its own standalone `radio` fat domain 2026-04-23 to save ~150
+    # catalog tokens; it's internet-sourced and fits semantically.
     "web_search":                        ("web", "search"),
     "news":                              ("web", "news"),
     "hackernews":                        ("web", "hackernews"),
     "trends":                            ("web", "trends"),
+    "list_radio_stations":               ("web", "radio"),
 }

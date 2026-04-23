@@ -1,11 +1,13 @@
 """Fat domain-tools for `MCP_ROUTER_MODE=fat_tools`.
 
-Collapses the 23 narrow `@mcp.tool`s in ``server.py`` into 4 fat tools —
-``weather`` / ``geo`` / ``knowledge`` / ``radio`` — where the model picks
+Collapses the 28 narrow `@mcp.tool`s in ``server.py`` into 4 fat tools —
+``weather`` / ``geo`` / ``knowledge`` / ``web`` — where the model picks
 a domain at the top level and passes an ``action`` discriminator to
 select the concrete operation inside. Goal is to shrink the per-turn
-tool catalog from ~4500 tokens to ~1500-2000 so that small models on
+tool catalog from ~6800 tokens to ~2250 so that small models on
 CPU (i7 + qwen3.5:9b) can prefill the catalog in acceptable time.
+(See `fat_tools_lean.py` for the even tighter `(action, params dict)`
+variant that hits ~1350 tokens — the production default.)
 
 **Not auto-loaded** — ``server._install_router()`` calls
 ``install_fat_tools(mcp)`` only when ``MCP_ROUTER_MODE=fat_tools``. The
@@ -98,6 +100,10 @@ async def weather(
     `city` is ALWAYS a single token: a place name (`"Kyiv"`), a postal
     code (`"84010"`), or the shape `"City, Region"` when disambiguation
     is required. Full-sentence queries will fail.
+
+    NOT here — wiki / country / holidays / currency / calc → `knowledge`;
+    geocoding / address / IP / time → `geo`; search / news / HN /
+    trends / radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "current_here":
@@ -178,6 +184,10 @@ async def geo(
           Needs: `city`. Optional: `country_code`.
       - `date_in_timezone` — today's date in a named timezone.
           Optional: `timezone` (IANA, default `"UTC"`).
+
+    NOT here — weather / air quality / sunrise → `weather`; wiki /
+    country / holidays / currency / calc → `knowledge`; search /
+    news / HN / trends / radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "find_coordinates":
@@ -253,6 +263,10 @@ async def knowledge(
           Needs: `expression` (no units, no unresolved symbols).
           Examples: `"3847 * 29"`, `"2450 * 0.15"`, `"pi * 5**2"`,
           `"hypot(3, 4)"`, `"sqrt(2450) + pi"`.
+
+    NOT here — weather / air quality / sunrise → `weather`; geocoding
+    / address / IP / time → `geo`; search / news / HN / trends /
+    radio → `web`.
     """
     import server  # lazy — see module docstring
     if action == "wikipedia":
@@ -278,23 +292,6 @@ async def knowledge(
 # ── radio ───────────────────────────────────────────────────────────────
 
 
-async def radio(
-    country: str | None = None,
-    tag: str | None = None,
-    language: str | None = None,
-    limit: int = 5,
-) -> dict:
-    """Find internet-radio stations (streams, not FM/AM frequencies).
-
-    Pass at least one filter: `country` (ISO-2 like `"UA"` preferred, or
-    full English name), `tag` (genre keyword: `"jazz"`, `"news"`,
-    `"chillout"`), or `language` (full English name like `"russian"`,
-    not the ISO code). `limit` caps the result count, 1-20 (default 5).
-    """
-    import server  # lazy — see module docstring
-    return await server.list_radio_stations(country, tag, language, limit)
-
-
 # ── web ─────────────────────────────────────────────────────────────────
 
 _WEB_ACTIONS = Literal[
@@ -302,6 +299,7 @@ _WEB_ACTIONS = Literal[
     "news",
     "hackernews",
     "trends",
+    "radio",
 ]
 
 
@@ -312,31 +310,37 @@ async def web(
     lang: str | None = None,
     category: str | None = None,
     country_code: str | None = None,
+    country: str | None = None,
+    tag: str | None = None,
+    language: str | None = None,
     limit: int | None = None,
 ) -> dict:
-    """Internet search / news / Hacker News / Google Trends — real-time info.
+    """Internet search / news / HN / trends / radio — anything off the live web.
 
-    Pick `action` based on the user's intent. One-sentence disambiguation:
-    `search` = static web references, `news` = time-sensitive journalism,
-    `hackernews` = tech-community feed, `trends` = mass-attention signal.
+    Rule: `search`=static web, `news`=time-sensitive journalism,
+    `hackernews`=tech community, `trends`=mass-attention signal,
+    `radio`=audio streams.
 
-    Actions (each uses only the listed parameters):
-      - `search` — general DuckDuckGo search for docs / references /
-          blog posts.
+    Actions:
+      - `search` — DuckDuckGo; docs/references/blog posts.
           Needs: `query`. Optional: `limit` (1-15, default 8).
-      - `news` — recent journalism via Google News.
-          No args → top headlines for the user's detected country
-          (GeoIP). `query` → news-search. `topic` (e.g. `"tech"`,
-          `"business"`) → category-style search.
-          Optional: `lang` (ISO-639 two-letter — `"en"`, `"ru"`,
-          `"uk"`), `limit` (1-20, default 10).
-      - `hackernews` — Hacker News community feed.
-          Optional: `category` (one of `"top"`, `"new"`, `"best"`,
-          `"ask"`, `"show"`, `"job"` — default `"top"`),
-          `limit` (1-30, default 15).
-      - `trends` — today's top search queries (Google Trends RSS).
-          Optional: `country_code` (ISO-3166-1 alpha-2 — default:
-          GeoIP-detected), `limit` (1-25, default 15).
+      - `news` — Google News. No args → GeoIP top headlines.
+          `query` → news-search. `topic` (e.g. "tech") → category search.
+          Optional: `lang` ("en"/"ru"/"uk"), `limit` (1-20, default 10).
+      - `hackernews` — HN feed.
+          Optional: `category` ("top"|"new"|"best"|"ask"|"show"|"job",
+          default "top"), `limit` (1-30, default 15).
+      - `trends` — Google Trends RSS.
+          Optional: `country_code` (ISO-3166 alpha-2, default GeoIP),
+          `limit` (1-25, default 15).
+      - `radio` — internet-radio streams (NOT FM/AM).
+          Pass ≥1: `country` (ISO-2 or English name), `tag` (genre),
+          `language` (English name like "russian", not "ru").
+          Optional: `limit` (1-20, default 5).
+
+    NOT here — weather / air quality / sunrise → `weather`; geocoding
+    / address / IP / time → `geo`; wiki / country / calc / currency
+    → `knowledge`.
     """
     import server  # lazy — see module docstring
     if action == "search":
@@ -354,6 +358,10 @@ async def web(
         return await server.trends(
             country_code, limit if limit is not None else 15
         )
+    if action == "radio":
+        return await server.list_radio_stations(
+            country, tag, language, limit if limit is not None else 5
+        )
     raise ValueError(f"web: unknown action {action!r}")
 
 
@@ -361,17 +369,17 @@ async def web(
 
 
 def install_fat_tools(mcp) -> None:
-    """Register the five fat-domain tools on the FastMCP instance.
+    """Register the four fat-domain tools on the FastMCP instance.
 
     Called from ``server._install_router()`` only when router mode is
     ``fat_tools``. The narrow `@mcp.tool`s in ``server.py`` remain
     registered but are hidden by the ``list_tools`` override so the
-    client only sees the fat surface.
+    client only sees the fat surface. `radio` folded into `web`
+    2026-04-23 — one less domain in the catalog.
     """
     mcp.tool()(weather)
     mcp.tool()(geo)
     mcp.tool()(knowledge)
-    mcp.tool()(radio)
     mcp.tool()(web)
 
 

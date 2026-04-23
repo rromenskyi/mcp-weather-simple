@@ -117,12 +117,12 @@ on:
           - 'self-hosted'
       router_mode:
         description: >-
-          `off` (default) — 23 narrow @mcp.tool s, catalog ~5300 tokens.
-          `fat_tools` — 4 fat domain-tools dispatching via `action` +
-          named kwargs, catalog ~1900 tokens (-64% vs off).
-          `fat_tools_lean` — 4 fat tools with signature `(action,
-          params={})`, drops the pydantic nullability shell on optional
-          kwargs, catalog ~1100 tokens (-79% vs off, -42% vs fat_tools).
+          `off` — 28 narrow @mcp.tool s, catalog ~6800 tokens (baseline).
+          `fat_tools` — 4 fat domain-tools (weather/geo/knowledge/web)
+          dispatching via `action` + named kwargs, catalog ~2250 tokens.
+          `fat_tools_lean` (default) — 4 fat tools with signature
+          `(action, params={})`, drops the pydantic nullability shell
+          on optional kwargs, catalog ~1350 tokens (-78% vs off).
           Eval scorer rewrites `expected_tool` to `fat(action)` form
           for both fat variants so the same cases.yaml scores all three.
           Use to A/B the prefill-cost vs tool-picking-reliability
@@ -325,10 +325,11 @@ jobs:
         # the streamable-http transport bound to loopback. No auth
         # because nothing else on the runner has network access to it.
         # `MCP_OUTPUT_SCHEMA` wires the A/B experiment into this row.
-        # `MCP_ROUTER_MODE` wires the router A/B — `off` is the 23-tool
-        # monolith, `fat_tools` is the 4 fat domain-tools. The eval
-        # scorer reads the same env to rewrite `expected_tool` into
-        # `fat(action)` form when fat_tools is active.
+        # `MCP_ROUTER_MODE` wires the router A/B — `off` is the 28-tool
+        # monolith, `fat_tools` / `fat_tools_lean` expose 4 fat
+        # domain-tools (weather/geo/knowledge/web). The eval scorer
+        # reads the same env to rewrite `expected_tool` into
+        # `fat(action)` form when a fat mode is active.
         env:
           MCP_TRANSPORT: streamable-http
           MCP_HOST: 127.0.0.1
