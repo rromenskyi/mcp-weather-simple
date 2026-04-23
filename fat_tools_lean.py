@@ -225,8 +225,54 @@ async def radio(params: dict | None = None) -> dict:
     )
 
 
+_WEB_ACTIONS = Literal["search", "news", "hackernews", "trends"]
+
+
+async def web(action: _WEB_ACTIONS, params: dict | None = None) -> dict:
+    """Internet search / news / Hacker News / Google Trends — real-time info.
+
+    Pick by user intent — all four route through this one tool:
+      - `search`:     {"query": str, "limit"?: int=8}
+                       general DuckDuckGo web search (docs, references,
+                       static content). Use for «найди», «что такое X»,
+                       non-time-sensitive queries.
+      - `news`:       {"query"?: str, "topic"?: str, "lang"?: str, "limit"?: int=10}
+                       recent journalism via Google News. No args →
+                       top headlines for user's detected country
+                       (GeoIP). `query` → news-search. `topic`
+                       (e.g. "tech", "business") → category-style
+                       search. Use for current events and «что
+                       нового про X».
+      - `hackernews`: {"category"?: "top"|"new"|"best"|"ask"|"show"|"job", "limit"?: int=15}
+                       HN feed. Use when the user names HN, asks
+                       about the tech community, or wants Show HN /
+                       Ask HN.
+      - `trends`:     {"country_code"?: str, "limit"?: int=15}
+                       today's top search queries by country (GeoIP
+                       default). Answers «что в трендах сегодня».
+
+    Disambiguation in one sentence: `search` = static web, `news` =
+    time-sensitive journalism, `hackernews` = tech-community feed,
+    `trends` = mass-attention signal.
+    """
+    import server
+    p = params or {}
+    if action == "search":
+        _require(p, "query")
+        return await server.web_search(p["query"], p.get("limit", 8))
+    if action == "news":
+        return await server.news(
+            p.get("query"), p.get("topic"), p.get("lang"), p.get("limit", 10)
+        )
+    if action == "hackernews":
+        return await server.hackernews(p.get("category", "top"), p.get("limit", 15))
+    if action == "trends":
+        return await server.trends(p.get("country_code"), p.get("limit", 15))
+    raise ValueError(f"web: unknown action {action!r}")
+
+
 def install_fat_tools_lean(mcp) -> None:
-    """Register the 4 lean fat-domain tools on the FastMCP instance.
+    """Register the 5 lean fat-domain tools on the FastMCP instance.
 
     Called from `server._install_router()` only when mode is
     `fat_tools_lean`. The narrow `@mcp.tool`s remain registered but
@@ -236,6 +282,7 @@ def install_fat_tools_lean(mcp) -> None:
     mcp.tool()(geo)
     mcp.tool()(knowledge)
     mcp.tool()(radio)
+    mcp.tool()(web)
 
 
 def _require(params: dict, *keys: str) -> None:

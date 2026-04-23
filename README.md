@@ -35,6 +35,10 @@ Two transports in a single codebase:
 | `get_public_holidays(country_code, year=None)`           | Public / bank holidays for a country in a given year. Backed by `date.nager.at`. |
 | `convert_currency(amount, from_currency, to_currency)`   | Fiat currency conversion at today's rate. ISO-4217 codes. |
 | `calculate(expression)`                                  | Safe arithmetic evaluator — `+ - * / // % **` (`^` also works as power), `pi`/`e`/`tau`, `sqrt`, `log`, trig, `hypot`, etc. Call for any 4+-digit multiplication, chained percentage, or geometry formula rather than guessing — small-LLM mental arithmetic is unreliable. AST-whitelisted, no `eval`. |
+| `web_search(query, limit=8)`                             | General DuckDuckGo web search — documentation, references, blog posts. Picks over `news` / `hackernews` when the query is not time-sensitive. No API key. |
+| `news(query=None, topic=None, lang=None, limit=10)`      | Recent journalism via Google News RSS. No args → top headlines for the user's GeoIP country. `query` → news-search. `topic` → category-style search. Time-sensitive counterpart to `web_search`. |
+| `hackernews(category="top", limit=15)`                   | Hacker News feed — `top` / `new` / `best` / `ask` / `show` / `job`. Tech-community curation; pick when the user names HN or asks about the programmer community. Free Firebase API, no key. |
+| `trends(country_code=None, limit=15)`                    | Today's top search queries via Google Trends RSS. GeoIP-default country. Answers "что в трендах сегодня" / "what's everyone searching for". |
 | `list_radio_stations(country=None, tag=None, language=None, limit=10)` | Browse internet-radio stations by country, tag or language. Volunteer catalogue (radio-browser.info) with mirror fallback. |
 
 ### No-arg shortcuts for common questions
@@ -52,22 +56,43 @@ The lower-level tools stay available for precise follow-ups (another city, a spe
 
 ## Router modes
 
-The 24 narrow `@mcp.tool`s above can be advertised to the MCP client in four shapes, selected via the `MCP_ROUTER_MODE` env var. This is a **tool-catalog-tokens vs. fidelity** trade-off: a CPU-bound Ollama host pays for every byte of the catalog on every turn, so a smaller catalog means faster time-to-first-token.
+The 28 narrow `@mcp.tool`s above can be advertised to the MCP client in four shapes, selected via the `MCP_ROUTER_MODE` env var. This is a **tool-catalog-tokens vs. fidelity** trade-off: a CPU-bound Ollama host pays for every byte of the catalog on every turn, so a smaller catalog means faster time-to-first-token.
 
 | Mode                   | What the client sees                             | Catalog tokens | Hit rate (qwen3.5:9b) |
 |------------------------|--------------------------------------------------|---------------:|----------------------:|
-| `off`                  | All 24 narrow tools                              |         ~5 846 |                 93.2 % |
-| `fat_tools`            | 4 fat domain-tools, one `action` enum + per-field kwargs |         ~2 098 |                 93.2 % |
-| **`fat_tools_lean`** *(default)* | 4 fat domain-tools, `(action, params: dict)` signature |       **~1 275** |             **93.2 %** |
+| `off`                  | All 28 narrow tools                              |         ~6 800 |                 93.2 % |
+| `fat_tools`            | 5 fat domain-tools, one `action` enum + per-field kwargs |         ~2 450 |                 93.2 % |
+| **`fat_tools_lean`** *(default)* | 5 fat domain-tools, `(action, params: dict)` signature |       **~1 500** |             **93.2 %** |
 | `list_changed`         | Spec-correct dynamic narrowing via MCP notification | —            |                   —    |
 
-The four fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, **`geo`**, **`knowledge`**, **`radio`**. Each takes an `action` enum that maps 1:1 to one of the 24 narrow tools, plus that action's arguments. The narrow-to-fat mapping lives in `fat_tools_map.py` — single source of truth, drift-guarded by a unit test. Both narrow and fat shapes go through the same underlying impls, so behaviour is identical; only the on-wire tool-catalog shape changes.
+The five fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, **`geo`**, **`knowledge`**, **`radio`**, **`web`**. Each takes an `action` enum that maps 1:1 to one of the 28 narrow tools, plus that action's arguments. The narrow-to-fat mapping lives in `fat_tools_map.py` — single source of truth, drift-guarded by a unit test. Both narrow and fat shapes go through the same underlying impls, so behaviour is identical; only the on-wire tool-catalog shape changes.
+
+Catalog-token figures above are estimates post-bundled-fields + post-web-domain (2026-04-22). The `fat_tools_lean` headline number of ~1 500 tokens is ~18 % larger than the previous 1 275 measurement because the `web` domain adds one fat tool (~250 tokens of docstring + enum) — still a **~78 %** reduction vs the monolith, same hit rate. Exact per-deployment measurements live in [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
 
 `list_changed` is kept as a reference implementation of the spec-correct dynamic shape, but every MCP client tested (mcphost, Open WebUI) ignores the `tools/list_changed` notification and keeps the initial-handshake catalog, so in practice it does not actually narrow anything. **Treat it as dead** — use one of the fat modes instead.
 
-**Picking a mode**: on a GPU-class host the catalog cost is negligible and `off` gives the model the richest surface. On a CPU-bound host (Intel i7 + quantised 9b), prefill time scales linearly with prompt tokens and a ~78 % catalog reduction is directly visible as faster first-turn latency — that is why `fat_tools_lean` is the production default on this project's sibling `platform` repo.
+**Picking a mode**: on a GPU-class host the catalog cost is negligible and `off` gives the model the richest surface. On a CPU-bound host (Intel i7 + quantised 9b), prefill time scales linearly with prompt tokens and the catalog reduction is directly visible as faster first-turn latency — that is why `fat_tools_lean` is the production default on this project's sibling `platform` repo.
 
-The eval scorer in `tests/integration/eval_tool_calling.py` auto-canonicalises `expected_tool` to `fat(action)` form in both fat modes, so the same `cases.yaml` scores cleanly across all three live modes. For the full experimental write-up (measured token counts, per-family hit-rate breakdown, per-deployment recommendation), see [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
+### Turning off whole domains (`MCP_ENABLED_DOMAINS`)
+
+Optional CSV env var that restricts which of the five fat domains are advertised at all. Empty / unset (default) = every domain is visible. Valid domain names: `weather`, `geo`, `knowledge`, `radio`, `web`.
+
+```
+MCP_ENABLED_DOMAINS=weather,geo,knowledge,radio   # disable web at this deployment
+MCP_ENABLED_DOMAINS=weather                         # weather-only sidecar
+```
+
+Invalid domain names fail loudly at server startup (no silent over-filtering). The filter composes with whatever router mode is active:
+
+- **`fat_tools` / `fat_tools_lean`** — drops fat tools whose name is outside the set.
+- **`off`** — drops narrow tools whose domain (via `NARROW_TO_FAT`) is outside the set.
+- **`list_changed`** — further narrows the already-domain-scoped visibility.
+
+Typical use: the platform chat sidecar turns off `web` for tenants where the model shouldn't reach the general internet outside of Open-Meteo / Wikipedia / etc.
+
+### Scorer canonicalisation
+
+The eval scorer in `tests/integration/eval_tool_calling.py` auto-canonicalises `expected_tool` to `fat(action)` form in both fat modes, so the same `cases.yaml` scores cleanly across all three live modes — `router_mode=off` and `router_mode=fat_tools_lean` runs return directly comparable hit-rate numbers.
 
 ## Multilingual queries
 
@@ -348,7 +373,7 @@ Two layers, each answering a different question.
 
 ### Unit tests — does the server behave?
 
-`tests/test_server.py` (130+ cases, ~3 s total, respx-mocked — no
+`tests/test_server.py` (145+ cases, ~3 s total, respx-mocked — no
 network). Proves every tool returns the correct response shape for
 a known input: correct geocoding fallback across scripts, correct
 `day_label` anchoring to the city's timezone, correct per-hour /
@@ -375,11 +400,12 @@ tool will cause the model to fumble the choice.
 `tests/integration/eval_tool_calling.py` + `tests/integration/cases.yaml`
 measure this as a **top-1 tool-selection hit rate**:
 
-- 48+ `(prompt, expected_tool)` pairs grouped by intent family —
+- 57+ `(prompt, expected_tool)` pairs grouped by intent family —
   weather-here, forecast-tomorrow, hourly, air quality, sunrise,
   historical, time-in-city, time-here, currency, country-info,
   public holidays, radio stations, Wikipedia, places-disambiguation,
-  address resolution, calculator.
+  address resolution, calculator, web search, news, Hacker News,
+  trends.
 - Russian + English mixed on purpose: the geocoder has a
   script-fallback chain, and the model has to trigger tools the
   same way regardless of query language.

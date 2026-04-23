@@ -44,4 +44,13 @@ NARROW_TO_FAT: dict[str, tuple[str, str | None]] = {
     # knowledge — arithmetic calculator (added 2026-04-22 for small-LLM
     # math reliability; see `server._safe_eval` for the whitelist).
     "calculate":                         ("knowledge", "calculate"),
+    # web — search / news / HN / trends (added 2026-04-22). All four
+    # providers are no-auth; see the narrow tools' docstrings in
+    # server.py for the disambiguation rules (search = static refs,
+    # news = time-sensitive journalism, hackernews = tech community,
+    # trends = mass-attention signal).
+    "web_search":                        ("web", "search"),
+    "news":                              ("web", "news"),
+    "hackernews":                        ("web", "hackernews"),
+    "trends":                            ("web", "trends"),
 }

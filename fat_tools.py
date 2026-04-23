@@ -295,11 +295,73 @@ async def radio(
     return await server.list_radio_stations(country, tag, language, limit)
 
 
+# ── web ─────────────────────────────────────────────────────────────────
+
+_WEB_ACTIONS = Literal[
+    "search",
+    "news",
+    "hackernews",
+    "trends",
+]
+
+
+async def web(
+    action: _WEB_ACTIONS,
+    query: str | None = None,
+    topic: str | None = None,
+    lang: str | None = None,
+    category: str | None = None,
+    country_code: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """Internet search / news / Hacker News / Google Trends — real-time info.
+
+    Pick `action` based on the user's intent. One-sentence disambiguation:
+    `search` = static web references, `news` = time-sensitive journalism,
+    `hackernews` = tech-community feed, `trends` = mass-attention signal.
+
+    Actions (each uses only the listed parameters):
+      - `search` — general DuckDuckGo search for docs / references /
+          blog posts.
+          Needs: `query`. Optional: `limit` (1-15, default 8).
+      - `news` — recent journalism via Google News.
+          No args → top headlines for the user's detected country
+          (GeoIP). `query` → news-search. `topic` (e.g. `"tech"`,
+          `"business"`) → category-style search.
+          Optional: `lang` (ISO-639 two-letter — `"en"`, `"ru"`,
+          `"uk"`), `limit` (1-20, default 10).
+      - `hackernews` — Hacker News community feed.
+          Optional: `category` (one of `"top"`, `"new"`, `"best"`,
+          `"ask"`, `"show"`, `"job"` — default `"top"`),
+          `limit` (1-30, default 15).
+      - `trends` — today's top search queries (Google Trends RSS).
+          Optional: `country_code` (ISO-3166-1 alpha-2 — default:
+          GeoIP-detected), `limit` (1-25, default 15).
+    """
+    import server  # lazy — see module docstring
+    if action == "search":
+        _require(query=query)
+        return await server.web_search(query, limit if limit is not None else 8)
+    if action == "news":
+        return await server.news(
+            query, topic, lang, limit if limit is not None else 10
+        )
+    if action == "hackernews":
+        return await server.hackernews(
+            category or "top", limit if limit is not None else 15
+        )
+    if action == "trends":
+        return await server.trends(
+            country_code, limit if limit is not None else 15
+        )
+    raise ValueError(f"web: unknown action {action!r}")
+
+
 # ── install ─────────────────────────────────────────────────────────────
 
 
 def install_fat_tools(mcp) -> None:
-    """Register the four fat-domain tools on the FastMCP instance.
+    """Register the five fat-domain tools on the FastMCP instance.
 
     Called from ``server._install_router()`` only when router mode is
     ``fat_tools``. The narrow `@mcp.tool`s in ``server.py`` remain
@@ -310,6 +372,7 @@ def install_fat_tools(mcp) -> None:
     mcp.tool()(geo)
     mcp.tool()(knowledge)
     mcp.tool()(radio)
+    mcp.tool()(web)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
