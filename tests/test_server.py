@@ -127,7 +127,7 @@ async def test_tool_second_identical_call_returns_duplicate_envelope():
     assert second["relay_to_user"] is False
     assert second["tool_name"] == "get_current_weather_in_city"
     assert second["duplicate_of_recent_call"] is True
-    assert "Duplicate call" in second["guidance"]
+    assert "Duplicate" in second["guidance"]
 
 
 @respx.mock
@@ -2333,11 +2333,13 @@ def test_router_mode_default_is_fat_tools_lean(monkeypatch):
     assert srv.ROUTER_MODE == "fat_tools_lean", (
         f"default should be fat_tools_lean, got {srv.ROUTER_MODE!r}"
     )
-    # fat modes register the 5 fat tools in addition to the 28 narrow
+    # fat modes register the 4 fat tools in addition to the 28 narrow
     # ones; list_tools filter is what hides the narrow set from clients.
+    # Radio folded from its own `radio` fat into `web(radio)` 2026-04-23.
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-    assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(names)
-    assert len(names) == 33
+    assert {"weather", "geo", "knowledge", "web"}.issubset(names)
+    assert "radio" not in names
+    assert len(names) == 32
 
 
 @pytest.mark.asyncio
@@ -2359,19 +2361,20 @@ async def test_router_mode_fat_tools_exposes_four_domain_tools(monkeypatch):
     try:
         assert srv.ROUTER_MODE == "fat_tools"
 
-        # Manager holds both 28 narrow + 5 fat — filtering is done at
-        # list_tools time, not at registration.
+        # Manager holds both 28 narrow + 4 fat — filtering is done at
+        # list_tools time, not at registration. (Was 5 fat before
+        # radio got folded into web 2026-04-23.)
         all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-        assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(all_names)
+        assert {"weather", "geo", "knowledge", "web"}.issubset(all_names)
         assert "get_current_weather_in_city" in all_names  # still registered
-        assert len(all_names) == 33
+        assert len(all_names) == 32
 
         from mcp.types import ListToolsRequest
 
         handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
         req = ListToolsRequest(method="tools/list")
         visible = sorted(t.name for t in (await handler(req)).root.tools)
-        assert visible == ["geo", "knowledge", "radio", "weather", "web"]
+        assert visible == ["geo", "knowledge", "weather", "web"]
     finally:
         monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
         importlib.reload(srv)
@@ -2394,14 +2397,14 @@ async def test_router_mode_fat_tools_lean_exposes_four_with_params_dict(monkeypa
         assert srv.ROUTER_MODE == "fat_tools_lean"
 
         all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-        assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(all_names)
+        assert {"weather", "geo", "knowledge", "web"}.issubset(all_names)
         assert "get_current_weather_in_city" in all_names  # still registered
 
         from mcp.types import ListToolsRequest
         handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
         req = ListToolsRequest(method="tools/list")
         tools = (await handler(req)).root.tools
-        assert sorted(t.name for t in tools) == ["geo", "knowledge", "radio", "weather", "web"]
+        assert sorted(t.name for t in tools) == ["geo", "knowledge", "weather", "web"]
 
         # The lean schema has exactly two top-level props (action, params)
         # on the enum-bearing tools — that's the whole point of the variant.
@@ -2512,7 +2515,7 @@ def test_narrow_to_fat_map_covers_every_registered_tool(monkeypatch):
 
     # Every mapped fat tool name must be one of the 5 known domains.
     fat_tool_names = {fat for fat, _ in fat_tools_map.NARROW_TO_FAT.values()}
-    assert fat_tool_names == {"weather", "geo", "knowledge", "radio", "web"}, (
+    assert fat_tool_names == {"weather", "geo", "knowledge", "web"}, (
         f"unexpected fat tool name(s): {fat_tool_names}"
     )
 
@@ -2522,7 +2525,7 @@ def test_narrow_to_fat_map_covers_every_registered_tool(monkeypatch):
     [
         ("get_current_weather_in_city", "weather(current_in_city)"),
         ("get_wikipedia_summary",       "knowledge(wikipedia)"),
-        ("list_radio_stations",         "radio"),
+        ("list_radio_stations",         "web(radio)"),
         ("get_current_date",            "geo(date_in_timezone)"),
     ],
 )
@@ -2877,14 +2880,14 @@ async def test_enabled_domains_narrows_fat_lean_surface(monkeypatch):
     import server as srv
 
     monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
-    monkeypatch.setenv("MCP_ENABLED_DOMAINS", "weather,geo,knowledge,radio")
+    monkeypatch.setenv("MCP_ENABLED_DOMAINS", "weather,geo,knowledge")
     srv = importlib.reload(srv)
     try:
         from mcp.types import ListToolsRequest
 
         handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
         visible = {t.name for t in (await handler(ListToolsRequest(method="tools/list"))).root.tools}
-        assert visible == {"weather", "geo", "knowledge", "radio"}
+        assert visible == {"weather", "geo", "knowledge"}
         assert "web" not in visible
     finally:
         monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)

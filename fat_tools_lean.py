@@ -209,51 +209,29 @@ async def knowledge(
     raise ValueError(f"knowledge: unknown action {action!r}")
 
 
-async def radio(params: dict | None = None) -> dict:
-    """Find internet-radio streams (NOT FM/AM frequencies).
-
-    Pass at least one filter in `params`:
-      - `country`?: str — ISO-2 (`"UA"`) preferred, or full name (`"Ukraine"`)
-      - `tag`?: str — genre keyword (`"jazz"`, `"news"`)
-      - `language`?: str — full English name (`"russian"`, not `"ru"`)
-      - `limit`?: int=5 — 1-20
-    """
-    import server
-    p = params or {}
-    return await server.list_radio_stations(
-        p.get("country"), p.get("tag"), p.get("language"), p.get("limit", 5)
-    )
-
-
-_WEB_ACTIONS = Literal["search", "news", "hackernews", "trends"]
+_WEB_ACTIONS = Literal["search", "news", "hackernews", "trends", "radio"]
 
 
 async def web(action: _WEB_ACTIONS, params: dict | None = None) -> dict:
-    """Internet search / news / Hacker News / Google Trends — real-time info.
+    """Internet search / news / HN / trends / radio — anything off the live web.
 
-    Pick by user intent — all four route through this one tool:
-      - `search`:     {"query": str, "limit"?: int=8}
-                       general DuckDuckGo web search (docs, references,
-                       static content). Use for «найди», «что такое X»,
-                       non-time-sensitive queries.
+    Actions:
+      - `search`:     {"query": str, "limit"?: int=8} — DuckDuckGo; docs/refs.
       - `news`:       {"query"?: str, "topic"?: str, "lang"?: str, "limit"?: int=10}
-                       recent journalism via Google News. No args →
-                       top headlines for user's detected country
-                       (GeoIP). `query` → news-search. `topic`
-                       (e.g. "tech", "business") → category-style
-                       search. Use for current events and «что
-                       нового про X».
-      - `hackernews`: {"category"?: "top"|"new"|"best"|"ask"|"show"|"job", "limit"?: int=15}
-                       HN feed. Use when the user names HN, asks
-                       about the tech community, or wants Show HN /
-                       Ask HN.
-      - `trends`:     {"country_code"?: str, "limit"?: int=15}
-                       today's top search queries by country (GeoIP
-                       default). Answers «что в трендах сегодня».
+                       — Google News. No args → GeoIP-country top headlines.
+      - `hackernews`: {"category"?: "top"|"new"|"best"|"ask"|"show"|"job",
+                        "limit"?: int=15} — HN feed; use when named or for
+                        programmer-community discussion.
+      - `trends`:     {"country_code"?: str, "limit"?: int=15} — Google Trends
+                        (GeoIP default).
+      - `radio`:      {"country"?: str, "tag"?: str, "language"?: str,
+                        "limit"?: int=5} — internet-radio streams (NOT FM/AM).
+                        Pass ≥1 filter. `country`=ISO-2 or English name,
+                        `language`=English name ("russian", not "ru").
 
-    Disambiguation in one sentence: `search` = static web, `news` =
-    time-sensitive journalism, `hackernews` = tech-community feed,
-    `trends` = mass-attention signal.
+    One-line rule: `search`=static web, `news`=time-sensitive journalism,
+    `hackernews`=tech community, `trends`=mass-attention signal,
+    `radio`=audio streams.
     """
     import server
     p = params or {}
@@ -268,11 +246,15 @@ async def web(action: _WEB_ACTIONS, params: dict | None = None) -> dict:
         return await server.hackernews(p.get("category", "top"), p.get("limit", 15))
     if action == "trends":
         return await server.trends(p.get("country_code"), p.get("limit", 15))
+    if action == "radio":
+        return await server.list_radio_stations(
+            p.get("country"), p.get("tag"), p.get("language"), p.get("limit", 5)
+        )
     raise ValueError(f"web: unknown action {action!r}")
 
 
 def install_fat_tools_lean(mcp) -> None:
-    """Register the 5 lean fat-domain tools on the FastMCP instance.
+    """Register the 4 lean fat-domain tools on the FastMCP instance.
 
     Called from `server._install_router()` only when mode is
     `fat_tools_lean`. The narrow `@mcp.tool`s remain registered but
@@ -281,7 +263,6 @@ def install_fat_tools_lean(mcp) -> None:
     mcp.tool()(weather)
     mcp.tool()(geo)
     mcp.tool()(knowledge)
-    mcp.tool()(radio)
     mcp.tool()(web)
 
 
