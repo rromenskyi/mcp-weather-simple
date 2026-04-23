@@ -1958,6 +1958,65 @@ async def test_country_info_flattens_rest_countries_shape():
     assert r["currencies"] == [{"code": "UAH", "name": "Ukrainian hryvnia", "symbol": "₴"}]
     assert r["languages"] == ["Ukrainian"]
     assert r["flag_emoji"] == "🇺🇦"
+    assert r["data_source"] == "rest_countries"
+
+
+@respx.mock
+async def test_country_info_falls_back_to_graphql_mirror_on_rest_5xx():
+    """restcountries.com is volunteer-hosted and 502s regularly
+    (hit twice in the chat UI on 2026-04-23). Fallback to the
+    trevorblades GraphQL mirror must kick in and return the
+    common subset — no population / area / borders / timezones,
+    but capital / currency / languages / emoji are all present.
+    `data_source` flips to `graphql_mirror` so the model can caveat.
+    """
+    respx.get(server.RESTCOUNTRIES_ALPHA_URL.format(code="CN")).mock(
+        return_value=httpx.Response(502)
+    )
+    respx.post(server.COUNTRIES_GRAPHQL_URL).mock(
+        return_value=httpx.Response(200, json={
+            "data": {"country": {
+                "code": "CN",
+                "name": "China",
+                "native": "中国",
+                "capital": "Beijing",
+                "emoji": "🇨🇳",
+                "phone": "86",
+                "currency": "CNY",
+                "continent": {"name": "Asia"},
+                "languages": [{"name": "Chinese"}],
+            }}
+        })
+    )
+    r = await server.get_country_info("CN")
+    assert r["data_source"] == "graphql_mirror"
+    assert r["name"] == "China"
+    assert r["capital"] == "Beijing"
+    assert r["calling_code"] == "+86"
+    assert r["currencies"] == [{"code": "CNY", "name": None, "symbol": None}]
+    assert r["languages"] == ["Chinese"]
+    # Fields not covered by the mirror degrade to null, not missing.
+    assert r["population"] is None
+    assert r["area_km2"] is None
+    assert r["borders"] == []
+    # Guidance must explicitly warn about the narrower field set.
+    assert "mirror" in r["guidance"].lower()
+
+
+@respx.mock
+async def test_country_info_reraises_when_both_primary_and_mirror_fail():
+    """If restcountries 5xx AND the GraphQL mirror also fails (network
+    down, rate-limit, etc.), surface the ORIGINAL restcountries error.
+    Using the mirror error would be misleading — the primary being
+    down is the actual story the user should get."""
+    respx.get(server.RESTCOUNTRIES_ALPHA_URL.format(code="CN")).mock(
+        return_value=httpx.Response(502)
+    )
+    respx.post(server.COUNTRIES_GRAPHQL_URL).mock(
+        return_value=httpx.Response(503)  # mirror also sick
+    )
+    with pytest.raises(RuntimeError, match="REST Countries"):
+        await server.get_country_info("CN")
 
 
 @respx.mock
