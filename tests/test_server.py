@@ -1945,6 +1945,33 @@ async def test_calculate_trig_via_radians():
 
 
 @pytest.mark.parametrize(
+    "expr,expected",
+    [
+        ("2^10",              1024),                # plain power
+        ("pi * 5^2",          3.141592653589793 * 25),  # circle area — natural notation
+        ("pi * 0^2",          0.0),                 # the live-reported case from the chat UI
+        ("(4/3) * pi * 2^3",  (4/3) * 3.141592653589793 * 8),  # sphere volume
+        ("2^3^2",             512),                 # right-associativity: 2^(3^2) = 2^9
+        ("3 + 4^2",           19),                  # precedence: 4^2 binds tighter than +
+    ],
+)
+async def test_calculate_caret_is_power_shortcut(expr, expected):
+    """`^` is rewritten to `**` before parsing so LLMs writing natural
+    math notation (`pi * r^2`, `2^10`) don't get BitXor rejections.
+    Precedence must match math convention — `**` binds tighter than
+    `*`/`+`, so `pi * r^2` means `pi * (r^2)`, not `(pi*r)^2`. Triggered
+    by a live report: model called `calculate("pi * 0^2")` for a
+    zero-radius circle and hit `operator not allowed: BitXor`."""
+    import server as srv
+    r = await srv.calculate(expr)
+    assert r.get("error") is None, f"unexpected error on {expr!r}: {r}"
+    if isinstance(expected, float):
+        assert r["result"] == pytest.approx(expected, rel=1e-12)
+    else:
+        assert r["result"] == expected
+
+
+@pytest.mark.parametrize(
     "expr,error_fragment",
     [
         ("foo + 1",                      "unknown name"),           # identifier

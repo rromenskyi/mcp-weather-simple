@@ -2040,6 +2040,12 @@ def _safe_eval(expression: str) -> float | int:
     rather than retrying an identical broken expression (which the
     #19 loop detector would otherwise short-circuit).
     """
+    # Calculator surfaces everywhere use `^` for power; Python parses it
+    # as bitwise XOR which raises on floats and has *lower* precedence
+    # than `*`. Rewriting before parsing keeps `pi * r^2` meaning `pi *
+    # r**2`, which is what LLMs generate when asked for circle area.
+    # The AST walk still whitelists Pow, so security is unchanged.
+    expression = expression.replace("^", "**")
     try:
         tree = _ast.parse(expression, mode="eval")
     except SyntaxError as exc:
@@ -2105,6 +2111,8 @@ async def calculate(expression: str) -> dict:
 
     Supported:
       - Arithmetic: `+ - * / // % **`, unary `-`, parentheses.
+        `^` also works as a power shortcut (auto-rewritten to `**`
+        with correct precedence — `pi * r^2` → `pi * r**2`).
       - Constants: `pi`, `e`, `tau`, `inf`, `nan`.
       - `math.*` functions: `sqrt`, `cbrt`, `log` (natural),
         `log2`, `log10`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`,
