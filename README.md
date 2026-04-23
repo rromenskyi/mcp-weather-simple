@@ -80,8 +80,8 @@ Catalog-token figures above are estimates post-bundled-fields + post-web-domain 
 Optional CSV env var that restricts which of the four fat domains are advertised at all. Empty / unset (default) = every domain is visible. Valid domain names: `weather`, `geo`, `knowledge`, `web`.
 
 ```
-MCP_ENABLED_DOMAINS=weather,geo,knowledge,radio   # disable web at this deployment
-MCP_ENABLED_DOMAINS=weather                         # weather-only sidecar
+MCP_ENABLED_DOMAINS=weather,geo,knowledge   # disable web at this deployment
+MCP_ENABLED_DOMAINS=weather                   # weather-only sidecar
 ```
 
 Invalid domain names fail loudly at server startup (no silent over-filtering). The filter composes with whatever router mode is active:
