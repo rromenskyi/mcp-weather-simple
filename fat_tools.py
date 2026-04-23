@@ -1,11 +1,13 @@
 """Fat domain-tools for `MCP_ROUTER_MODE=fat_tools`.
 
-Collapses the 23 narrow `@mcp.tool`s in ``server.py`` into 4 fat tools —
-``weather`` / ``geo`` / ``knowledge`` / ``radio`` — where the model picks
+Collapses the 28 narrow `@mcp.tool`s in ``server.py`` into 4 fat tools —
+``weather`` / ``geo`` / ``knowledge`` / ``web`` — where the model picks
 a domain at the top level and passes an ``action`` discriminator to
 select the concrete operation inside. Goal is to shrink the per-turn
-tool catalog from ~4500 tokens to ~1500-2000 so that small models on
+tool catalog from ~6800 tokens to ~2250 so that small models on
 CPU (i7 + qwen3.5:9b) can prefill the catalog in acceptable time.
+(See `fat_tools_lean.py` for the even tighter `(action, params dict)`
+variant that hits ~1350 tokens — the production default.)
 
 **Not auto-loaded** — ``server._install_router()`` calls
 ``install_fat_tools(mcp)`` only when ``MCP_ROUTER_MODE=fat_tools``. The

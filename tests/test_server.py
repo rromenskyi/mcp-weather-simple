@@ -2319,10 +2319,11 @@ def test_router_mode_explicit_off_leaves_full_monolith(monkeypatch):
 def test_router_mode_default_is_fat_tools_lean(monkeypatch):
     """When MCP_ROUTER_MODE isn't set, server boots in fat_tools_lean.
 
-    Flipped 2026-04-22 — measured catalog drops 5289 → 1090 tokens
-    (-79 %) with 93.2 % hit rate in both modes on qwen3.5:9b.
-    Production Docker image + platform sidecar inherit this default
-    so i7-CPU deployments stop paying the 3-7 min monolith prefill.
+    Flipped 2026-04-22; current catalog (post-web-domain, post-radio-
+    fold-in 2026-04-23) ≈ 1350 tokens vs ~6800 for the monolith.
+    Hit rate stays at 93.2 % on qwen3.5:9b across live modes. Production
+    Docker image + platform sidecar inherit this default so i7-CPU
+    deployments stop paying the monolith prefill.
     """
     import importlib
 
