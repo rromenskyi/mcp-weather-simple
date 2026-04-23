@@ -1381,12 +1381,25 @@ async def _get_current_weather_in_city_impl(city: str, country_code: str | None 
         params={
             "latitude": loc["latitude"],
             "longitude": loc["longitude"],
+            # Bundled free-ride: `precipitation_probability` + `uv_index`
+            # come from the same endpoint, zero extra HTTP. `daily=sunrise,
+            # sunset` with `forecast_days=1` adds today's sun times so
+            # "weather + во сколько закат" resolves in one tool call.
+            # Docstring stays silent — self-explanatory field names
+            # (sunrise / uv_index / feels_like via apparent_temperature)
+            # carry the contract.
             "current": "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                       "precipitation,weather_code,wind_speed_10m,wind_direction_10m",
+                       "precipitation,precipitation_probability,"
+                       "weather_code,wind_speed_10m,wind_direction_10m,uv_index",
+            "daily": "sunrise,sunset",
+            "forecast_days": 1,
             "timezone": "auto",
         },
     )
     cur = data.get("current", {})
+    daily = data.get("daily", {})
+    sunrise = (daily.get("sunrise") or [None])[0]
+    sunset = (daily.get("sunset") or [None])[0]
     return {
         "location": f"{loc['name']}, {loc['country']}",
         "time": cur.get("time"),
@@ -1394,9 +1407,13 @@ async def _get_current_weather_in_city_impl(city: str, country_code: str | None 
         "apparent_temperature_c": cur.get("apparent_temperature"),
         "humidity_pct": cur.get("relative_humidity_2m"),
         "precipitation_mm": cur.get("precipitation"),
+        "precipitation_probability_pct": cur.get("precipitation_probability"),
+        "uv_index": cur.get("uv_index"),
         "wind_kmh": cur.get("wind_speed_10m"),
         "wind_direction_deg": cur.get("wind_direction_10m"),
         "conditions": WEATHER_CODES.get(cur.get("weather_code"), "unknown"),
+        "sunrise": sunrise,
+        "sunset": sunset,
     }
 
 
@@ -1443,8 +1460,15 @@ async def _get_weather_forecast_impl(
         params={
             "latitude": loc["latitude"],
             "longitude": loc["longitude"],
+            # Zero-cost bundle: `apparent_temperature_max/min`, `sunrise`,
+            # `sunset`, `uv_index_max` ride on the same daily query.
+            # Closes "закат завтра?" / "жарко будет?" / "UV высокий?"
+            # without a second round-trip. Docstring silent — field
+            # names self-explanatory.
             "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
-                     "precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
+                     "apparent_temperature_max,apparent_temperature_min,"
+                     "precipitation_sum,precipitation_probability_max,"
+                     "wind_speed_10m_max,sunrise,sunset,uv_index_max",
             "forecast_days": days,
             "timezone": "auto",
         },
@@ -1459,6 +1483,14 @@ async def _get_weather_forecast_impl(
         today = datetime.now(ZoneInfo(loc.get("timezone") or "UTC")).date()
     except Exception:
         today = datetime.now(_tz.utc).date()
+
+    # Tolerant getter for fields added later (sunrise / sunset / UV /
+    # feels_like). Existing fixtures in the test suite don't emit them,
+    # and a brief Open-Meteo schema blip shouldn't 500 the tool.
+    def _opt(key: str, i: int):
+        col = d.get(key)
+        return col[i] if col and i < len(col) else None
+
     out = []
     for i, date_iso in enumerate(dates):
         out.append({
@@ -1467,9 +1499,14 @@ async def _get_weather_forecast_impl(
             "conditions": WEATHER_CODES.get(d["weather_code"][i], "unknown"),
             "temp_min_c": d["temperature_2m_min"][i],
             "temp_max_c": d["temperature_2m_max"][i],
+            "feels_like_min_c": _opt("apparent_temperature_min", i),
+            "feels_like_max_c": _opt("apparent_temperature_max", i),
             "precipitation_mm": d["precipitation_sum"][i],
             "precipitation_probability_pct": d["precipitation_probability_max"][i],
             "wind_max_kmh": d["wind_speed_10m_max"][i],
+            "uv_index_max": _opt("uv_index_max", i),
+            "sunrise": _opt("sunrise", i),
+            "sunset": _opt("sunset", i),
         })
     return {
         "location": f"{loc['name']}, {loc['country']}",

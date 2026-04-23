@@ -22,10 +22,11 @@ Two transports in a single codebase:
 | `lookup_ip_geolocation(ip)`                              | GeoIP lookup of a **specific** IPv4 / IPv6. Use when the user pastes an address like "where is 8.8.8.8?". Separate tool from `detect_my_location_by_ip` so the naming stays clean: "MY" = no args, "lookup" = explicit IP required. |
 | `find_place_coordinates(city, country_code=None)`        | Resolve a city name or postal code to lat/lon and timezone. `country_code` (ISO-3166-1 alpha-2) disambiguates homonyms and zip-code collisions. |
 | `search_places(query, country_code=None, feature_types=None, limit=5)` | Return every geocoding candidate for an ambiguous query — towns, mountains, lakes, islands, neighborhoods, airports, etc. Each candidate carries a `feature_type` human label; filter with `feature_types=["city"]` for only towns, or leave unset to see every kind. |
-| `get_current_weather_in_city(city, country_code=None)`   | Current temperature, humidity, wind, conditions. |
-| `get_weather_forecast(city, days=7, country_code=None)`  | Daily forecast, 1–16 days ahead. Each entry carries `day_label` ("today", "tomorrow", "in N days") anchored to the city's local timezone. |
+| `resolve_address(address)` | Parse a free-form postal string (`"221B Baker St, London"`, `"Bountiful, Utah, 84010"`) into its components (street / city / region / postcode / country) + lat/lon. The escape hatch when other tools reject multi-part input because they expect a single city token. |
+| `get_current_weather_in_city(city, country_code=None)`   | Current temperature, humidity, wind, conditions. **Also bundled (same HTTP call):** `feels_like`, `precipitation_probability`, `uv_index`, today's `sunrise`/`sunset`. |
+| `get_weather_forecast(city, days=7, country_code=None)`  | Daily forecast, 1–16 days ahead. Each entry carries `day_label` ("today", "tomorrow", "in N days") anchored to the city's local timezone. Per-day bundle: `feels_like_min/max`, `uv_index_max`, `sunrise`/`sunset`. |
 | `get_hourly_forecast(city, hours=24, country_code=None)` | Hour-by-hour forecast (up to 168 h = 7 days). Timestamps in the city's local timezone. |
-| `get_sunrise_sunset(city, date_iso=None, days=1, country_code=None)` | Sunrise, sunset, daylight duration and sunshine duration for one or more consecutive days. |
+| `get_sunrise_sunset(city, date_iso=None, days=1, country_code=None)` | Sunrise, sunset, daylight duration and sunshine duration for one or more consecutive days. Use for specific past/future dates — `get_current_weather_in_city` already bundles today's sun times. |
 | `get_air_quality(city, country_code=None)`               | Current PM2.5 / PM10 / ozone / NO2 / SO2 / CO plus European and US AQI indices. |
 | `get_weather_by_coordinates(latitude, longitude)`        | Current weather at raw lat/lon — skips the geocoder entirely. Useful with coordinates from `detect_my_location_by_ip` or pasted from a map app. |
 | `get_historical_weather(city, start_date_iso, end_date_iso=None, country_code=None)` | Daily archive (1940–present). Up to 31 days per request. |
@@ -33,6 +34,7 @@ Two transports in a single codebase:
 | `get_country_info(country)`                              | Country facts: capital, population, currencies, languages, calling code, borders, timezones. Accepts ISO code or plain name. |
 | `get_public_holidays(country_code, year=None)`           | Public / bank holidays for a country in a given year. Backed by `date.nager.at`. |
 | `convert_currency(amount, from_currency, to_currency)`   | Fiat currency conversion at today's rate. ISO-4217 codes. |
+| `calculate(expression)`                                  | Safe arithmetic evaluator — `+ - * / // % **` (`^` also works as power), `pi`/`e`/`tau`, `sqrt`, `log`, trig, `hypot`, etc. Call for any 4+-digit multiplication, chained percentage, or geometry formula rather than guessing — small-LLM mental arithmetic is unreliable. AST-whitelisted, no `eval`. |
 | `list_radio_stations(country=None, tag=None, language=None, limit=10)` | Browse internet-radio stations by country, tag or language. Volunteer catalogue (radio-browser.info) with mirror fallback. |
 
 ### No-arg shortcuts for common questions
@@ -47,6 +49,25 @@ Pre-composed tools whose **name alone** tells the model which user question they
 | `get_current_time_where_i_am()` | "What time is it?" / «который сейчас час?» |
 
 The lower-level tools stay available for precise follow-ups (another city, a specific date, longer horizon).
+
+## Router modes
+
+The 24 narrow `@mcp.tool`s above can be advertised to the MCP client in four shapes, selected via the `MCP_ROUTER_MODE` env var. This is a **tool-catalog-tokens vs. fidelity** trade-off: a CPU-bound Ollama host pays for every byte of the catalog on every turn, so a smaller catalog means faster time-to-first-token.
+
+| Mode                   | What the client sees                             | Catalog tokens | Hit rate (qwen3.5:9b) |
+|------------------------|--------------------------------------------------|---------------:|----------------------:|
+| `off`                  | All 24 narrow tools                              |         ~5 846 |                 93.2 % |
+| `fat_tools`            | 4 fat domain-tools, one `action` enum + per-field kwargs |         ~2 098 |                 93.2 % |
+| **`fat_tools_lean`** *(default)* | 4 fat domain-tools, `(action, params: dict)` signature |       **~1 275** |             **93.2 %** |
+| `list_changed`         | Spec-correct dynamic narrowing via MCP notification | —            |                   —    |
+
+The four fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, **`geo`**, **`knowledge`**, **`radio`**. Each takes an `action` enum that maps 1:1 to one of the 24 narrow tools, plus that action's arguments. The narrow-to-fat mapping lives in `fat_tools_map.py` — single source of truth, drift-guarded by a unit test. Both narrow and fat shapes go through the same underlying impls, so behaviour is identical; only the on-wire tool-catalog shape changes.
+
+`list_changed` is kept as a reference implementation of the spec-correct dynamic shape, but every MCP client tested (mcphost, Open WebUI) ignores the `tools/list_changed` notification and keeps the initial-handshake catalog, so in practice it does not actually narrow anything. **Treat it as dead** — use one of the fat modes instead.
+
+**Picking a mode**: on a GPU-class host the catalog cost is negligible and `off` gives the model the richest surface. On a CPU-bound host (Intel i7 + quantised 9b), prefill time scales linearly with prompt tokens and a ~78 % catalog reduction is directly visible as faster first-turn latency — that is why `fat_tools_lean` is the production default on this project's sibling `platform` repo.
+
+The eval scorer in `tests/integration/eval_tool_calling.py` auto-canonicalises `expected_tool` to `fat(action)` form in both fat modes, so the same `cases.yaml` scores cleanly across all three live modes. For the full experimental write-up (measured token counts, per-family hit-rate breakdown, per-deployment recommendation), see [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
 
 ## Multilingual queries
 
@@ -327,13 +348,15 @@ Two layers, each answering a different question.
 
 ### Unit tests — does the server behave?
 
-`tests/test_server.py` (35+ cases, ~1 s total, respx-mocked — no
+`tests/test_server.py` (130+ cases, ~3 s total, respx-mocked — no
 network). Proves every tool returns the correct response shape for
 a known input: correct geocoding fallback across scripts, correct
 `day_label` anchoring to the city's timezone, correct per-hour /
-per-day row structure, Open-Meteo parameters wired right, friendly
-error messages for 4xx vs 5xx, lat/lon validation, mirror fallback
-for radio-browser, etc.
+per-day row structure, Open-Meteo parameters wired right (including
+the bundled `sunrise`/`sunset`/`feels_like`/`uv_index` fields),
+friendly error messages for 4xx vs 5xx, lat/lon validation, mirror
+fallback for radio-browser, `NARROW_TO_FAT` drift-guard for the
+router, AST-whitelist calculator rejections, etc.
 
 Run: `uv sync --extra test && uv run pytest -q`
 
@@ -352,38 +375,54 @@ tool will cause the model to fumble the choice.
 `tests/integration/eval_tool_calling.py` + `tests/integration/cases.yaml`
 measure this as a **top-1 tool-selection hit rate**:
 
-- 40+ `(prompt, expected_tool)` pairs grouped by intent family —
+- 48+ `(prompt, expected_tool)` pairs grouped by intent family —
   weather-here, forecast-tomorrow, hourly, air quality, sunrise,
   historical, time-in-city, time-here, currency, country-info,
-  public holidays, radio stations, Wikipedia, places-disambiguation.
+  public holidays, radio stations, Wikipedia, places-disambiguation,
+  address resolution, calculator.
 - Russian + English mixed on purpose: the geocoder has a
   script-fallback chain, and the model has to trigger tools the
   same way regardless of query language.
 - For every case the harness sends `{prompt, tools, temperature=0,
   seed=42}` to Ollama's `/api/chat`, reads `tool_calls[0].function.name`,
-  scores it against the expected tool.
+  scores it against the expected tool. In fat-router modes the
+  scorer canonicalises both sides to `fat(action)` form so the
+  same `cases.yaml` runs against `off` / `fat_tools` / `fat_tools_lean`
+  unchanged.
 - Reports a **per-family** and **overall** hit rate, lists the
   failing prompts. `pass_threshold` lives in `cases.yaml`; current
-  baseline on qwen3.5:9b is **~97 %** (86.8 % on the first run
-  before a warm-up call was added to neutralise the cold-start
-  ReadTimeout on the first 4 scored cases).
+  baseline on qwen3.5:9b is **~93.2 %** in every live router mode
+  (`off` / `fat_tools` / `fat_tools_lean` — a ~78 % catalog
+  reduction at the same hit rate is the headline result of the
+  router experiment).
 
 Run (GitHub Actions): `.github/workflows/eval.yml` kicks this off
 via `workflow_dispatch` and a nightly `cron` at 03:00 UTC. Each
 runner gets 16 GB RAM / 4 vCPU, its own Ollama model cache
 (`ollama-<model>-v1`), and its own job summary with the scored table.
 
-Three matrix axes, fan-out independently:
+Five matrix axes, fan-out independently:
 
 - **model** — `qwen3.5:9b` + `qwen3:14b` by default (leave input
   empty), or pick a single model via the `model` dropdown.
 - **output_schema** — `off` (default), `on`, or `both`. The `both`
   setting runs the outputSchema A/B experiment; see ROADMAP's
   "Experiments → outputSchema A/B" section.
-- **chunk_count** — `1`, `2` (default), or `4`. Shards the 40-prompt
+- **chunk_count** — `1`, `2` (default), or `4`. Shards the prompt
   suite across parallel rows so the 14b-on-CPU path fits inside the
   45-minute per-row ceiling. Widest fanout (2 × 2 × 4 = 16 rows) is
   still under the 20-concurrent-job free-tier cap.
+- **router_mode** — `off` (default), `fat_tools`, or `fat_tools_lean`.
+  Selects which catalog shape the MCP server advertises for the run
+  — the scorer auto-canonicalises to `fat(action)` in the fat modes,
+  so `cases.yaml` is unchanged. Use this axis to A/B a catalog
+  change's effect on hit rate.
+- **runs_on** — `github-hosted` (default, free 16 GB / 4 vCPU
+  ubuntu-latest runner) or `self-hosted` (routes to the L4 GPU VM
+  spun up via `terraform-gcp-eval-runner` in `mode=agent`). The
+  self-hosted path skips the Install-Ollama and Cache-Ollama-Models
+  steps (they're persistent on the VM), cutting a nightly run from
+  ~8 min to ~2–3 min for 9b.
 
 **Named recipes**: `scripts/eval.sh <recipe>` wraps `gh workflow run`
 so you don't have to remember axis combinations. Recipes: `quick`
@@ -416,7 +455,14 @@ use it" bites.
 ## Project files
 
 - `server.py` — the MCP server (FastMCP). Transport is controlled by
-  `MCP_TRANSPORT` (`stdio` | `streamable-http`), port by `MCP_PORT`.
+  `MCP_TRANSPORT` (`stdio` | `streamable-http`), port by `MCP_PORT`,
+  catalog shape by `MCP_ROUTER_MODE` (see **Router modes** above).
+- `fat_tools.py` / `fat_tools_lean.py` — the four fat domain
+  dispatchers (`weather` / `geo` / `knowledge` / `radio`) used in
+  the two fat router modes.
+- `fat_tools_map.py` — `NARROW_TO_FAT` source of truth for the
+  narrow → `fat(action)` mapping, imported by both the server and
+  the eval scorer. Drift-guarded by a unit test.
 - `pyproject.toml` / `uv.lock` — dependencies (`mcp[cli]`, `httpx`).
 - `mcphost.config.json` — `mcphost` config for Option B.
 - `tests/` — unit tests (`test_server.py`, mocked) and integration

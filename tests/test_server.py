@@ -1026,6 +1026,182 @@ async def test_weather_forecast_labels_today_and_tomorrow_in_city_tz():
     assert result["timezone_id"] == "Europe/Kyiv"
 
 
+# ── Bundled free-ride fields (sunrise/sunset/feels_like/uv/precip_prob) ──
+#
+# Several high-frequency follow-ups — "во сколько закат?", "по ощущениям
+# сколько?", "UV высокий?", "зонтик нужен?" — used to cost a second
+# round-trip (`get_sunrise_sunset`, etc.). They all come from the SAME
+# Open-Meteo /v1/forecast call, so the current-weather + daily-forecast
+# impls now ask for them up-front and surface them in the response body.
+# Docstring stays silent on purpose (self-explanatory field names keep
+# the catalog token count flat); these tests are the written contract.
+
+
+@respx.mock
+async def test_current_weather_bundles_sunrise_uv_precip_prob():
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Kyiv", "country": "Ukraine", "country_code": "UA",
+                     "latitude": 50.45, "longitude": 30.52, "timezone": "Europe/Kyiv",
+                     "feature_code": "PPLC", "admin1": "Kyiv City",
+                     "population": 3_000_000},
+                ]
+            },
+        )
+    )
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": "2026-04-21T10:00",
+                    "temperature_2m": 12.3,
+                    "relative_humidity_2m": 60,
+                    "apparent_temperature": 9.5,
+                    "precipitation": 0.0,
+                    "precipitation_probability": 40,
+                    "weather_code": 2,
+                    "wind_speed_10m": 10.0,
+                    "wind_direction_10m": 180,
+                    "uv_index": 3.7,
+                },
+                "daily": {
+                    "time": ["2026-04-21"],
+                    "sunrise": ["2026-04-21T05:45"],
+                    "sunset":  ["2026-04-21T20:12"],
+                },
+            },
+        )
+
+    respx.get(server.FORECAST_URL).mock(side_effect=_respond)
+
+    r = await server.get_current_weather_in_city("Kyiv", country_code="UA")
+
+    # The request actually asks for the new variables — prevents silent
+    # removal of a CSV entry from breaking the contract without a test
+    # signal.
+    assert "precipitation_probability" in captured["current"]
+    assert "uv_index" in captured["current"]
+    assert "sunrise" in captured["daily"] and "sunset" in captured["daily"]
+    assert captured["forecast_days"] == "1"
+
+    assert r["relay_to_user"] is True
+    assert r["apparent_temperature_c"] == 9.5
+    assert r["humidity_pct"] == 60
+    assert r["precipitation_probability_pct"] == 40
+    assert r["uv_index"] == 3.7
+    assert r["sunrise"] == "2026-04-21T05:45"
+    assert r["sunset"] == "2026-04-21T20:12"
+
+
+@respx.mock
+async def test_current_weather_handles_missing_bundled_fields_gracefully():
+    # Open-Meteo has, in the past, silently dropped a variable when the
+    # lat/lon falls outside the coverage area (e.g. UV index over
+    # far-north winter). The tool must degrade to `null` rather than
+    # crashing the whole turn.
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Svalbard", "country": "Norway", "country_code": "NO",
+                     "latitude": 78.2, "longitude": 15.6, "timezone": "Europe/Oslo",
+                     "feature_code": "PPL"},
+                ]
+            },
+        )
+    )
+    respx.get(server.FORECAST_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "current": {
+                    "time": "2026-12-21T10:00",
+                    "temperature_2m": -18.0,
+                    "relative_humidity_2m": 80,
+                    "apparent_temperature": -25.0,
+                    "precipitation": 0.0,
+                    "weather_code": 1,
+                    "wind_speed_10m": 20.0,
+                    "wind_direction_10m": 90,
+                    # precipitation_probability / uv_index intentionally absent
+                },
+                # daily intentionally absent — polar night has no sunset
+            },
+        )
+    )
+
+    r = await server.get_current_weather_in_city("Svalbard")
+    assert r["relay_to_user"] is True
+    assert r["uv_index"] is None
+    assert r["precipitation_probability_pct"] is None
+    assert r["sunrise"] is None
+    assert r["sunset"] is None
+
+
+@respx.mock
+async def test_daily_forecast_bundles_feels_like_uv_and_sun_times():
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Paris", "country": "France", "country_code": "FR",
+                     "latitude": 48.85, "longitude": 2.35, "timezone": "Europe/Paris",
+                     "feature_code": "PPLC"},
+                ]
+            },
+        )
+    )
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "daily": {
+                    "time": ["2026-04-22", "2026-04-23"],
+                    "weather_code": [2, 3],
+                    "temperature_2m_max": [22.0, 24.0],
+                    "temperature_2m_min": [10.0, 11.0],
+                    "apparent_temperature_max": [20.5, 22.5],
+                    "apparent_temperature_min": [8.5, 9.5],
+                    "precipitation_sum": [0.0, 2.0],
+                    "precipitation_probability_max": [15, 70],
+                    "wind_speed_10m_max": [12.0, 20.0],
+                    "uv_index_max": [5.2, 4.8],
+                    "sunrise": ["2026-04-22T06:45", "2026-04-23T06:43"],
+                    "sunset":  ["2026-04-22T20:58", "2026-04-23T21:00"],
+                },
+            },
+        )
+
+    respx.get(server.FORECAST_URL).mock(side_effect=_respond)
+
+    r = await server.get_weather_forecast("Paris", days=2, country_code="FR")
+
+    assert "apparent_temperature_max" in captured["daily"]
+    assert "uv_index_max" in captured["daily"]
+    assert "sunrise" in captured["daily"] and "sunset" in captured["daily"]
+
+    today, tomorrow = r["days"]
+    assert today["feels_like_max_c"] == 20.5
+    assert today["feels_like_min_c"] == 8.5
+    assert today["uv_index_max"] == 5.2
+    assert today["sunrise"] == "2026-04-22T06:45"
+    assert today["sunset"] == "2026-04-22T20:58"
+    assert tomorrow["feels_like_max_c"] == 22.5
+    assert tomorrow["sunset"] == "2026-04-23T21:00"
+
+
 # ── Historical: date validation ──────────────────────────────────────────
 
 
