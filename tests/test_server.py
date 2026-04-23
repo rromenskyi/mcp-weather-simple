@@ -2238,7 +2238,7 @@ async def test_router_mode_filters_list_tools_by_active_domain(monkeypatch):
 
 
 def test_router_mode_explicit_off_leaves_full_monolith(monkeypatch):
-    """Explicit `MCP_ROUTER_MODE=off` restores the historical 23-tool
+    """Explicit `MCP_ROUTER_MODE=off` restores the full narrow-tool
     monolith with stateless HTTP. Used by the nightly eval cron to
     keep baseline trend data comparable to pre-router numbers."""
     import importlib
@@ -2246,12 +2246,15 @@ def test_router_mode_explicit_off_leaves_full_monolith(monkeypatch):
     import server as srv
 
     monkeypatch.setenv("MCP_ROUTER_MODE", "off")
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
     srv = importlib.reload(srv)
     assert srv.ROUTER_MODE == "off"
     assert srv.mcp.settings.stateless_http is True
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
     assert "select_domain" not in names
-    assert len(names) == 24
+    # 24 base narrow tools + 4 web-domain narrows (`web_search`, `news`,
+    # `hackernews`, `trends`) added 2026-04-22.
+    assert len(names) == 28
 
 
 def test_router_mode_default_is_fat_tools_lean(monkeypatch):
@@ -2271,11 +2274,11 @@ def test_router_mode_default_is_fat_tools_lean(monkeypatch):
     assert srv.ROUTER_MODE == "fat_tools_lean", (
         f"default should be fat_tools_lean, got {srv.ROUTER_MODE!r}"
     )
-    # fat modes register the 4 fat tools in addition to the 23 narrow
+    # fat modes register the 5 fat tools in addition to the 28 narrow
     # ones; list_tools filter is what hides the narrow set from clients.
     names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-    assert {"weather", "geo", "knowledge", "radio"}.issubset(names)
-    assert len(names) == 28
+    assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(names)
+    assert len(names) == 33
 
 
 @pytest.mark.asyncio
@@ -2292,23 +2295,24 @@ async def test_router_mode_fat_tools_exposes_four_domain_tools(monkeypatch):
     import server as srv
 
     monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools")
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
     srv = importlib.reload(srv)
     try:
         assert srv.ROUTER_MODE == "fat_tools"
 
-        # Manager holds both 23 narrow + 4 fat — filtering is done at
+        # Manager holds both 28 narrow + 5 fat — filtering is done at
         # list_tools time, not at registration.
         all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-        assert {"weather", "geo", "knowledge", "radio"}.issubset(all_names)
+        assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(all_names)
         assert "get_current_weather_in_city" in all_names  # still registered
-        assert len(all_names) == 28
+        assert len(all_names) == 33
 
         from mcp.types import ListToolsRequest
 
         handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
         req = ListToolsRequest(method="tools/list")
         visible = sorted(t.name for t in (await handler(req)).root.tools)
-        assert visible == ["geo", "knowledge", "radio", "weather"]
+        assert visible == ["geo", "knowledge", "radio", "weather", "web"]
     finally:
         monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
         importlib.reload(srv)
@@ -2325,19 +2329,20 @@ async def test_router_mode_fat_tools_lean_exposes_four_with_params_dict(monkeypa
     import server as srv
 
     monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
     srv = importlib.reload(srv)
     try:
         assert srv.ROUTER_MODE == "fat_tools_lean"
 
         all_names = {t.name for t in srv.mcp._tool_manager.list_tools()}
-        assert {"weather", "geo", "knowledge", "radio"}.issubset(all_names)
+        assert {"weather", "geo", "knowledge", "radio", "web"}.issubset(all_names)
         assert "get_current_weather_in_city" in all_names  # still registered
 
         from mcp.types import ListToolsRequest
         handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
         req = ListToolsRequest(method="tools/list")
         tools = (await handler(req)).root.tools
-        assert sorted(t.name for t in tools) == ["geo", "knowledge", "radio", "weather"]
+        assert sorted(t.name for t in tools) == ["geo", "knowledge", "radio", "weather", "web"]
 
         # The lean schema has exactly two top-level props (action, params)
         # on the enum-bearing tools — that's the whole point of the variant.
@@ -2446,9 +2451,9 @@ def test_narrow_to_fat_map_covers_every_registered_tool(monkeypatch):
     assert not missing, f"NARROW_TO_FAT missing narrow tools: {sorted(missing)}"
     assert not extra, f"NARROW_TO_FAT references unknown tools: {sorted(extra)}"
 
-    # Every mapped fat tool name must be one of the 4 known domains.
+    # Every mapped fat tool name must be one of the 5 known domains.
     fat_tool_names = {fat for fat, _ in fat_tools_map.NARROW_TO_FAT.values()}
-    assert fat_tool_names == {"weather", "geo", "knowledge", "radio"}, (
+    assert fat_tool_names == {"weather", "geo", "knowledge", "radio", "web"}, (
         f"unexpected fat tool name(s): {fat_tool_names}"
     )
 
@@ -2501,3 +2506,384 @@ def test_eval_canonicalise_expected_fat_mode(monkeypatch, narrow, canonical):
     m2._load_fat_mapping_if_enabled()
     assert m2._FAT_MODE is False
     assert m2._canonicalise_expected(narrow) == narrow
+
+
+# ── Web domain (search / news / hackernews / trends) ─────────────────────
+#
+# Each test mocks the upstream provider at the HTTP boundary so the
+# suite stays offline. The goal is both response-shape coverage and
+# **prompt-engineering** coverage — we want the fixtures to reflect
+# the real provider's quirks (DDG's redirect wrapping, Google News'
+# nested <source> tag, HN's two-phase ID-list + per-item fetch,
+# Google Trends' namespaced XML extensions) so regressions in the
+# parsing code show up immediately.
+
+
+@respx.mock
+async def test_web_search_parses_ddg_lite_html():
+    ddg_html = """
+    <html><body>
+      <div class="result">
+        <a rel="nofollow" class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fkyiv&rut=x">
+          Kyiv — Wikipedia
+        </a>
+        <a class="result__snippet" href="ignored">
+          Kyiv is the capital and most populous city of Ukraine.
+        </a>
+      </div>
+      <div class="result">
+        <a rel="nofollow" class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fkyivindependent.com%2F">
+          Kyiv Independent
+        </a>
+        <a class="result__snippet">Independent English-language newsroom.</a>
+      </div>
+    </body></html>
+    """
+    respx.get(server.DDG_LITE_URL).mock(return_value=httpx.Response(200, text=ddg_html))
+
+    r = await server.web_search("Kyiv")
+    assert r["relay_to_user"] is True
+    assert len(r["results"]) == 2
+    first = r["results"][0]
+    # DDG-redirect wrapper should be unwrapped to the real destination.
+    assert first["url"] == "https://example.com/kyiv"
+    assert "Kyiv" in first["title"]
+    assert "capital" in first["snippet"].lower()
+
+
+@respx.mock
+async def test_web_search_empty_results_sets_relay_false():
+    respx.get(server.DDG_LITE_URL).mock(
+        return_value=httpx.Response(200, text="<html><body>No hits</body></html>")
+    )
+    r = await server.web_search("jsklfdjsakl")
+    assert r["results"] == []
+    assert r["relay_to_user"] is False
+    assert "rephrase" in r["guidance"].lower() or "shape" in r["guidance"].lower()
+
+
+async def test_web_search_rejects_empty_query():
+    with pytest.raises(ValueError, match="query is required"):
+        await server.web_search("   ")
+
+
+@respx.mock
+async def test_news_no_args_uses_geoip_top_rss():
+    """No-args news → GeoIP → Google News top RSS with hl/gl/ceid set."""
+    respx.get(f"{server.GEOIP_URL}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "203.0.113.10", "city": "Kyiv",
+                "country": "Ukraine", "country_code": "UA",
+                "latitude": 50.45, "longitude": 30.52,
+                "timezone": {"id": "Europe/Kyiv"},
+            },
+        )
+    )
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0"><channel>
+          <item>
+            <title>Top story: Kyiv in the news</title>
+            <link>https://news.example/1</link>
+            <source url="https://example.com">Example News</source>
+            <pubDate>Mon, 21 Apr 2026 10:00:00 GMT</pubDate>
+            <description>Lorem ipsum &lt;b&gt;dolor&lt;/b&gt;.</description>
+          </item>
+        </channel></rss>
+        """
+        return httpx.Response(200, text=rss)
+
+    respx.get(server.GNEWS_TOP_URL).mock(side_effect=_respond)
+    r = await server.news()
+    # GeoIP-derived params must end up on the upstream call — guards the
+    # "top-news is locale-aware" contract.
+    assert captured["gl"] == "UA"
+    assert captured["ceid"] == "UA:en"
+    assert r["shape"] == "top"
+    assert r["country"] == "UA"
+    assert len(r["items"]) == 1
+    assert r["items"][0]["source"] == "Example News"
+    # HTML tags in description must be stripped so the model doesn't
+    # re-emit them in user-facing prose.
+    assert "<" not in r["items"][0]["description"]
+
+
+@respx.mock
+async def test_news_with_query_uses_search_rss():
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        rss = """<?xml version="1.0"?>
+        <rss><channel>
+          <item>
+            <title>OpenAI ships something</title>
+            <link>https://example/openai</link>
+            <source>Example Tech</source>
+            <pubDate>Tue, 22 Apr 2026 09:00:00 GMT</pubDate>
+          </item>
+        </channel></rss>
+        """
+        return httpx.Response(200, text=rss)
+
+    respx.get(server.GNEWS_SEARCH_URL).mock(side_effect=_respond)
+
+    r = await server.news(query="OpenAI", lang="en")
+    assert captured["q"] == "OpenAI"
+    assert captured["hl"] == "en"
+    assert r["shape"] == "query"
+    assert r["items"][0]["title"].startswith("OpenAI")
+
+
+async def test_news_rejects_query_and_topic_together():
+    with pytest.raises(ValueError, match="either"):
+        await server.news(query="x", topic="y")
+
+
+@respx.mock
+async def test_hackernews_fetches_ids_then_items_in_parallel():
+    respx.get(f"{server.HN_API_BASE}/topstories.json").mock(
+        return_value=httpx.Response(200, json=[101, 102, 103])
+    )
+    respx.get(f"{server.HN_API_BASE}/item/101.json").mock(
+        return_value=httpx.Response(200, json={
+            "id": 101, "title": "A thing", "url": "https://a.example",
+            "score": 120, "descendants": 45, "by": "alice", "time": 1_700_000_000,
+        })
+    )
+    respx.get(f"{server.HN_API_BASE}/item/102.json").mock(
+        return_value=httpx.Response(200, json={
+            "id": 102, "title": "Ask HN: X?", "score": 30, "descendants": 12,
+            "by": "bob", "time": 1_700_000_100,
+            # No `url` — typical Ask HN item. Tool should fall back to hn_url.
+        })
+    )
+    respx.get(f"{server.HN_API_BASE}/item/103.json").mock(
+        return_value=httpx.Response(200, json={
+            "id": 103, "title": "Show HN: Y", "url": "https://y.example",
+            "score": 80, "descendants": 20, "by": "carol", "time": 1_700_000_200,
+        })
+    )
+
+    r = await server.hackernews("top", limit=3)
+    assert r["category"] == "top"
+    assert [it["title"] for it in r["items"]] == ["A thing", "Ask HN: X?", "Show HN: Y"]
+    # Ask HN's item has no url → falls back to the HN item page.
+    ask_hn = r["items"][1]
+    assert ask_hn["url"] == "https://news.ycombinator.com/item?id=102"
+    assert ask_hn["hn_url"] == "https://news.ycombinator.com/item?id=102"
+
+
+async def test_hackernews_rejects_unknown_category():
+    with pytest.raises(ValueError, match="unknown HN category"):
+        await server.hackernews("nonsense")
+
+
+@respx.mock
+async def test_trends_defaults_country_via_geoip():
+    respx.get(f"{server.GEOIP_URL}/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True, "ip": "203.0.113.10", "city": "Salt Lake City",
+                "country": "United States", "country_code": "US",
+                "latitude": 40.76, "longitude": -111.89,
+                "timezone": {"id": "America/Denver"},
+            },
+        )
+    )
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss xmlns:ht="https://trends.google.com/trending/rss" version="2.0">
+          <channel>
+            <item>
+              <title>Mars mission</title>
+              <ht:approx_traffic>500,000+</ht:approx_traffic>
+              <ht:news_item_title>SpaceX lands rover on Mars</ht:news_item_title>
+              <ht:news_item_url>https://example/mars</ht:news_item_url>
+            </item>
+          </channel>
+        </rss>
+        """
+        return httpx.Response(200, text=rss)
+
+    respx.get(server.GTRENDS_RSS_URL).mock(side_effect=_respond)
+
+    r = await server.trends()
+    assert captured["geo"] == "US"  # GeoIP-derived
+    assert r["country_code"] == "US"
+    assert r["items"][0]["query"] == "Mars mission"
+    assert r["items"][0]["approx_traffic"] == "500,000+"
+    assert r["items"][0]["related_news_title"] == "SpaceX lands rover on Mars"
+
+
+@respx.mock
+async def test_trends_explicit_country_code_skips_geoip():
+    # No GeoIP mock — if the tool reaches for GeoIP it'll 404.
+    captured: dict[str, str] = {}
+
+    def _respond(req):
+        captured.update(dict(req.url.params))
+        return httpx.Response(
+            200,
+            text='<rss><channel><item><title>t1</title></item></channel></rss>',
+        )
+
+    respx.get(server.GTRENDS_RSS_URL).mock(side_effect=_respond)
+
+    r = await server.trends(country_code="DE")
+    assert captured["geo"] == "DE"
+    assert r["country_code"] == "DE"
+
+
+# ── Domain filter (MCP_ENABLED_DOMAINS) ─────────────────────────────────
+
+
+def test_enabled_domains_empty_keeps_all_visible(monkeypatch):
+    """Unset / empty-string → no filtering. Covers the default case so
+    a regression in the parsing can't silently shrink the catalog."""
+    import importlib
+    import server as srv
+
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
+    srv = importlib.reload(srv)
+    assert srv.ENABLED_DOMAINS == frozenset()
+    # Apply-filter on a fake list should return it unchanged.
+    class _T:
+        def __init__(self, n): self.name = n
+    fake = [_T("weather"), _T("web"), _T("get_current_weather_in_city")]
+    assert srv._apply_domain_filter(fake) == fake
+
+
+def test_enabled_domains_invalid_name_fails_at_boot(monkeypatch):
+    import importlib
+    import server as srv
+
+    monkeypatch.setenv("MCP_ENABLED_DOMAINS", "weather,frobnicate")
+    with pytest.raises(RuntimeError, match="unknown domain"):
+        importlib.reload(srv)
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
+    importlib.reload(srv)  # restore
+
+
+@pytest.mark.asyncio
+async def test_enabled_domains_narrows_off_mode_surface(monkeypatch):
+    """`MCP_ENABLED_DOMAINS=weather,knowledge` in off mode drops every
+    non-weather/non-knowledge narrow from `tools/list`, keeps the
+    rest of the narrow catalog intact. Location / time / web tools
+    must not appear."""
+    import importlib
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "off")
+    monkeypatch.setenv("MCP_ENABLED_DOMAINS", "weather,knowledge")
+    srv = importlib.reload(srv)
+    try:
+        from mcp.types import ListToolsRequest
+
+        handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
+        visible = {t.name for t in (await handler(ListToolsRequest(method="tools/list"))).root.tools}
+
+        # Weather + knowledge narrows present.
+        assert "get_current_weather_in_city" in visible
+        assert "get_wikipedia_summary" in visible
+        assert "calculate" in visible
+        # Web / geo / time narrows filtered out.
+        assert "web_search" not in visible
+        assert "news" not in visible
+        assert "detect_my_location_by_ip" not in visible
+        assert "get_current_date" not in visible
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
+        importlib.reload(srv)
+
+
+@pytest.mark.asyncio
+async def test_enabled_domains_narrows_fat_lean_surface(monkeypatch):
+    """In fat_tools_lean mode the filter picks a subset of the 5 fat
+    tools. This is the primary production use case — the platform
+    chat sidecar disabling `web` for deployments where the model
+    shouldn't reach the general internet.
+    """
+    import importlib
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
+    monkeypatch.setenv("MCP_ENABLED_DOMAINS", "weather,geo,knowledge,radio")
+    srv = importlib.reload(srv)
+    try:
+        from mcp.types import ListToolsRequest
+
+        handler = srv.mcp._mcp_server.request_handlers[ListToolsRequest]
+        visible = {t.name for t in (await handler(ListToolsRequest(method="tools/list"))).root.tools}
+        assert visible == {"weather", "geo", "knowledge", "radio"}
+        assert "web" not in visible
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
+        importlib.reload(srv)
+
+
+# ── Fat-router coverage for web domain ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fat_lean_web_dispatch(monkeypatch):
+    """`web(action="search", params={"query": "..."})` in lean mode must
+    reach the narrow `web_search` impl. Mirror test for the other
+    three web actions."""
+    import importlib
+    import server as srv
+
+    monkeypatch.setenv("MCP_ROUTER_MODE", "fat_tools_lean")
+    monkeypatch.delenv("MCP_ENABLED_DOMAINS", raising=False)
+    srv = importlib.reload(srv)
+    try:
+        import fat_tools_lean
+
+        calls: list[tuple[str, tuple, dict]] = []
+
+        async def _stub_web_search(q, limit=8):
+            calls.append(("web_search", (q, limit), {}))
+            return {"results": []}
+
+        async def _stub_news(query=None, topic=None, lang=None, limit=10):
+            calls.append(("news", (query, topic, lang, limit), {}))
+            return {"items": []}
+
+        async def _stub_hn(category="top", limit=15):
+            calls.append(("hackernews", (category, limit), {}))
+            return {"items": []}
+
+        async def _stub_trends(country_code=None, limit=15):
+            calls.append(("trends", (country_code, limit), {}))
+            return {"items": []}
+
+        monkeypatch.setattr(srv, "web_search", _stub_web_search)
+        monkeypatch.setattr(srv, "news", _stub_news)
+        monkeypatch.setattr(srv, "hackernews", _stub_hn)
+        monkeypatch.setattr(srv, "trends", _stub_trends)
+
+        await fat_tools_lean.web("search", {"query": "kyiv"})
+        await fat_tools_lean.web("news", {"topic": "tech"})
+        await fat_tools_lean.web("hackernews", {"category": "show"})
+        await fat_tools_lean.web("trends", {"country_code": "UA"})
+
+        called = [c[0] for c in calls]
+        assert called == ["web_search", "news", "hackernews", "trends"]
+        assert calls[0][1] == ("kyiv", 8)
+        assert calls[1][1] == (None, "tech", None, 10)
+        assert calls[2][1] == ("show", 15)
+        assert calls[3][1] == ("UA", 15)
+    finally:
+        monkeypatch.delenv("MCP_ROUTER_MODE", raising=False)
+        importlib.reload(srv)

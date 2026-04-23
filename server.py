@@ -192,6 +192,29 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 PHOTON_URL = "https://photon.komoot.io/api"
 OSM_UA = RADIO_BROWSER_UA  # same self-identification string — one repo, one UA
 
+# ── Web-domain sources (search / news / HN / trends) ────────────────────────
+#
+# All four providers are no-auth, free-tier and stable-ish — picked
+# over the more capable alternatives (Brave/Serper for search, NewsAPI
+# for news) specifically to stay key-free on a single-operator
+# deployment. Failure modes are documented next to the narrow tool
+# that uses each endpoint.
+DDG_LITE_URL = "https://html.duckduckgo.com/html/"
+# Google News exposes one RSS per (query | top-for-locale) combo.
+# Topic-by-ID is possible but topic IDs are opaque Base64 strings; the
+# `news` tool feeds `topic` back through the `q=` search instead.
+GNEWS_SEARCH_URL = "https://news.google.com/rss/search"
+GNEWS_TOP_URL = "https://news.google.com/rss"
+# HN public Firebase API — no key, generous rate-limits, no auth. Each
+# `*stories.json` returns an ordered list of numeric item IDs; items
+# themselves are fetched individually from `/item/{id}.json`.
+HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+# Google Trends RSS of the day's top search queries, per-country.
+# Key-less; parameter is `geo={CC}` (ISO-3166-1 alpha-2).
+GTRENDS_RSS_URL = "https://trends.google.com/trending/rss"
+# Polite client identity for providers that log the User-Agent.
+WEB_UA = RADIO_BROWSER_UA  # reuse the repo's identification string
+
 
 async def _fetch_json(
     url: str | list[str] | tuple[str, ...],
@@ -253,6 +276,49 @@ async def _fetch_json(
             f"{service} is unreachable ({type(last_exc).__name__}){tail}. Network or DNS failure."
         ) from last_exc
     raise RuntimeError(f"{service} is unreachable{tail}.")  # pragma: no cover
+
+
+async def _fetch_text(
+    url: str,
+    *,
+    service: str,
+    timeout: float = 8.0,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> str:
+    """Same contract as `_fetch_json` but returns raw `r.text`.
+
+    Used by HTML-scrape (DuckDuckGo Lite) and RSS/XML endpoints
+    (Google News, Google Trends) that don't speak JSON. Kept as a
+    thin sibling so the error-translation block stays shared — a 429
+    from DDG and a 500 from Google News surface the same actionable
+    message shape as any other Open-Meteo / Wikipedia 4xx.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            return r.text
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            f"{service} did not respond within {timeout:.0f} s — try again in a moment."
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if 400 <= status < 500:
+            raise RuntimeError(
+                f"{service} rejected the request with HTTP {status} — "
+                "check the tool arguments."
+            ) from exc
+        raise RuntimeError(
+            f"{service} returned HTTP {status} — the service may be having issues."
+        ) from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"{service} is unreachable ({type(exc).__name__}). Network or DNS failure."
+        ) from exc
+
+
 # Free, no-auth, HTTPS GeoIP. Accepts an IP in the path or `/` for
 # auto-detection based on the caller. Returns ip, city, region,
 # country_code, latitude, longitude and timezone.id (IANA name). We
@@ -2205,6 +2271,357 @@ async def calculate(expression: str) -> dict:
     return _respond({"expression": expression, "result": value})
 
 
+# ── Web domain: search / news / hackernews / trends ────────────────────────
+#
+# Four small tools that close the "what's happening / find me X on the
+# internet" gap that neither Wikipedia (too stale) nor the weather
+# tools (wrong domain) can answer. All four keep the **no-auth, no
+# API-key** property of the rest of the server — DuckDuckGo Lite is
+# HTML-scraped, Google News + Google Trends are public RSS, HN uses
+# its key-less Firebase API. Responses are capped at a few hundred
+# tokens each on purpose — tool results eat context on every
+# subsequent turn, and a 10-item list is usually enough for the model
+# to summarise an answer.
+
+
+import re as _re
+import xml.etree.ElementTree as _ET
+from urllib.parse import parse_qs as _parse_qs, urlparse as _urlparse
+
+
+def _ddg_unwrap(href: str) -> str:
+    """DDG wraps outbound links in a `/l/?uddg=<encoded-url>` redirect.
+    Extract the real destination so downstream consumers don't have
+    to follow an extra hop."""
+    try:
+        parsed = _urlparse(href)
+        if parsed.path.endswith("/l/") and parsed.query:
+            qs = _parse_qs(parsed.query)
+            real = qs.get("uddg") or qs.get("u")
+            if real:
+                return real[0]
+    except Exception:
+        pass
+    return href
+
+
+# Very forgiving pattern — DDG Lite HTML has remained stable for years
+# but the exact class/attr order shifts occasionally. Grabs href,
+# title text, and the adjacent snippet. Ignores other anchors on the
+# page (sponsor / topic pivots / related-searches).
+_DDG_RESULT_RE = _re.compile(
+    r'<a\s+[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+    r'.*?<a\s+[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+    _re.DOTALL | _re.IGNORECASE,
+)
+_TAG_STRIP_RE = _re.compile(r"<[^>]+>")
+
+
+def _text(html: str, limit: int = 400) -> str:
+    """Strip HTML tags + collapse whitespace; cap length."""
+    import html as _html_mod
+    out = _html_mod.unescape(_TAG_STRIP_RE.sub("", html))
+    out = " ".join(out.split())
+    return out[: limit - 1] + "…" if len(out) > limit else out
+
+
+@mcp.tool()
+@_loop_guarded
+async def web_search(query: str, limit: int = 8) -> dict:
+    """General web search via DuckDuckGo. Use for non-time-sensitive queries.
+
+    Returns up to `limit` results as `{title, url, snippet}`. Picks
+    documentation, Wikipedia, company sites, blog posts — whatever
+    DDG has indexed.
+
+    **Pick `news` instead** when the user asks about *current events*,
+    *recent happenings*, or anything with a time-of-day / today /
+    yesterday qualifier. **Pick `hackernews`** when the user names
+    HN explicitly, asks what the tech community is discussing, or
+    wants Show HN / Ask HN / YC-batch-style content.
+
+    Args:
+      query: free-form search query (any language).
+      limit: 1-15, default 8.
+
+    Fails friendly on empty result sets ({"results": []}). DDG may
+    rate-limit under heavy use (HTTP 202/429) — surfaced as a plain
+    error message, not a retry loop.
+    """
+    if not query or not query.strip():
+        raise ValueError("query is required and must be non-empty")
+    limit = max(1, min(int(limit), 15))
+    html_body = await _fetch_text(
+        DDG_LITE_URL,
+        service="DuckDuckGo search",
+        timeout=10.0,
+        params={"q": query, "kl": "wt-wt"},
+        headers={"User-Agent": WEB_UA},
+    )
+    results: list[dict] = []
+    for href, title_html, snippet_html in _DDG_RESULT_RE.findall(html_body):
+        results.append({
+            "title": _text(title_html, 150),
+            "url": _ddg_unwrap(href),
+            "snippet": _text(snippet_html, 250),
+        })
+        if len(results) >= limit:
+            break
+    if not results:
+        return _respond(
+            {"query": query, "results": []},
+            relay_to_user=False,
+            guidance="DuckDuckGo returned no results or its HTML shape drifted. Ask the user to rephrase, or try news/hackernews if intent allows.",
+        )
+    return _respond({"query": query, "results": results})
+
+
+def _parse_rss_items(xml_text: str, limit: int) -> list[dict]:
+    """Parse an RSS 2.0 document into `{title, url, source, published,
+    description}` dicts. Tolerant to Atom-flavoured variants (Google
+    News occasionally mixes namespaces)."""
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError:
+        return []
+    items = root.findall(".//item")[:limit]
+    out: list[dict] = []
+    for it in items:
+        link = (it.findtext("link") or "").strip()
+        title = _text(it.findtext("title") or "", 200)
+        # Google News embeds the publisher inside a nested `<source>`
+        # element. Other RSS feeds use `<dc:creator>` or nothing.
+        source_el = it.find("source")
+        source = (source_el.text.strip() if source_el is not None and source_el.text else "")
+        published = (it.findtext("pubDate") or "").strip()
+        desc_raw = it.findtext("description") or ""
+        out.append({
+            "title": title,
+            "url": link,
+            "source": source,
+            "published": published,
+            "description": _text(desc_raw, 200),
+        })
+    return out
+
+
+@mcp.tool()
+@_loop_guarded
+async def news(
+    query: str | None = None,
+    topic: str | None = None,
+    lang: str | None = None,
+    limit: int = 10,
+) -> dict:
+    """Recent journalism — use for time-sensitive queries about current events.
+
+    Three shapes in one tool:
+      - **No args**: top headlines for the user's country (GeoIP-detected,
+        same as `detect_my_location_by_ip`). Good for «что в мире
+        сегодня?» / "what's happening in the news".
+      - **`query`**: news-search for that query across all journalistic
+        sources indexed by Google News. Good for «новости про Tesla».
+      - **`topic`**: category-style (e.g. `"tech"`, `"business"`,
+        `"sports"`). Treated as a search query underneath, not a
+        fixed topic-ID — flexible, slightly less precise.
+
+    **Pick `web_search` instead** for documentation, static references,
+    or non-current queries. **Pick `hackernews`** when the user wants
+    tech-community discussion specifically (not journalism).
+
+    Args:
+      query: free-form news query.
+      topic: coarse category — fed as a search term.
+      lang: ISO-639 two-letter code (`en`, `ru`, `uk`). Defaults to
+            `en` for query/topic, or the GeoIP-detected locale for
+            no-args top-news.
+      limit: 1-20, default 10.
+    """
+    limit = max(1, min(int(limit), 20))
+    if query and topic:
+        raise ValueError("pass either `query` or `topic`, not both")
+
+    # No-args: use GeoIP to seed (country_code, lang). Skips loop-guard
+    # on the inner call via _detect_my_location_by_ip_impl (see #3/#19).
+    if not query and not topic:
+        loc, _ = await _detect_my_location_by_ip_impl()
+        country = (loc.get("country_code") or "US").upper()
+        effective_lang = (lang or "en").lower()
+        params = {
+            "hl": f"{effective_lang}-{country}",
+            "gl": country,
+            "ceid": f"{country}:{effective_lang}",
+        }
+        xml = await _fetch_text(
+            GNEWS_TOP_URL,
+            service="Google News RSS",
+            timeout=10.0,
+            params=params,
+            headers={"User-Agent": WEB_UA},
+        )
+        items = _parse_rss_items(xml, limit)
+        return _respond(
+            {"shape": "top", "country": country, "lang": effective_lang, "items": items},
+            guidance=_GUIDANCE_GEOIP_AUTODETECT,
+        )
+
+    # Query or topic path: search RSS.
+    effective_query = (query or topic or "").strip()
+    effective_lang = (lang or "en").lower()
+    # `gl` intentionally left at "US" for queried search — sources are
+    # returned in English-major style regardless; setting gl=XX narrows
+    # to country-local coverage which is usually NOT what a search
+    # intent wants.
+    params = {
+        "q": effective_query,
+        "hl": effective_lang,
+        "ceid": f"US:{effective_lang}",
+    }
+    xml = await _fetch_text(
+        GNEWS_SEARCH_URL,
+        service="Google News RSS",
+        timeout=10.0,
+        params=params,
+        headers={"User-Agent": WEB_UA},
+    )
+    items = _parse_rss_items(xml, limit)
+    shape = "query" if query else "topic"
+    return _respond(
+        {"shape": shape, "query": effective_query, "lang": effective_lang, "items": items}
+    )
+
+
+_HN_CATEGORIES: frozenset[str] = frozenset({"top", "new", "best", "ask", "show", "job"})
+
+
+@mcp.tool()
+@_loop_guarded
+async def hackernews(category: str = "top", limit: int = 15) -> dict:
+    """Hacker News (news.ycombinator.com) top posts — tech-community feed.
+
+    Pick when the user explicitly names HN, asks about the tech
+    community's current discussion, or wants Show HN / Ask HN /
+    YC-batch content. For mainstream journalism use `news` instead;
+    for general web search use `web_search`.
+
+    Args:
+      category: one of `top` (default), `new`, `best`, `ask`, `show`, `job`.
+      limit: 1-30, default 15.
+
+    Returns each post as `{rank, title, url, points, comments_count,
+    author, posted_unix, hn_url}`. For Ask HN / Show HN items the
+    `url` points at HN's item page (there's no external link).
+    """
+    cat = (category or "top").strip().lower()
+    if cat not in _HN_CATEGORIES:
+        raise ValueError(
+            f"unknown HN category {cat!r}; allowed: {sorted(_HN_CATEGORIES)}"
+        )
+    limit = max(1, min(int(limit), 30))
+    ids = await _fetch_json(
+        f"{HN_API_BASE}/{cat}stories.json",
+        service="Hacker News",
+        timeout=8.0,
+    )
+    if not isinstance(ids, list):
+        raise RuntimeError("Hacker News returned an unexpected shape (not a list of IDs).")
+
+    # Fetch items in parallel — HN Firebase is fast and capacity is
+    # generous, but a sequential loop of 15 GETs adds 1-2 s for no
+    # reason.
+    import asyncio as _asyncio
+
+    async def _fetch_item(item_id: int) -> dict | None:
+        try:
+            return await _fetch_json(
+                f"{HN_API_BASE}/item/{item_id}.json",
+                service="Hacker News",
+                timeout=5.0,
+            )
+        except Exception:
+            return None
+
+    items = await _asyncio.gather(*(_fetch_item(i) for i in ids[:limit]))
+    out: list[dict] = []
+    for rank, it in enumerate(items, start=1):
+        if not it:
+            continue
+        hn_url = f"https://news.ycombinator.com/item?id={it.get('id')}"
+        out.append({
+            "rank": rank,
+            "title": it.get("title", ""),
+            "url": it.get("url") or hn_url,
+            "points": it.get("score", 0),
+            "comments_count": it.get("descendants", 0),
+            "author": it.get("by", ""),
+            "posted_unix": it.get("time", 0),
+            "hn_url": hn_url,
+        })
+    return _respond({"category": cat, "items": out})
+
+
+@mcp.tool()
+@_loop_guarded
+async def trends(country_code: str | None = None, limit: int = 15) -> dict:
+    """Today's top search queries (Google Trends RSS). GeoIP-default country.
+
+    Answers «что в трендах сегодня?» / "what's everyone searching for
+    today" — the realest mass-attention signal we can pull key-lessly.
+    Mix of sport, entertainment, breaking news, viral moments.
+
+    Args:
+      country_code: ISO-3166-1 alpha-2 (`"US"`, `"UA"`, `"DE"`).
+                    Defaults to the GeoIP-detected country of the caller.
+      limit: 1-25, default 15.
+    """
+    limit = max(1, min(int(limit), 25))
+    source_note = None
+    if not country_code:
+        loc, _ = await _detect_my_location_by_ip_impl()
+        country_code = (loc.get("country_code") or "US").upper()
+        source_note = _GUIDANCE_GEOIP_AUTODETECT
+    country_code = country_code.strip().upper()
+    xml = await _fetch_text(
+        GTRENDS_RSS_URL,
+        service="Google Trends RSS",
+        timeout=8.0,
+        params={"geo": country_code},
+        headers={"User-Agent": WEB_UA},
+    )
+    try:
+        root = _ET.fromstring(xml)
+    except _ET.ParseError:
+        return _respond(
+            {"country_code": country_code, "items": []},
+            relay_to_user=False,
+            guidance="Google Trends returned an unparseable body — try again in a minute.",
+        )
+    items: list[dict] = []
+    # Google Trends RSS uses a `ht:` namespace for `approx_traffic` and
+    # `news_item_*` extensions. ElementTree exposes namespaced tags
+    # with a Clark-notation prefix; we look them up tolerantly.
+    HT = "{https://trends.google.com/trending/rss}"
+    for it in root.findall(".//item")[:limit]:
+        query = (it.findtext("title") or "").strip()
+        if not query:
+            continue
+        traffic = (it.findtext(f"{HT}approx_traffic") or "").strip()
+        # First related news headline (if any) — lets the model
+        # paraphrase «почему это трендит» without a separate `news`
+        # call. Common for breaking-news trends.
+        news_title = it.findtext(f"{HT}news_item_title") or ""
+        news_url = it.findtext(f"{HT}news_item_url") or ""
+        items.append({
+            "query": query,
+            "approx_traffic": traffic,
+            "related_news_title": _text(news_title, 200),
+            "related_news_url": news_url.strip(),
+        })
+    if source_note:
+        return _respond({"country_code": country_code, "items": items}, guidance=source_note)
+    return _respond({"country_code": country_code, "items": items})
+
+
 @mcp.tool()
 @_loop_guarded
 async def list_radio_stations(
@@ -2656,6 +3073,12 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "list_radio_stations",
         "calculate",
     ),
+    "web": (
+        "web_search",
+        "news",
+        "hackernews",
+        "trends",
+    ),
 }
 
 _ROUTER_STATE: dict[str, str | None] = {"active": None}
@@ -2716,7 +3139,7 @@ def _install_router() -> None:
 
     @mcp.tool()
     async def select_domain(
-        domain: Literal["weather", "location", "time", "knowledge"],
+        domain: Literal["weather", "location", "time", "knowledge", "web"],
         ctx: Context,
     ) -> dict:
         """Route this session to a tool subset. **Call once per user intent.**
@@ -2727,6 +3150,8 @@ def _install_router() -> None:
           - `time`     — current date/time here or in a named city.
           - `knowledge` — wikipedia, country info, holidays, currency,
                           radio stations.
+          - `web`      — DuckDuckGo search, Google News, Hacker News,
+                          Google Trends.
 
         After you call this, the tool list updates (the client will
         re-fetch it) and the domain's tools appear. Switch domains
@@ -2767,7 +3192,8 @@ def _install_router() -> None:
             # point. This is the main-menu state.
             return [t for t in all_tools if t.name == "select_domain"]
         visible = {"select_domain", *_ROUTER_DOMAINS.get(active, ())}
-        return [t for t in all_tools if t.name in visible]
+        narrowed = [t for t in all_tools if t.name in visible]
+        return _apply_domain_filter(narrowed)
 
     mcp._mcp_server.list_tools()(_router_list_tools)
 
@@ -2776,8 +3202,70 @@ def _install_router() -> None:
 # fat_tools.py. Kept at module scope so the `_install_fat_tools_mode`
 # filter knows which of the registered tools to keep visible.
 _FAT_TOOL_NAMES: frozenset[str] = frozenset(
-    {"weather", "geo", "knowledge", "radio"}
+    {"weather", "geo", "knowledge", "radio", "web"}
 )
+
+
+# ── Domain filter (MCP_ENABLED_DOMAINS) ─────────────────────────────────────
+#
+# Optional CSV env var that restricts the advertised tool surface to a
+# subset of domains. Empty / unset (default) = all 5 domains visible.
+# Validation is strict — an unknown domain name fails loudly at boot
+# rather than silently hiding every tool. The filter composes with
+# whatever list_tools override the active router mode installs:
+# in fat modes it narrows the 5 fat tools; in off mode it narrows the
+# full narrow surface via the NARROW_TO_FAT mapping; in list_changed
+# mode it further narrows `_ROUTER_DOMAINS`-derived visibility.
+#
+# Use case: keep the chat pod sidecar at `fat_tools_lean` default but
+# turn off `web` for a deployment where the model should NOT reach
+# the internet outside of Open-Meteo/Wikipedia/etc.
+
+_VALID_DOMAINS: frozenset[str] = _FAT_TOOL_NAMES
+
+
+def _parse_enabled_domains(raw: str) -> frozenset[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return frozenset()
+    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
+    unknown = parts - _VALID_DOMAINS
+    if unknown:
+        raise RuntimeError(
+            f"MCP_ENABLED_DOMAINS contains unknown domain(s): {sorted(unknown)} "
+            f"(valid: {sorted(_VALID_DOMAINS)})"
+        )
+    return frozenset(parts)
+
+
+ENABLED_DOMAINS: frozenset[str] = _parse_enabled_domains(os.getenv("MCP_ENABLED_DOMAINS", ""))
+
+
+def _domain_of(tool_name: str) -> str | None:
+    """Resolve a registered tool name to its domain identifier.
+
+    Fat tool names map 1:1 to domain identifiers. Narrow tools go
+    through `NARROW_TO_FAT`. The `select_domain` router-mode helper
+    (list_changed only) is intentionally treated as domain-less — it
+    must stay visible whenever the router mode is active, so callers
+    special-case it.
+    """
+    if tool_name in _FAT_TOOL_NAMES:
+        return tool_name
+    # Lazy import — `fat_tools_map` has no other imports so this is cheap.
+    from fat_tools_map import NARROW_TO_FAT
+    mapped = NARROW_TO_FAT.get(tool_name)
+    return mapped[0] if mapped else None
+
+
+def _apply_domain_filter(tools: list) -> list:
+    """Drop tools outside `ENABLED_DOMAINS`. No-op when the set is empty."""
+    if not ENABLED_DOMAINS:
+        return tools
+    return [
+        t for t in tools
+        if t.name == "select_domain" or (_domain_of(t.name) in ENABLED_DOMAINS)
+    ]
 
 
 def _install_fat_tools_mode() -> None:
@@ -2809,10 +3297,12 @@ def _install_fat_tools_mode() -> None:
     _base_list_tools = mcp.list_tools
 
     async def _fat_list_tools():
-        # Hide every narrow tool — the fat 4 are the only surface the
-        # model is allowed to see in this mode.
+        # Hide every narrow tool — the fat 5 are the only surface the
+        # model is allowed to see in this mode. Then drop any fat tool
+        # outside `ENABLED_DOMAINS` (no-op when the filter is empty).
         all_tools = await _base_list_tools()
-        return [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+        fat_only = [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+        return _apply_domain_filter(fat_only)
 
     mcp._mcp_server.list_tools()(_fat_list_tools)
 
@@ -2844,12 +3334,35 @@ def _install_fat_tools_lean_mode() -> None:
 
     async def _lean_list_tools():
         all_tools = await _base_list_tools()
-        return [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+        fat_only = [t for t in all_tools if t.name in _FAT_TOOL_NAMES]
+        return _apply_domain_filter(fat_only)
 
     mcp._mcp_server.list_tools()(_lean_list_tools)
 
 
+def _install_off_mode_domain_filter() -> None:
+    """Apply `ENABLED_DOMAINS` filtering to the narrow-tools `off` surface.
+
+    Only wired up when `MCP_ENABLED_DOMAINS` is non-empty — otherwise
+    `off` mode remains the fully-transparent default with no list_tools
+    override at all. Narrow tools are resolved to their domain via
+    `fat_tools_map.NARROW_TO_FAT`, so a narrow rename here fails the
+    drift-guard unit test immediately.
+    """
+    _base_list_tools = mcp.list_tools
+
+    async def _off_list_tools():
+        return _apply_domain_filter(await _base_list_tools())
+
+    mcp._mcp_server.list_tools()(_off_list_tools)
+
+
+# `_install_router` only handles fat / list_changed / off-with-no-filter.
+# The off-mode domain filter plugs in post-install to keep the router
+# function focused on mode selection.
 _install_router()
+if ROUTER_MODE == "off" and ENABLED_DOMAINS:
+    _install_off_mode_domain_filter()
 
 
 if __name__ == "__main__":

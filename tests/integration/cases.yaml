@@ -171,6 +171,40 @@ cases:
   - prompt: "Площадь круга радиусом 7 метров"
     expected_tool: calculate
 
+  # ── Web domain (added 2026-04-22) ──────────────────────────────────────
+  # Four actions, disambiguated by time-sensitivity and community focus:
+  #   web_search → static web references, docs, company sites
+  #   news       → journalism, current events, «что нового про X»
+  #   hackernews → tech-community curated feed
+  #   trends     → mass-attention signal by country
+  # The failure mode we're probing is the model confusing web_search/news:
+  # if the prompt has a time-sensitivity hint ("latest", "today",
+  # "recent", «новости», «сегодня»), it should pick news. If it names HN
+  # explicitly, pick hackernews. If the user asks about "что в трендах /
+  # what's popular / trending", pick trends.
+
+  - prompt: "Find documentation for Python asyncio"
+    expected_tool: web_search
+  - prompt: "Найди статью про квантовые компьютеры"
+    expected_tool: web_search
+
+  - prompt: "Latest news about OpenAI"
+    expected_tool: news
+  - prompt: "Что нового в мире сегодня?"
+    expected_tool: news
+  - prompt: "Последние новости про Украину"
+    expected_tool: news
+
+  - prompt: "What's on Hacker News right now?"
+    expected_tool: hackernews
+  - prompt: "Show me Show HN submissions"
+    expected_tool: hackernews
+
+  - prompt: "What's trending on Google today?"
+    expected_tool: trends
+  - prompt: "Что сейчас в трендах поиска?"
+    expected_tool: trends
+
 # Minimum hit-rate to consider the model "dialed in" for this surface.
 # Set below 1.0 because LLMs are not deterministic even at T=0 — a
 # single spurious tool pick is not a regression. Tightened over time
