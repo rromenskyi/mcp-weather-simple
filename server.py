@@ -165,6 +165,11 @@ AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WIKIPEDIA_SUMMARY_URL = "https://{lang}.wikipedia.org/api/rest_v1/page/summary/{title}"
 RESTCOUNTRIES_ALPHA_URL = "https://restcountries.com/v3.1/alpha/{code}"
 RESTCOUNTRIES_NAME_URL = "https://restcountries.com/v3.1/name/{name}"
+# GraphQL mirror used only when REST Countries 5xx/times out. Covers
+# the common overlap (name, capital, currency, languages, emoji,
+# calling code) but NOT population / area / borders / timezones — we
+# surface `data_source` on the response so the model can caveat.
+COUNTRIES_GRAPHQL_URL = "https://countries.trevorblades.com/"
 HOLIDAYS_URL = "https://date.nager.at/api/v3/PublicHolidays/{year}/{country_code}"
 CURRENCY_URL = "https://open.er-api.com/v6/latest/{base}"
 # radio-browser is a volunteer pool of geographically distributed
@@ -295,7 +300,11 @@ async def _fetch_text(
     message shape as any other Open-Meteo / Wikipedia 4xx.
     """
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        # DDG Lite, Google News RSS and Google Trends all serve 302s to
+        # canonical URLs on first hit (geo / locale / UA-dependent). Must
+        # follow — `httpx` default is `follow_redirects=False` which
+        # would surface as "HTTP 302" RuntimeErrors in production.
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, params=params, headers=headers)
             r.raise_for_status()
             return r.text
@@ -1978,6 +1987,79 @@ async def get_wikipedia_summary(title: str, lang: str = "en") -> dict:
     raise RuntimeError(f"Wikipedia: no lang candidates tried for title={title!r}")
 
 
+async def _country_info_graphql_fallback(country: str) -> dict | None:
+    """Fallback to `countries.trevorblades.com` (GraphQL) when REST
+    Countries 5xx/timeouts. Covers name / capital / currency /
+    languages / emoji / calling code; has **no** population / area /
+    borders / timezones — those come back as `None` and the caller
+    stamps `data_source="graphql_mirror"` so the model can caveat.
+    Returns None when the mirror can't resolve the input either (so
+    the outer handler re-raises the original restcountries error)."""
+    code_or_name = country.strip()
+    # The mirror's `country(code: ID!)` only accepts alpha-2, so plain
+    # names route through the `countries(filter: {name})` list query.
+    if len(code_or_name) == 2 and code_or_name.isalpha():
+        query = """
+        query ($c: ID!) {
+          country(code: $c) {
+            code name native capital emoji phone currency
+            continent { name }
+            languages { name }
+          }
+        }
+        """
+        variables = {"c": code_or_name.upper()}
+        key = "country"
+    else:
+        query = """
+        query ($q: String) {
+          countries(filter: {name: {regex: $q}}) {
+            code name native capital emoji phone currency
+            continent { name }
+            languages { name }
+          }
+        }
+        """
+        # GraphQL filter uses re2 — anchor to start for reasonable precision.
+        variables = {"q": f"^{code_or_name}$"}
+        key = "countries"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            r = await client.post(
+                COUNTRIES_GRAPHQL_URL,
+                json={"query": query, "variables": variables},
+                headers={"User-Agent": WEB_UA},
+            )
+            r.raise_for_status()
+            payload = r.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    data = (payload.get("data") or {}).get(key)
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not data:
+        return None
+    phone = data.get("phone") or ""
+    return {
+        "name": data.get("name"),
+        "official_name": None,
+        "country_code": data.get("code"),
+        "capital": data.get("capital"),
+        "region": (data.get("continent") or {}).get("name"),
+        "subregion": None,
+        "population": None,
+        "area_km2": None,
+        "currencies": [{"code": c, "name": None, "symbol": None}
+                       for c in (data.get("currency") or "").split(",") if c],
+        "languages": [l.get("name") for l in (data.get("languages") or []) if l.get("name")],
+        "calling_code": f"+{phone}" if phone and not phone.startswith("+") else phone,
+        "borders": [],
+        "timezones": [],
+        "flag_emoji": data.get("emoji"),
+        "data_source": "graphql_mirror",
+    }
+
+
 @mcp.tool()
 @_loop_guarded
 async def get_country_info(country: str) -> dict:
@@ -1993,7 +2075,23 @@ async def get_country_info(country: str) -> dict:
     url = (RESTCOUNTRIES_ALPHA_URL if use_alpha else RESTCOUNTRIES_NAME_URL).format(
         code=code.upper(), name=code,
     )
-    data = await _fetch_json(url, service="REST Countries", timeout=5.0)
+    try:
+        data = await _fetch_json(url, service="REST Countries", timeout=5.0)
+    except RuntimeError as primary_err:
+        # restcountries.com is volunteer-hosted and 502s / times out
+        # regularly. Try the GraphQL mirror at trevorblades.com for
+        # the common subset of fields; if THAT also fails, surface the
+        # original error (mirror's error would be misleading).
+        fallback = await _country_info_graphql_fallback(code)
+        if fallback:
+            guidance = (
+                "Relay with a caveat: primary country database is temporarily "
+                "unavailable; these values come from a public mirror that does "
+                "NOT carry population / area / borders / timezones."
+            )
+            return _respond({**fallback, "data_source": "graphql_mirror"},
+                            guidance=guidance)
+        raise primary_err
     hit = data[0] if isinstance(data, list) else data
     currencies = hit.get("currencies") or {}
     languages = hit.get("languages") or {}
@@ -2017,6 +2115,7 @@ async def get_country_info(country: str) -> dict:
         "borders": hit.get("borders") or [],
         "timezones": hit.get("timezones") or [],
         "flag_emoji": hit.get("flag"),
+        "data_source": "rest_countries",
     })
 
 
