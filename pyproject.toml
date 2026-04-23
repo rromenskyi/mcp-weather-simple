@@ -1,6 +1,6 @@
 [project]
 name = "mcp-weather-simple"
-version = "1.0.0"
+version = "1.2.0"
 description = "Simple MCP server that exposes weather tools (Open-Meteo, no API key)"
 requires-python = ">=3.10"
 dependencies = [

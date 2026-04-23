@@ -63,13 +63,22 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+          # Server exposes `/healthz` (no I/O, always 200) and `/readyz`
+          # (actively probes Open-Meteo; 503 on upstream failure). Both
+          # paths bypass the MCP bearer-auth middleware. Previous
+          # `tcpSocket: http` probes only confirmed the port was open
+          # — they wouldn't catch a hung interpreter or a dead
+          # Open-Meteo dependency. See server.py's `_register_probes`
+          # block for the contract and README §Deployment for detail.
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 20
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /readyz
               port: http
             initialDelaySeconds: 2
             periodSeconds: 10

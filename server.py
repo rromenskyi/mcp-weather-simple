@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import re as _re
 import secrets
 import time
 from datetime import date, datetime, timezone as _tz
@@ -22,18 +23,21 @@ PORT = int(os.getenv("MCP_PORT", "8000"))
 AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
 
 # Default `fat_tools_lean` since 2026-04-22 — see
-# docs/tool-catalog-scaling.md for the measurements. Collapses the
-# 23 narrow tools into 4 fat domain-tools with an `(action, params)`
-# signature; catalog drops 5289 → 1090 tokens (−79%) with zero hit-rate
-# regression on qwen3.5:9b (93.2% both ways). Set `MCP_ROUTER_MODE=off`
-# to get the historical monolith surface — needed for nightly eval
-# baseline continuity and as an escape hatch if any specific client
-# turns out to misbehave on the fat surface.
+# docs/tool-catalog-scaling.md for the original measurements.
+# Collapses the 28 narrow tools into 4 fat domain-tools
+# (weather / geo / knowledge / web) with an `(action, params)`
+# signature; catalog ≈ 1350 tokens post-2026-04-23 (radio folded into
+# `web(radio)`, web domain added) vs ~6800 for the monolith. Hit rate
+# stays at 93.2% on qwen3.5:9b across live modes. Set
+# `MCP_ROUTER_MODE=off` for the historical monolith surface — needed
+# for nightly eval baseline continuity and as an escape hatch if any
+# specific client turns out to misbehave on the fat surface.
 #
 # Other modes kept behind this flag: `fat_tools` (fat with named
-# kwargs, +800 tokens vs lean) and `list_changed` (spec-correct
-# dynamic router — confirmed unsupported by mcphost / Open WebUI,
-# kept as a reference implementation only).
+# kwargs, ~900 tokens more than lean because of the pydantic
+# nullability shell) and `list_changed` (spec-correct dynamic router —
+# confirmed unsupported by mcphost / Open WebUI, kept as a reference
+# implementation only).
 ROUTER_MODE = os.getenv("MCP_ROUTER_MODE", "fat_tools_lean").strip().lower()
 
 # ── Tool-calling policy (#19) ──────────────────────────────────────────────
@@ -1985,8 +1989,9 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
     Returns None when the mirror can't resolve the input either (so
     the outer handler re-raises the original restcountries error)."""
     code_or_name = country.strip()
-    # The mirror's `country(code: ID!)` only accepts alpha-2, so plain
-    # names route through the `countries(filter: {name})` list query.
+    # The mirror's `country(code: ID!)` only accepts alpha-2. alpha-3
+    # codes (`"USA"`, `"DEU"`) and plain names (`"United States"`) both
+    # route through the `countries(filter: {name})` list query.
     if len(code_or_name) == 2 and code_or_name.isalpha():
         query = """
         query ($c: ID!) {
@@ -2009,8 +2014,11 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
           }
         }
         """
-        # GraphQL filter uses re2 — anchor to start for reasonable precision.
-        variables = {"q": f"^{code_or_name}$"}
+        # GraphQL filter uses RE2. `(?i)` enables case-insensitive match
+        # so "united states" / "USA" / "ukraine" all hit. No anchors —
+        # partial match so alpha-3 codes (which upstream doesn't index
+        # as names) degrade to None gracefully rather than false-hit.
+        variables = {"q": f"(?i){_re.escape(code_or_name)}"}
         key = "countries"
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
@@ -2045,7 +2053,8 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
         "borders": [],
         "timezones": [],
         "flag_emoji": data.get("emoji"),
-        "data_source": "graphql_mirror",
+        # `data_source` intentionally not set here — the caller in
+        # `get_country_info` stamps it so the marker lives in one place.
     }
 
 
@@ -2369,7 +2378,6 @@ async def calculate(expression: str) -> dict:
 # to summarise an answer.
 
 
-import re as _re
 import xml.etree.ElementTree as _ET
 from urllib.parse import parse_qs as _parse_qs, urlparse as _urlparse
 
@@ -3294,11 +3302,11 @@ _FAT_TOOL_NAMES: frozenset[str] = frozenset(
 # ── Domain filter (MCP_ENABLED_DOMAINS) ─────────────────────────────────────
 #
 # Optional CSV env var that restricts the advertised tool surface to a
-# subset of domains. Empty / unset (default) = all 5 domains visible.
+# subset of domains. Empty / unset (default) = all 4 domains visible.
 # Validation is strict — an unknown domain name fails loudly at boot
 # rather than silently hiding every tool. The filter composes with
 # whatever list_tools override the active router mode installs:
-# in fat modes it narrows the 5 fat tools; in off mode it narrows the
+# in fat modes it narrows the 4 fat tools; in off mode it narrows the
 # full narrow surface via the NARROW_TO_FAT mapping; in list_changed
 # mode it further narrows `_ROUTER_DOMAINS`-derived visibility.
 #
@@ -3354,7 +3362,7 @@ def _apply_domain_filter(tools: list) -> list:
 
 
 def _install_fat_tools_mode() -> None:
-    """Register the 4 fat domain-tools and hide the 23 narrow ones.
+    """Register the 4 fat domain-tools and hide the 28 narrow ones.
 
     Works with static-catalog clients (mcphost, Open WebUI) — no
     `notifications/tools/list_changed` involved. Clients see a stable,
