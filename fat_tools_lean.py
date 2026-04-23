@@ -1,6 +1,6 @@
 """Ultra-lean variant of `fat_tools.py` for `MCP_ROUTER_MODE=fat_tools_lean`.
 
-Same four domain-tools (weather / geo / knowledge / radio), same
+Same four domain-tools (weather / geo / knowledge / web), same
 action names, but the signature drops from `(action, name=None,
 lat=None, lon=None, ...)` down to just `(action, params={})`. That's
 a huge win on FastMCP-generated schema: every optional kwarg in

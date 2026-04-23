@@ -69,7 +69,7 @@ The four fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, *
 
 Radio (`list_radio_stations`) lives under `web(radio)` — folded in 2026-04-23 because it's inherently internet-sourced and a standalone `radio` fat cost ~150 catalog tokens for a single tool.
 
-Catalog-token figures above are estimates post-bundled-fields + post-web-domain (2026-04-22). The `fat_tools_lean` headline number of ~1 500 tokens is ~18 % larger than the previous 1 275 measurement because the `web` domain adds one fat tool (~250 tokens of docstring + enum) — still a **~78 %** reduction vs the monolith, same hit rate. Exact per-deployment measurements live in [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
+Catalog-token figures above are estimates as of 2026-04-23 — post-bundled-fields, post-web-domain, post-radio-fold-in. The `fat_tools_lean` headline ~1 350 tokens is ~6 % above the pre-web 1 275 baseline (web adds ~300 tokens of actions + enum, radio merge saves ~150) — still a **~78 %** reduction vs the monolith at the same 93.2 % hit rate. Exact per-deployment measurements live in [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
 
 `list_changed` is kept as a reference implementation of the spec-correct dynamic shape, but every MCP client tested (mcphost, Open WebUI) ignores the `tools/list_changed` notification and keeps the initial-handshake catalog, so in practice it does not actually narrow anything. **Treat it as dead** — use one of the fat modes instead.
 

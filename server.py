@@ -5,10 +5,13 @@ import functools
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re as _re
 import secrets
 import time
+
+_log = logging.getLogger("mcp-weather")
 from datetime import date, datetime, timezone as _tz
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -140,6 +143,20 @@ def _detect_and_record_call(fingerprint: str) -> bool:
     """
     now = time.monotonic()
     session_key = _current_session_key()
+
+    # Opportunistic GC for abandoned sessions. Before touching the
+    # current session's deque, scan every OTHER session and drop ones
+    # whose most-recent call is past the window. Worst-case O(N)
+    # sessions per call with N ≤ small in practice (each chat pod
+    # concurrency is bounded). The previous "after append, pop if
+    # empty" sweep was dead code — an append-then-check never fires
+    # because append just pushed one entry.
+    for other_key, other_deque in list(_RECENT_CALLS_BY_SESSION.items()):
+        if other_key == session_key or not other_deque:
+            continue
+        if now - other_deque[-1][1] > _LOOP_WINDOW_SECONDS:
+            del _RECENT_CALLS_BY_SESSION[other_key]
+
     recent = _RECENT_CALLS_BY_SESSION.get(session_key)
     if recent is None:
         recent = collections.deque(maxlen=10)
@@ -149,11 +166,6 @@ def _detect_and_record_call(fingerprint: str) -> bool:
         recent.popleft()
     is_dup = any(fp == fingerprint for fp, _ in recent)
     recent.append((fingerprint, now))
-    # Opportunistic housekeeping — drop per-session deques that went
-    # fully stale, otherwise long-running servers accumulate empty
-    # entries for every dead session.
-    if not recent:
-        _RECENT_CALLS_BY_SESSION.pop(session_key, None)
     return is_dup
 
 
@@ -1101,6 +1113,14 @@ async def _try_photon(address: str, country_code: str | None) -> dict | None:
             cc_got = ((feat.get("properties") or {}).get("countrycode") or "").upper()
             if cc_got == cc_want:
                 return _normalise_photon_feature(feat, address_input=address)
+        # Observability: when N candidates all miss the country pin, the
+        # default response is opaque ("nothing found"). Log the miss so
+        # a debugging operator can tell whether Photon had data but we
+        # filtered it vs. the upstream genuinely didn't know the address.
+        _log.info(
+            "Photon returned %d candidates for %r, none in %s — falling through to 'not found'",
+            len(features), address, cc_want,
+        )
         return None
     return _normalise_photon_feature(features[0], address_input=address)
 
@@ -2078,7 +2098,14 @@ async def _country_info_graphql_fallback(country: str) -> dict | None:
             )
             r.raise_for_status()
             payload = r.json()
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
+        # Mirror also failed. Log so that when the outer `get_country_info`
+        # re-raises the restcountries error, the operator has both failure
+        # reasons in the log stream ("primary 502 + mirror timeout" vs
+        # "primary 502 + mirror also 5xx'd" vs "primary 502 + mirror
+        # unreachable"). Level=INFO on purpose — not error-worthy by
+        # itself, the outer path decides that.
+        _log.info("country_info mirror fallback failed for %r: %s", country, exc)
         return None
     data = (payload.get("data") or {}).get(key)
     if isinstance(data, list):
@@ -2135,7 +2162,11 @@ async def get_country_info(country: str) -> dict:
                 {**fallback, "data_source": "graphql_mirror"},
                 guidance="Caveat: mirror fallback, no population/area/borders/timezones.",
             )
-        raise primary_err
+        # Bubble the primary failure. The helper already logs its own
+        # exception context on failure (see _country_info_graphql_fallback),
+        # so the debugging operator sees BOTH "why primary failed" and
+        # "why the mirror didn't save us".
+        raise
     hit = data[0] if isinstance(data, list) else data
     currencies = hit.get("currencies") or {}
     languages = hit.get("languages") or {}
@@ -2411,11 +2442,13 @@ async def calculate(expression: str) -> dict:
             relay_to_user=False,
             guidance="Division by zero. Ask user what they meant.",
         )
-    except (TypeError, OverflowError) as exc:
+    except (TypeError, OverflowError, MemoryError) as exc:
         # Whitelisted funcs still raise on bad argument types: `factorial(3.5)`
         # (non-int), `sum(1, 2)` (non-iterable), `gcd(1.2, 2)` (non-int),
-        # `math.exp(10000)` (overflow). Surface as a controlled envelope
-        # rather than bubbling an internal Python error to the client.
+        # `math.exp(10000)` (overflow), `factorial(10**8)` (MemoryError —
+        # Python arbitrary-precision ints don't overflow, they allocate
+        # until the process is OOM-killed). Surface each as a controlled
+        # envelope rather than bubbling an internal Python error.
         return _respond(
             {"expression": expression, "error": f"{type(exc).__name__}: {exc}"},
             relay_to_user=False,
@@ -3029,6 +3062,9 @@ _ENVELOPE_OUTPUT_SCHEMA = {
 }
 
 
+_OUTPUT_SCHEMA_SKIP: frozenset[str] = frozenset({"select_domain"})
+
+
 def _apply_output_schema_experiment() -> None:
     """When MCP_OUTPUT_SCHEMA=on, attach _ENVELOPE_OUTPUT_SCHEMA to every
     registered tool so the MCP catalog advertises the envelope contract
@@ -3038,10 +3074,19 @@ def _apply_output_schema_experiment() -> None:
     (weather / geo / knowledge / web), which are registered inside
     the router installer, also receive the outputSchema stamp. Called
     once at module bottom (see the final block).
+
+    `select_domain` is skipped: its response is router metadata
+    (`active_domain` / `previous_domain` / `list_changed_notification`),
+    not the data-tool envelope, so stamping the envelope schema would
+    advertise a contract its payload doesn't satisfy — strict clients
+    that validate `structuredContent` against `outputSchema` would
+    reject the call.
     """
     if _OUTPUT_SCHEMA_MODE != "on":
         return
-    for tool in mcp._tool_manager._tools.values():
+    for name, tool in mcp._tool_manager._tools.items():
+        if name in _OUTPUT_SCHEMA_SKIP:
+            continue
         tool.output_schema = _ENVELOPE_OUTPUT_SCHEMA
 
 
@@ -3448,7 +3493,7 @@ def _install_fat_tools_mode() -> None:
     _base_list_tools = mcp.list_tools
 
     async def _fat_list_tools():
-        # Hide every narrow tool — the fat 5 are the only surface the
+        # Hide every narrow tool — the fat 4 are the only surface the
         # model is allowed to see in this mode. Then drop any fat tool
         # outside `ENABLED_DOMAINS` (no-op when the filter is empty).
         all_tools = await _base_list_tools()
@@ -3463,9 +3508,9 @@ def _install_fat_tools_lean_mode() -> None:
 
     Same list_tools-filter machinery as ``_install_fat_tools_mode``, just
     registering the `fat_tools_lean.*` variants (which share the fat-
-    tool names `weather` / `geo` / `knowledge` / `radio`). Tool-
-    manager registration is mutually exclusive — lean and non-lean
-    can't both be active because FastMCP would reject the name clash.
+    tool names `weather` / `geo` / `knowledge` / `web`). Tool-manager
+    registration is mutually exclusive — lean and non-lean can't both
+    be active because FastMCP would reject the name clash.
     """
     import fat_tools_lean
 
