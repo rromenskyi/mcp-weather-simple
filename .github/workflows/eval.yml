@@ -250,7 +250,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          enable-cache: true
+          # Cache is pointless on the self-hosted L4 — uv's cache
+          # already lives on the persistent disk, and the Post step
+          # (`@v5`'s cache save) was failing with exit 2 against that
+          # layout. github-hosted runners keep caching for the 5-10 s
+          # speedup on cold boots.
+          enable-cache: ${{ needs.plan.outputs.runs_on != 'self-hosted' }}
 
       - name: Sync server + eval dependencies
         run: uv sync --frozen --extra test --extra eval
