@@ -61,11 +61,13 @@ The 28 narrow `@mcp.tool`s above can be advertised to the MCP client in four sha
 | Mode                   | What the client sees                             | Catalog tokens | Hit rate (qwen3.5:9b) |
 |------------------------|--------------------------------------------------|---------------:|----------------------:|
 | `off`                  | All 28 narrow tools                              |         ~6 800 |                 93.2 % |
-| `fat_tools`            | 5 fat domain-tools, one `action` enum + per-field kwargs |         ~2 450 |                 93.2 % |
-| **`fat_tools_lean`** *(default)* | 5 fat domain-tools, `(action, params: dict)` signature |       **~1 500** |             **93.2 %** |
+| `fat_tools`            | 4 fat domain-tools, one `action` enum + per-field kwargs |         ~2 250 |                 93.2 % |
+| **`fat_tools_lean`** *(default)* | 4 fat domain-tools, `(action, params: dict)` signature |       **~1 350** |             **93.2 %** |
 | `list_changed`         | Spec-correct dynamic narrowing via MCP notification | —            |                   —    |
 
-The five fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, **`geo`**, **`knowledge`**, **`radio`**, **`web`**. Each takes an `action` enum that maps 1:1 to one of the 28 narrow tools, plus that action's arguments. The narrow-to-fat mapping lives in `fat_tools_map.py` — single source of truth, drift-guarded by a unit test. Both narrow and fat shapes go through the same underlying impls, so behaviour is identical; only the on-wire tool-catalog shape changes.
+The four fat domain-tools in `fat_tools` / `fat_tools_lean` are **`weather`**, **`geo`**, **`knowledge`**, **`web`**. Each takes an `action` enum that maps 1:1 to one of the 28 narrow tools, plus that action's arguments. The narrow-to-fat mapping lives in `fat_tools_map.py` — single source of truth, drift-guarded by a unit test. Both narrow and fat shapes go through the same underlying impls, so behaviour is identical; only the on-wire tool-catalog shape changes.
+
+Radio (`list_radio_stations`) lives under `web(radio)` — folded in 2026-04-23 because it's inherently internet-sourced and a standalone `radio` fat cost ~150 catalog tokens for a single tool.
 
 Catalog-token figures above are estimates post-bundled-fields + post-web-domain (2026-04-22). The `fat_tools_lean` headline number of ~1 500 tokens is ~18 % larger than the previous 1 275 measurement because the `web` domain adds one fat tool (~250 tokens of docstring + enum) — still a **~78 %** reduction vs the monolith, same hit rate. Exact per-deployment measurements live in [`docs/tool-catalog-scaling.md`](docs/tool-catalog-scaling.md).
 
@@ -75,7 +77,7 @@ Catalog-token figures above are estimates post-bundled-fields + post-web-domain 
 
 ### Turning off whole domains (`MCP_ENABLED_DOMAINS`)
 
-Optional CSV env var that restricts which of the five fat domains are advertised at all. Empty / unset (default) = every domain is visible. Valid domain names: `weather`, `geo`, `knowledge`, `radio`, `web`.
+Optional CSV env var that restricts which of the four fat domains are advertised at all. Empty / unset (default) = every domain is visible. Valid domain names: `weather`, `geo`, `knowledge`, `web`.
 
 ```
 MCP_ENABLED_DOMAINS=weather,geo,knowledge,radio   # disable web at this deployment

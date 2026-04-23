@@ -144,9 +144,8 @@ def _loop_guarded(fn):
                 },
                 relay_to_user=False,
                 guidance=(
-                    f"Duplicate call: you already ran `{fn.__name__}` with "
-                    "these arguments in the last few minutes. Use that "
-                    "previous result or ask the user to clarify — do NOT retry."
+                    f"Duplicate `{fn.__name__}` call in last few min. "
+                    "Use previous result or ask user; don't retry."
                 ),
             )
         return await fn(*args, **kwargs)
@@ -663,16 +662,10 @@ def _ambiguity_response(query: str, candidates: list[dict], reason: str, country
     # today — the escape hatch is `get_weather_by_coordinates` which
     # takes lat/lon straight from the chosen candidate.
     if country_code:
-        narrow = (
-            "Take the chosen candidate's `latitude` and `longitude` "
-            "and call `get_weather_by_coordinates` directly."
-        )
+        narrow = "Use chosen candidate's lat/lon via `get_weather_by_coordinates`."
     else:
-        narrow = (
-            "Then re-call with `country_code` set (ISO-3166 alpha-2) "
-            "to narrow the geocoder."
-        )
-    guidance = f"Ambiguous: {reason}. Ask the user to pick one: {names}. {narrow}"
+        narrow = "Re-call with `country_code` (ISO-3166 alpha-2) to narrow."
+    guidance = f"Ambiguous: {reason}. Ask user to pick: {names}. {narrow}"
     return _respond(
         {
             "query": query,
@@ -1109,8 +1102,7 @@ async def resolve_address(address: str, country_code: str | None = None) -> dict
         {"address": query, "country_code": country_code, "candidates": []},
         relay_to_user=False,
         guidance=(
-            f"No address resolved for {query!r}. Ask the user to "
-            "rephrase or provide more detail (city, country)."
+            f"No address for {query!r}. Ask user to rephrase or add city/country."
         ),
     )
 
@@ -1167,14 +1159,11 @@ _GUIDANCE_DIRECT = "Relay directly."
 # models truncate or ignore long instructions. The full rationale
 # (VPN / NAT / cluster egress specifics) is in the repo; the LLM just
 # needs the action verb + the uncertainty flag.
-_GUIDANCE_GEOIP_AUTODETECT = (
-    "Relay with a caveat: city was auto-detected from the caller's IP and "
-    "may be wrong (VPN / NAT). If the user disagrees, ask for the city."
-)
-_GUIDANCE_GEOIP_EXPLICIT = (
-    "Relay with a caveat: city is a GeoIP approximation, may be off for "
-    "VPN / mobile / data-center IPs."
-)
+# Kept terse — these ride every GeoIP-backed response; every token is
+# context tax per turn. The rule (add a caveat, ask if wrong) is
+# shorter than the explanation.
+_GUIDANCE_GEOIP_AUTODETECT = "Caveat: city from caller's IP; may miss on VPN/NAT. Ask user if off."
+_GUIDANCE_GEOIP_EXPLICIT = "Caveat: GeoIP approximation."
 
 
 def _respond(
@@ -2084,13 +2073,10 @@ async def get_country_info(country: str) -> dict:
         # original error (mirror's error would be misleading).
         fallback = await _country_info_graphql_fallback(code)
         if fallback:
-            guidance = (
-                "Relay with a caveat: primary country database is temporarily "
-                "unavailable; these values come from a public mirror that does "
-                "NOT carry population / area / borders / timezones."
+            return _respond(
+                {**fallback, "data_source": "graphql_mirror"},
+                guidance="Caveat: mirror fallback, no population/area/borders/timezones.",
             )
-            return _respond({**fallback, "data_source": "graphql_mirror"},
-                            guidance=guidance)
         raise primary_err
     hit = data[0] if isinstance(data, list) else data
     currencies = hit.get("currencies") or {}
@@ -2359,13 +2345,13 @@ async def calculate(expression: str) -> dict:
         return _respond(
             {"expression": expression, "error": str(exc)},
             relay_to_user=False,
-            guidance="Expression rejected. Rewrite using plain arithmetic and listed functions/constants, or ask the user to clarify. Do not retry an identical expression.",
+            guidance="Invalid expression. Rewrite with listed ops/funcs or ask user. Don't retry same.",
         )
     except ZeroDivisionError:
         return _respond(
             {"expression": expression, "error": "division by zero"},
             relay_to_user=False,
-            guidance="Division by zero is undefined. Ask the user whether they meant something else.",
+            guidance="Division by zero. Ask user what they meant.",
         )
     return _respond({"expression": expression, "result": value})
 
@@ -2470,7 +2456,7 @@ async def web_search(query: str, limit: int = 8) -> dict:
         return _respond(
             {"query": query, "results": []},
             relay_to_user=False,
-            guidance="DuckDuckGo returned no results or its HTML shape drifted. Ask the user to rephrase, or try news/hackernews if intent allows.",
+            guidance="No DDG hits. Ask user to rephrase, or try news/hackernews.",
         )
     return _respond({"query": query, "results": results})
 
@@ -2693,7 +2679,7 @@ async def trends(country_code: str | None = None, limit: int = 15) -> dict:
         return _respond(
             {"country_code": country_code, "items": []},
             relay_to_user=False,
-            guidance="Google Trends returned an unparseable body — try again in a minute.",
+            guidance="Trends RSS unparseable; retry shortly.",
         )
     items: list[dict] = []
     # Google Trends RSS uses a `ht:` namespace for `approx_traffic` and
@@ -3169,7 +3155,6 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "get_country_info",
         "get_public_holidays",
         "convert_currency",
-        "list_radio_stations",
         "calculate",
     ),
     "web": (
@@ -3177,6 +3162,7 @@ _ROUTER_DOMAINS: dict[str, tuple[str, ...]] = {
         "news",
         "hackernews",
         "trends",
+        "list_radio_stations",
     ),
 }
 
@@ -3248,9 +3234,9 @@ def _install_router() -> None:
           - `location` — geocoding, address parse, IP geolocation.
           - `time`     — current date/time here or in a named city.
           - `knowledge` — wikipedia, country info, holidays, currency,
-                          radio stations.
+                          calculator.
           - `web`      — DuckDuckGo search, Google News, Hacker News,
-                          Google Trends.
+                          Google Trends, radio streams.
 
         After you call this, the tool list updates (the client will
         re-fetch it) and the domain's tools appear. Switch domains
@@ -3301,7 +3287,7 @@ def _install_router() -> None:
 # fat_tools.py. Kept at module scope so the `_install_fat_tools_mode`
 # filter knows which of the registered tools to keep visible.
 _FAT_TOOL_NAMES: frozenset[str] = frozenset(
-    {"weather", "geo", "knowledge", "radio", "web"}
+    {"weather", "geo", "knowledge", "web"}
 )
 
 
