@@ -184,6 +184,31 @@ async def test_loop_guard_allows_different_arguments_to_same_tool():
     assert b["relay_to_user"] is True
 
 
+async def test_loop_guard_isolates_recent_calls_per_session():
+    """Regression guard for the shared-HTTP-deployment bug: the
+    duplicate-call deque used to be a single process global. Two
+    chat sessions on the same pod asking the same question within
+    120s would see the second caller's request short-circuit as
+    `duplicate_of_recent_call`. Now the detector is keyed by the
+    MCP session id via the lowlevel `request_ctx`, and direct-Python
+    callers with no request context share a single fallback key.
+    This test simulates two sessions by patching the session-key
+    resolver between calls and asserts neither falsely short-circuits.
+    """
+    server._reset_recent_calls()
+    # Session A fires a call — records it under its own key.
+    with patch.object(server, "_current_session_key", return_value="sess-A"):
+        fp = server._call_fingerprint("list_radio_stations", {"country": "UA"})
+        assert server._detect_and_record_call(fp) is False  # fresh
+        assert server._detect_and_record_call(fp) is True   # same session, same fp = dup
+
+    # Session B, identical call within window, must NOT see A's entry.
+    with patch.object(server, "_current_session_key", return_value="sess-B"):
+        assert server._detect_and_record_call(fp) is False, (
+            "session B must not inherit session A's call history"
+        )
+
+
 @respx.mock
 async def test_shortcut_does_not_leak_inner_call_into_loop_detector():
     # Regression guard for #3 / #19 interaction. When
@@ -449,6 +474,31 @@ async def test_geocode_raises_when_empty():
     respx.get(server.GEOCODE_URL).mock(return_value=httpx.Response(200, json={}))
     with pytest.raises(ValueError, match="City not found"):
         await server._geocode("Nowhereville", country_code="XX")
+
+
+@respx.mock
+async def test_geocode_country_code_filter_hard_rejects_wrong_country():
+    """Regression guard for the silent-fallback bug: when
+    `country_code` is set but NO hit in the result set matches it,
+    the geocoder used to silently revert to the unfiltered top-1
+    (Moscow, Russia) instead of raising "not found in FR". Now it
+    honours the pin and surfaces the miss so the model can ask the
+    user to clarify rather than lying about a French Moscow."""
+    respx.get(server.GEOCODE_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"name": "Moscow", "country": "Russia", "country_code": "RU",
+                     "latitude": 55.75, "longitude": 37.62, "timezone": "Europe/Moscow",
+                     "feature_code": "PPLC", "admin1": "Moscow", "population": 12_500_000},
+                ]
+            },
+        )
+    )
+    # `country_code="FR"` mismatches — no silent top-1 fallback.
+    with pytest.raises(ValueError, match="City not found"):
+        await server._geocode("Moscow", country_code="FR")
 
 
 # ── Ambiguity detection (#17) ────────────────────────────────────────────
